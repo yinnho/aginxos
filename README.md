@@ -229,11 +229,62 @@ cargo test
 RUST_LOG=debug cargo run
 ```
 
+## Security
+
+AgentOS implements multiple layers of security to ensure safe agent execution:
+
+### Command Execution Sandbox
+
+Commands are executed with the following restrictions:
+
+- **Blocked commands blacklist**: Dangerous commands are blocked by default:
+  - Destructive: `rm`, `rmdir`, `dd`, `mkfs`, `fdisk`
+  - Privilege escalation: `sudo`, `su`, `chmod`, `chown`, `passwd`
+  - System control: `shutdown`, `reboot`, `init`, `kill`, `killall`
+  - Network download: `curl`, `wget`
+
+- **Execution timeout**: Commands are limited to 30 seconds by default
+
+### Path Traversal Prevention
+
+File operations are protected against directory traversal attacks:
+
+- Paths are canonicalized to resolve `..` and symlinks
+- All file access is validated against the agent's allowed directories
+- Agents cannot access files outside their granted filesystem capabilities
+
+### Rate Limiting
+
+LLM API calls are rate-limited to prevent runaway costs:
+
+- Default: 60 requests per minute
+- Default: 100,000 tokens per minute
+- Configurable via `RateLimitConfig`
+
+### Audit Logging
+
+All tool executions are logged with:
+
+- Timestamp and agent ID
+- Tool name and arguments
+- Result and success status
+- Execution duration
+
+```rust
+// Query audit logs
+let entries = audit_log.query_by_agent(&agent_id, 100)?;
+
+// Get tool statistics
+let stats = audit_log.tool_stats(&agent_id)?;
+println!("Success rate: {:.1}%", stats.success_rate() * 100.0);
+```
+
 ## Roadmap
 
 - [x] Local LLM support (Ollama)
 - [x] Context compaction with LLM summarization
 - [x] Vector-based memory retrieval (sqlite-vec)
+- [x] Security hardening (command sandbox, path validation, rate limiting)
 - [ ] Multi-agent coordination
 - [ ] Agent isolation (namespaces/seccomp)
 - [ ] Goal verification framework
