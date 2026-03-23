@@ -219,6 +219,16 @@ export AGENTOS_MODEL=your-model-name
 ./target/release/agentos
 ```
 
+### Using DeepSeek
+
+```bash
+export AGENTOS_LLM_PROVIDER=custom
+export AGENTOS_LLM_BASE_URL=https://api.deepseek.com/v1
+export AGENTOS_LLM_API_KEY=your_deepseek_api_key
+export AGENTOS_MODEL=deepseek-chat
+./target/release/agentos
+```
+
 ## Development
 
 ```bash
