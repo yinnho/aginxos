@@ -62,8 +62,10 @@ pub struct LlmGateway {
 
 /// LLM 提供商
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum LlmProvider {
     /// OpenAI API
+    #[default]
     OpenAI,
     /// Ollama 本地服务
     Ollama { base_url: String },
@@ -71,11 +73,6 @@ pub enum LlmProvider {
     Custom { base_url: String, api_key: Option<String> },
 }
 
-impl Default for LlmProvider {
-    fn default() -> Self {
-        Self::OpenAI
-    }
-}
 
 impl LlmGateway {
     /// 创建 OpenAI 网关

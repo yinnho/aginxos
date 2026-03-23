@@ -105,7 +105,7 @@ impl MockAgentExecutor {
 
                 self.agent.context.push(Message::tool_result(
                     &tool_call.name,
-                    &format!("Success: {}\n{}", result.success, result.output),
+                    format!("Success: {}\n{}", result.success, result.output),
                 ));
             }
         }

@@ -42,7 +42,7 @@ impl AuditEventType {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s {
             "tool_call" => AuditEventType::ToolCall,
             "tool_result" => AuditEventType::ToolResult,
@@ -199,7 +199,7 @@ impl AuditLog {
                         .unwrap_or_else(|_| Utc::now()),
                     agent_id: row.get::<_, String>(2)?.parse()
                         .unwrap_or_default(),
-                    event_type: AuditEventType::from_str(&row.get::<_, String>(3)?),
+                    event_type: AuditEventType::parse(&row.get::<_, String>(3)?),
                     tool_name: row.get(4)?,
                     arguments: row.get(5)?,
                     result: row.get(6)?,

@@ -58,7 +58,7 @@ fn test_compaction_system_and_recent() {
     // Compact
     let mut manager = ContextManager::new();
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let result = rt.block_on(manager.compact(&mut agent)).unwrap();
+    let _result = rt.block_on(manager.compact(&mut agent)).unwrap();
 
     // Should have: 1 system + 3 recent = 4 messages
     assert_eq!(agent.context.messages.len(), 4);

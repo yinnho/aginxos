@@ -68,7 +68,7 @@ impl StateManager {
     /// 注册 Agent
     pub fn register_agent(&mut self, agent: &Agent) {
         let snapshot = AgentSnapshot {
-            id: agent.id.clone(),
+            id: agent.id,
             name: agent.name.clone(),
             state: agent.state,
             current_goal: agent.goal.as_ref().map(|g| g.id),

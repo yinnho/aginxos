@@ -26,18 +26,15 @@ impl std::fmt::Display for GoalId {
 
 /// 优先级
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum Priority {
     Low = 0,
+    #[default]
     Normal = 1,
     High = 2,
     Critical = 3,
 }
 
-impl Default for Priority {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
 
 /// 验证测试
 #[derive(Debug, Clone, Serialize, Deserialize)]

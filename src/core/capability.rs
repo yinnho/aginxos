@@ -48,12 +48,11 @@ impl Capability {
                     a_paths.iter().any(|ap| bp.starts_with(ap))
                 );
                 // 检查权限覆盖
-                let mode_ok = match (a_mode, b_mode) {
-                    (AccessMode::ReadWrite, _) => true,
-                    (AccessMode::ReadOnly, AccessMode::ReadOnly) => true,
-                    (AccessMode::WriteOnly, AccessMode::WriteOnly) => true,
-                    _ => false,
-                };
+                let mode_ok = matches!((a_mode, b_mode),
+                    (AccessMode::ReadWrite, _) |
+                    (AccessMode::ReadOnly, AccessMode::ReadOnly) |
+                    (AccessMode::WriteOnly, AccessMode::WriteOnly)
+                );
                 path_ok && mode_ok
             }
             (Capability::Network { domains: a_domains, ports: a_ports },

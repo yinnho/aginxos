@@ -101,7 +101,7 @@ impl AgentExecutor {
                 // 添加工具结果到上下文
                 self.agent.context.push(Message::tool_result(
                     &tool_call.name,
-                    &format!("Success: {}\n{}", result.success, result.output),
+                    format!("Success: {}\n{}", result.success, result.output),
                 ));
             }
 

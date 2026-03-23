@@ -19,7 +19,7 @@ pub struct Repl {
 impl Repl {
     pub fn new() -> Result<Self, Error> {
         let editor = Reedline::create();
-        let prompt = DefaultPrompt::default();
+        let prompt = DefaultPrompt;
 
         let gateway = LlmGateway::from_env();
         let scheduler = IntentScheduler::new();

@@ -160,6 +160,6 @@ fn test_different_agents_isolated() {
 #[test]
 fn test_event_type_conversion() {
     assert_eq!(EventType::UserInput.as_str(), "user_input");
-    assert!(matches!(EventType::from_str("tool_call"), EventType::ToolCall));
-    assert!(matches!(EventType::from_str("unknown"), EventType::Other));
+    assert!(matches!(EventType::parse("tool_call"), EventType::ToolCall));
+    assert!(matches!(EventType::parse("unknown"), EventType::Other));
 }

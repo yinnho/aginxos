@@ -50,7 +50,7 @@ impl EventType {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s {
             "user_input" => EventType::UserInput,
             "thinking" => EventType::Thinking,
@@ -110,7 +110,7 @@ impl EmbeddingGenerator for OpenAIEmbedding {
         let embedding = response.data.first()
             .ok_or_else(|| crate::core::Error::Llm("No embedding returned".into()))?;
 
-        Ok(embedding.embedding.iter().map(|&f| f as f32).collect())
+        Ok(embedding.embedding.to_vec())
     }
 }
 
@@ -316,7 +316,7 @@ impl MemoryManager {
                     timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
-                    event_type: EventType::from_str(&row.get::<_, String>(3)?),
+                    event_type: EventType::parse(&row.get::<_, String>(3)?),
                     content: row.get(4)?,
                     embedding,
                 })
@@ -379,7 +379,7 @@ impl MemoryManager {
                     timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
-                    event_type: EventType::from_str(&row.get::<_, String>(3)?),
+                    event_type: EventType::parse(&row.get::<_, String>(3)?),
                     content: row.get(4)?,
                     embedding: Some(embedding),
                 })
@@ -457,7 +457,7 @@ impl MemoryManager {
                     timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(2)?)
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or_else(|_| Utc::now()),
-                    event_type: EventType::from_str(&row.get::<_, String>(3)?),
+                    event_type: EventType::parse(&row.get::<_, String>(3)?),
                     content: row.get(4)?,
                     embedding,
                 })
