@@ -10,6 +10,10 @@ use async_openai::{
 };
 use serde_json::Value;
 
+/// Placeholder API key for services that don't require authentication
+/// This is a well-known placeholder that clearly indicates no real key is needed
+const NO_AUTH_PLACEHOLDER: &str = "no-api-key-required";
+
 /// LLM 提供商
 #[derive(Debug, Clone)]
 pub enum LlmProvider {
@@ -55,9 +59,10 @@ impl LlmGateway {
     /// 创建 Ollama 网关 (本地 LLM)
     pub fn ollama(base_url: Option<String>, model: Option<String>) -> Self {
         let url = base_url.unwrap_or_else(|| "http://localhost:11434/v1".to_string());
+        // Ollama 不需要 API key，使用占位符
         let config = OpenAIConfig::new()
             .with_api_base(&url)
-            .with_api_key("ollama"); // Ollama 不需要 key，但 async-openai 需要非空值
+            .with_api_key(NO_AUTH_PLACEHOLDER);
 
         Self {
             client: Client::with_config(config),
@@ -74,9 +79,10 @@ impl LlmGateway {
                 .with_api_base(&base_url)
                 .with_api_key(key)
         } else {
+            // 自定义端点可能不需要 key，使用占位符
             OpenAIConfig::new()
                 .with_api_base(&base_url)
-                .with_api_key("none")
+                .with_api_key(NO_AUTH_PLACEHOLDER)
         };
 
         Self {
