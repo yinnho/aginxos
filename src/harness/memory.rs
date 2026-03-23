@@ -333,6 +333,8 @@ impl MemoryManager {
     }
 
     /// 基于向量相似度检索相关记忆
+    ///
+    /// 优化：使用候选池 + Top-K 选择，避免加载所有记忆
     pub async fn retrieve_similar(
         &self,
         agent_id: &AgentId,
@@ -345,20 +347,25 @@ impl MemoryManager {
 
         let query_embedding = generator.embed(query).await?;
 
-        // 获取所有有 embedding 的记忆
+        // 优化：只查询最近 N 条记忆作为候选池（N = k * 10）
+        // 这避免了在大量历史记忆中进行全量扫描
+        let candidate_limit = std::cmp::max(k * 10, 100);
+
         let mut stmt = self.db
             .prepare(
                 "SELECT m.id, m.agent_id, m.timestamp, m.event_type, m.content, e.embedding
                  FROM memory m
                  INNER JOIN embeddings e ON m.id = e.memory_id
-                 WHERE m.agent_id = ?1",
+                 WHERE m.agent_id = ?1
+                 ORDER BY m.timestamp DESC
+                 LIMIT ?2",
             )
             .map_err(|e| {
                 crate::core::Error::Internal(format!("Failed to prepare statement: {}", e))
             })?;
 
         let entries = stmt
-            .query_map(params![agent_id.to_string()], |row| {
+            .query_map(params![agent_id.to_string(), candidate_limit as i64], |row| {
                 let embedding_blob: Vec<u8> = row.get(5)?;
                 let embedding: Vec<f32> = embedding_blob.chunks_exact(4)
                     .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -385,7 +392,7 @@ impl MemoryManager {
                 crate::core::Error::Internal(format!("Failed to parse memories: {}", e))
             })?;
 
-        // 计算相似度并排序
+        // 计算相似度
         let query_vec = Array1::from_vec(query_embedding);
 
         let mut scored: Vec<(MemoryEntry, f32)> = entries
