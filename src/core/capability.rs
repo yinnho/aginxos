@@ -43,10 +43,15 @@ impl Capability {
         match (self, other) {
             (Capability::FileSystem { paths: a_paths, mode: a_mode },
              Capability::FileSystem { paths: b_paths, mode: b_mode }) => {
-                // 检查路径覆盖
-                let path_ok = b_paths.iter().all(|bp|
-                    a_paths.iter().any(|ap| bp.starts_with(ap))
-                );
+                // 支持通配符 "*" 表示允许所有路径
+                let path_ok = if a_paths.iter().any(|p| p.to_str() == Some("*")) {
+                    true
+                } else {
+                    // 检查路径覆盖
+                    b_paths.iter().all(|bp|
+                        a_paths.iter().any(|ap| bp.starts_with(ap))
+                    )
+                };
                 // 检查权限覆盖
                 let mode_ok = matches!((a_mode, b_mode),
                     (AccessMode::ReadWrite, _) |
@@ -75,7 +80,12 @@ impl Capability {
             }
             (Capability::Execute { commands: a_cmds },
              Capability::Execute { commands: b_cmds }) => {
-                b_cmds.iter().all(|bc| a_cmds.contains(bc))
+                // 支持通配符 "*" 表示允许所有命令
+                if a_cmds.contains(&"*".to_string()) {
+                    true
+                } else {
+                    b_cmds.iter().all(|bc| a_cmds.contains(bc))
+                }
             }
             (Capability::SpawnAgent { max_count: a_max },
              Capability::SpawnAgent { max_count: b_max }) => {

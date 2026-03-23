@@ -144,6 +144,7 @@ async fn test_mock_write_file() {
         MockResponse {
             content: "I'll write a hello world file.".to_string(),
             tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
                 name: "write_file".to_string(),
                 arguments: serde_json::json!({
                     "path": "/tmp/hello.txt",
@@ -187,6 +188,7 @@ async fn test_mock_read_file() {
         MockResponse {
             content: "I'll read the file.".to_string(),
             tool_calls: vec![ToolCall {
+                id: "call_2".to_string(),
                 name: "read_file".to_string(),
                 arguments: serde_json::json!({
                     "path": "/tmp/test_read.txt"
@@ -218,6 +220,7 @@ async fn test_mock_capability_denied() {
         MockResponse {
             content: "I'll try to read a file.".to_string(),
             tool_calls: vec![ToolCall {
+                id: "call_3".to_string(),
                 name: "read_file".to_string(),
                 arguments: serde_json::json!({
                     "path": "/etc/passwd"
@@ -245,6 +248,7 @@ async fn test_mock_execute_command() {
         MockResponse {
             content: "I'll run echo command.".to_string(),
             tool_calls: vec![ToolCall {
+                id: "call_4".to_string(),
                 name: "execute".to_string(),
                 arguments: serde_json::json!({
                     "command": "echo",
@@ -282,6 +286,7 @@ async fn test_mock_multi_step_goal() {
         MockResponse {
             content: "Step 1: Creating file.".to_string(),
             tool_calls: vec![ToolCall {
+                id: "call_5".to_string(),
                 name: "write_file".to_string(),
                 arguments: serde_json::json!({
                     "path": "/tmp/multi_test.txt",
@@ -293,6 +298,7 @@ async fn test_mock_multi_step_goal() {
         MockResponse {
             content: "Step 2: Verifying file.".to_string(),
             tool_calls: vec![ToolCall {
+                id: "call_6".to_string(),
                 name: "read_file".to_string(),
                 arguments: serde_json::json!({
                     "path": "/tmp/multi_test.txt"

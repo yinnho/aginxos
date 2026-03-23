@@ -7,6 +7,7 @@ use std::time::Duration;
 /// 工具调用请求
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
+    pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
 }
@@ -185,6 +186,19 @@ impl ToolBus {
 
     /// 验证路径是否在允许的范围内（防止路径遍历攻击）
     fn validate_path(&self, path_str: &str, allowed_paths: &[PathBuf]) -> Result<PathBuf, Error> {
+        // 支持通配符 "*" 表示允许所有路径
+        if allowed_paths.iter().any(|p| p.to_str() == Some("*")) {
+            // 通配符模式下，仍然规范化路径以防止路径遍历
+            let path = PathBuf::from(path_str);
+            return if path.exists() {
+                path.canonicalize()
+                    .map_err(|e| Error::Tool(format!("Failed to resolve path: {}", e)))
+            } else {
+                // 对于不存在的文件，返回原始路径
+                Ok(path)
+            };
+        }
+
         let path = PathBuf::from(path_str);
 
         // 规范化路径（解析 ..、. 和符号链接）
@@ -218,9 +232,15 @@ impl ToolBus {
         agent.capabilities.iter()
             .filter_map(|cap| {
                 if let Capability::FileSystem { paths, .. } = cap {
-                    // 尝试规范化允许的路径
+                    // 保留通配符路径，其他路径尝试规范化
                     paths.iter()
-                        .filter_map(|p| p.canonicalize().ok())
+                        .filter_map(|p| {
+                            if p.to_str() == Some("*") {
+                                Some(p.clone())
+                            } else {
+                                p.canonicalize().ok()
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .into_iter()
                         .next()

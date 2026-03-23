@@ -293,6 +293,7 @@ impl LlmGateway {
         Ok(LlmResponse {
             content: message.content.clone().unwrap_or_default(),
             tool_calls: tool_calls.into_iter().map(|tc| ToolCall {
+                id: tc.id,
                 name: tc.function.name,
                 arguments: serde_json::from_str(&tc.function.arguments).unwrap_or(Value::Null),
             }).collect(),

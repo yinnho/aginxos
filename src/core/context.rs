@@ -10,12 +10,24 @@ pub enum Role {
     Tool,
 }
 
+/// 工具调用信息（用于存储在消息中）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
 /// 消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
     pub name: Option<String>,
+    /// 工具调用 ID（仅用于 Tool 角色）
+    pub tool_call_id: Option<String>,
+    /// 工具调用列表（仅用于 Assistant 角色）
+    pub tool_calls: Vec<StoredToolCall>,
 }
 
 impl Message {
@@ -24,6 +36,8 @@ impl Message {
             role: Role::System,
             content: content.into(),
             name: None,
+            tool_call_id: None,
+            tool_calls: vec![],
         }
     }
 
@@ -32,6 +46,8 @@ impl Message {
             role: Role::User,
             content: content.into(),
             name: None,
+            tool_call_id: None,
+            tool_calls: vec![],
         }
     }
 
@@ -40,14 +56,31 @@ impl Message {
             role: Role::Assistant,
             content: content.into(),
             name: None,
+            tool_call_id: None,
+            tool_calls: vec![],
         }
     }
 
-    pub fn tool_result(name: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<StoredToolCall>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            name: None,
+            tool_call_id: None,
+            tool_calls,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
             content: content.into(),
-            name: Some(name.into()),
+            name: None,
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: vec![],
         }
     }
 }
@@ -128,6 +161,8 @@ impl Context {
             ChatCompletionRequestUserMessageArgs,
             ChatCompletionRequestAssistantMessageArgs,
             ChatCompletionRequestToolMessageArgs,
+            ChatCompletionMessageToolCall,
+            FunctionCall,
         };
 
         self.messages.iter().map(|m| match m.role {
@@ -144,15 +179,38 @@ impl Context {
                     .map(ChatCompletionRequestMessage::User)
             }
             super::Role::Assistant => {
-                ChatCompletionRequestAssistantMessageArgs::default()
-                    .content(&*m.content)
-                    .build()
-                    .map(ChatCompletionRequestMessage::Assistant)
+                // 构建 Assistant 消息
+                let openai_tool_calls: Vec<ChatCompletionMessageToolCall> = m.tool_calls.iter().map(|tc| {
+                    ChatCompletionMessageToolCall {
+                        id: tc.id.clone(),
+                        r#type: async_openai::types::ChatCompletionToolType::Function,
+                        function: FunctionCall {
+                            name: tc.name.clone(),
+                            arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                        },
+                    }
+                }).collect();
+
+                let content = if m.content.is_empty() {
+                    None
+                } else {
+                    Some(&*m.content)
+                };
+
+                let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
+                if let Some(c) = content {
+                    builder.content(c);
+                }
+                if !openai_tool_calls.is_empty() {
+                    builder.tool_calls(openai_tool_calls);
+                }
+                builder.build().map(ChatCompletionRequestMessage::Assistant)
             }
             super::Role::Tool => {
+                let tool_id = m.tool_call_id.as_deref().unwrap_or("unknown");
                 ChatCompletionRequestToolMessageArgs::default()
                     .content(&*m.content)
-                    .tool_call_id(m.name.as_deref().unwrap_or("unknown"))
+                    .tool_call_id(tool_id)
                     .build()
                     .map(ChatCompletionRequestMessage::Tool)
             }

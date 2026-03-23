@@ -46,8 +46,9 @@ async fn run_goal(description: &str) {
 
     // 创建 Agent
     let mut agent = Agent::new("default");
+    // MVP: 授予通配符权限（生产环境应使用更严格的权限）
     agent.grant_capability(Capability::FileSystem {
-        paths: vec![std::env::current_dir().unwrap_or_default()],
+        paths: vec!["*".into()],
         mode: AccessMode::ReadWrite,
     });
     agent.grant_capability(Capability::Execute {

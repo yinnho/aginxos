@@ -67,10 +67,9 @@ impl AgentExecutor {
             // 调用 LLM
             let response = self.gateway.chat(&self.agent.context).await?;
 
-            // 添加助手回复到上下文
-            self.agent.context.push(Message::assistant(&response.content));
-
             if !response.has_tool_calls() {
+                // 没有工具调用，添加普通助手回复并认为任务完成
+                self.agent.context.push(Message::assistant(&response.content));
                 // 没有工具调用，认为任务完成
                 self.memory.store(
                     &self.agent.id,
@@ -81,6 +80,19 @@ impl AgentExecutor {
                 self.agent.state = AgentState::Completed;
                 return Ok(StepResult::Completed);
             }
+
+            // 有工具调用，添加带 tool_calls 的助手消息到上下文
+            let stored_tool_calls: Vec<StoredToolCall> = response.tool_calls.iter().map(|tc| {
+                StoredToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                }
+            }).collect();
+            self.agent.context.push(Message::assistant_with_tool_calls(
+                &response.content,
+                stored_tool_calls,
+            ));
 
             // 执行工具调用
             for tool_call in &response.tool_calls {
@@ -98,9 +110,9 @@ impl AgentExecutor {
                     &result.output,
                 )?;
 
-                // 添加工具结果到上下文
+                // 添加工具结果到上下文（使用 tool_call_id）
                 self.agent.context.push(Message::tool_result(
-                    &tool_call.name,
+                    &tool_call.id,
                     format!("Success: {}\n{}", result.success, result.output),
                 ));
             }
