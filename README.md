@@ -233,7 +233,7 @@ RUST_LOG=debug cargo run
 
 - [x] Local LLM support (Ollama)
 - [x] Context compaction with LLM summarization
-- [ ] Vector-based memory retrieval (sqlite-vec)
+- [x] Vector-based memory retrieval (sqlite-vec)
 - [ ] Multi-agent coordination
 - [ ] Agent isolation (namespaces/seccomp)
 - [ ] Goal verification framework

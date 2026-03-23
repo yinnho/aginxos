@@ -28,6 +28,13 @@ async-openai = "0.24"
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# Vector operations
+ndarray = "0.16"
+ndarray-stats = "0.6"
+
+# Async traits
+async-trait = "0.1"
+
 # Errors
 thiserror = "1"
 anyhow = "1"
