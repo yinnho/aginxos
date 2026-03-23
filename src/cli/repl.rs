@@ -7,6 +7,7 @@ use nu_ansi_term::Color;
 use reedline::{DefaultPrompt, Reedline, Signal};
 
 /// CLI REPL
+#[allow(dead_code)] // scheduler reserved for future goal queue management
 pub struct Repl {
     editor: Reedline,
     prompt: DefaultPrompt,

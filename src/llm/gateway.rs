@@ -168,7 +168,7 @@ impl LlmGateway {
         &self,
         context: &Context,
     ) -> Result<LlmResponse, Error> {
-        let messages = context.to_openai_messages();
+        let messages = context.to_openai_messages()?;
         let tools = self.tools();
 
         let request = CreateChatCompletionRequestArgs::default()

@@ -55,7 +55,8 @@ async fn run_goal(description: &str) {
     });
 
     // 创建执行器
-    let memory = MemoryManager::in_memory().unwrap();
+    let memory = MemoryManager::in_memory()
+        .expect("Failed to initialize memory manager");
     let scheduler = IntentScheduler::new();
     let gateway = LlmGateway::from_env();
     println!("Using model: {} via {:?}",

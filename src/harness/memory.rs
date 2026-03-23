@@ -2,8 +2,7 @@ use crate::core::AgentId;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use ndarray::{Array1, Axis};
-use ndarray_stats::DeviationExt;
+use ndarray::Array1;
 
 /// Embedding 向量维度 (OpenAI text-embedding-3-small)
 pub const EMBEDDING_DIM: usize = 1536;
@@ -213,13 +212,13 @@ impl MemoryManager {
 
     pub fn with_openai_embeddings(api_key: Option<String>, model: Option<String>) -> Self {
         Self::in_memory()
-            .unwrap()
+            .expect("Failed to create in-memory database for OpenAI embeddings")
             .with_embedding_generator(Box::new(OpenAIEmbedding::new(api_key, model)))
     }
 
     pub fn with_mock_embeddings() -> Self {
         Self::in_memory()
-            .unwrap()
+            .expect("Failed to create in-memory database for mock embeddings")
             .with_embedding_generator(Box::new(MockEmbedding))
     }
 

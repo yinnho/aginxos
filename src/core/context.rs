@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use super::Error;
 
 /// 消息角色
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,7 +121,7 @@ impl Context {
     }
 
     /// 转换为 OpenAI 格式的消息
-    pub fn to_openai_messages(&self) -> Vec<async_openai::types::ChatCompletionRequestMessage> {
+    pub fn to_openai_messages(&self) -> Result<Vec<async_openai::types::ChatCompletionRequestMessage>, Error> {
         use async_openai::types::{
             ChatCompletionRequestMessage,
             ChatCompletionRequestSystemMessageArgs,
@@ -131,38 +132,31 @@ impl Context {
 
         self.messages.iter().map(|m| match m.role {
             super::Role::System => {
-                ChatCompletionRequestMessage::System(
-                    ChatCompletionRequestSystemMessageArgs::default()
-                        .content(&*m.content)
-                        .build()
-                        .unwrap()
-                )
+                ChatCompletionRequestSystemMessageArgs::default()
+                    .content(&*m.content)
+                    .build()
+                    .map(ChatCompletionRequestMessage::System)
             }
             super::Role::User => {
-                ChatCompletionRequestMessage::User(
-                    ChatCompletionRequestUserMessageArgs::default()
-                        .content(&*m.content)
-                        .build()
-                        .unwrap()
-                )
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content(&*m.content)
+                    .build()
+                    .map(ChatCompletionRequestMessage::User)
             }
             super::Role::Assistant => {
-                ChatCompletionRequestMessage::Assistant(
-                    ChatCompletionRequestAssistantMessageArgs::default()
-                        .content(&*m.content)
-                        .build()
-                        .unwrap()
-                )
+                ChatCompletionRequestAssistantMessageArgs::default()
+                    .content(&*m.content)
+                    .build()
+                    .map(ChatCompletionRequestMessage::Assistant)
             }
             super::Role::Tool => {
-                ChatCompletionRequestMessage::Tool(
-                    ChatCompletionRequestToolMessageArgs::default()
-                        .content(&*m.content)
-                        .tool_call_id(m.name.as_deref().unwrap_or("unknown"))
-                        .build()
-                        .unwrap()
-                )
+                ChatCompletionRequestToolMessageArgs::default()
+                    .content(&*m.content)
+                    .tool_call_id(m.name.as_deref().unwrap_or("unknown"))
+                    .build()
+                    .map(ChatCompletionRequestMessage::Tool)
             }
-        }).collect()
+        }).collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Internal(format!("Failed to build message: {}", e)))
     }
 }

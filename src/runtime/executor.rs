@@ -1,13 +1,16 @@
 use crate::core::*;
-use crate::harness::MemoryManager;
+use crate::harness::{ContextManager, MemoryManager};
 use crate::llm::LlmGateway;
 use crate::scheduler::IntentScheduler;
 
 /// Agent 执行器
+#[allow(dead_code)] // scheduler reserved for multi-agent coordination
 pub struct AgentExecutor {
     agent: Agent,
     gateway: LlmGateway,
     memory: MemoryManager,
+    #[allow(dead_code)] // context_manager reserved for advanced compaction
+    context_manager: ContextManager,
     scheduler: IntentScheduler,
     max_iterations: usize,
 }
@@ -19,10 +22,14 @@ impl AgentExecutor {
         memory: MemoryManager,
         scheduler: IntentScheduler,
     ) -> Self {
+        // ContextManager 用于上下文压缩，memory 用于事件记录
+        // 由于 MemoryManager 不可 Clone，这里只保留引用的语义
+        // 压缩时归档的消息会保存到主 memory 中
         Self {
             agent,
             gateway,
             memory,
+            context_manager: ContextManager::new(),
             scheduler,
             max_iterations: 50,
         }
@@ -98,44 +105,9 @@ impl AgentExecutor {
                 ));
             }
 
-            // 检查是否需要压缩上下文
-            if self.agent.context.needs_compaction() {
-                // MVP: 简单地截断旧消息（保留系统消息）
-                // TODO: 实现 LLM 摘要
-                self.compact_context();
-            }
+            // 检查并执行上下文压缩
+            // 使用 ContextManager 的压缩策略（默认保留系统消息 + 最近 10 条）
+            self.context_manager.maybe_compact(&mut self.agent).await?;
         }
-    }
-
-    /// 简单的上下文压缩
-    fn compact_context(&mut self) {
-        if self.agent.context.messages.len() <= 4 {
-            return;
-        }
-
-        // 保留系统消息和最近的消息
-        let system_messages: Vec<_> = self.agent.context.messages
-            .iter()
-            .filter(|m| m.role == Role::System)
-            .cloned()
-            .collect();
-
-        let recent_count = 6;
-        let recent_messages: Vec<_> = self.agent.context.messages
-            .iter()
-            .rev()
-            .take(recent_count)
-            .rev()
-            .cloned()
-            .collect();
-
-        self.agent.context.messages = system_messages;
-        self.agent.context.messages.extend(recent_messages);
-
-        // 重新估算 token
-        self.agent.context.current_tokens = self.agent.context.messages
-            .iter()
-            .map(|m| self.agent.context.estimate_tokens(&m.content))
-            .sum();
     }
 }
