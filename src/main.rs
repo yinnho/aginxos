@@ -57,12 +57,14 @@ async fn run_goal(description: &str) {
     // 创建执行器
     let memory = MemoryManager::in_memory().unwrap();
     let scheduler = IntentScheduler::new();
+    let gateway = LlmGateway::from_env();
+    println!("Using model: {} via {:?}",
+        gateway.model(),
+        gateway.provider()
+    );
     let mut executor = AgentExecutor::new(
         agent,
-        LlmGateway::new(
-            std::env::var("OPENAI_API_KEY").ok(),
-            std::env::var("AGENTOS_MODEL").ok(),
-        ),
+        gateway,
         memory,
         scheduler,
     );

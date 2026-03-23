@@ -170,10 +170,54 @@ struct Context {
 
 ## Configuration
 
-| Environment Variable | Description |
-|---------------------|-------------|
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
 | `OPENAI_API_KEY` | OpenAI API key |
-| `AGENTOS_MODEL` | Model to use (default: gpt-4o) |
+| `AGENTOS_MODEL` | Model to use (default: gpt-4o / llama3.2) |
+| `AGENTOS_LLM_PROVIDER` | Provider: `openai`, `ollama`, `custom` |
+| `OLLAMA_BASE_URL` | Ollama server URL (default: http://localhost:11434/v1) |
+| `AGENTOS_LLM_BASE_URL` | Custom LLM API base URL |
+| `AGENTOS_LLM_API_KEY` | Custom LLM API key |
+
+### Using Local LLM (Ollama)
+
+1. Install and start Ollama:
+```bash
+# macOS/Linux
+curl -fsSL https://ollama.com/install.sh | sh
+ollama serve
+```
+
+2. Pull a model:
+```bash
+ollama pull llama3.2
+# or
+ollama pull qwen2.5
+ollama pull deepseek-r1
+```
+
+3. Run AgentOS:
+```bash
+# Auto-detect Ollama
+./target/release/agentos
+
+# Or explicitly set
+export AGENTOS_LLM_PROVIDER=ollama
+export AGENTOS_MODEL=llama3.2
+./target/release/agentos
+```
+
+### Using Custom LLM Endpoint
+
+```bash
+export AGENTOS_LLM_PROVIDER=custom
+export AGENTOS_LLM_BASE_URL=http://your-llm-server:8000/v1
+export AGENTOS_LLM_API_KEY=your_key_if_needed
+export AGENTOS_MODEL=your-model-name
+./target/release/agentos
+```
 
 ## Development
 
@@ -187,9 +231,9 @@ RUST_LOG=debug cargo run
 
 ## Roadmap
 
+- [x] Local LLM support (Ollama)
 - [ ] Context compaction with LLM summarization
 - [ ] Vector-based memory retrieval (sqlite-vec)
-- [ ] Local LLM support (llama.cpp)
 - [ ] Multi-agent coordination
 - [ ] Agent isolation (namespaces/seccomp)
 - [ ] Goal verification framework

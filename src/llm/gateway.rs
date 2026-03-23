@@ -13,9 +13,18 @@ use serde_json::Value;
 /// LLM 提供商
 #[derive(Debug, Clone)]
 pub enum LlmProvider {
+    /// OpenAI API
     OpenAI,
-    Anthropic,
-    Local(String), // 本地模型路径
+    /// Ollama 本地服务
+    Ollama { base_url: String },
+    /// 自定义 OpenAI 兼容端点
+    Custom { base_url: String, api_key: Option<String> },
+}
+
+impl Default for LlmProvider {
+    fn default() -> Self {
+        Self::OpenAI
+    }
 }
 
 /// LLM Gateway - LLM 网关
@@ -23,23 +32,124 @@ pub struct LlmGateway {
     client: Client<OpenAIConfig>,
     model: String,
     tool_bus: ToolBus,
+    provider: LlmProvider,
 }
 
 impl LlmGateway {
-    pub fn new(api_key: Option<String>, model: Option<String>) -> Self {
+    /// 创建 OpenAI 网关
+    pub fn openai(api_key: Option<String>, model: Option<String>) -> Self {
         let config = if let Some(key) = api_key {
             OpenAIConfig::new().with_api_key(key)
         } else {
             OpenAIConfig::new()
         };
 
-        let client = Client::with_config(config);
-
         Self {
-            client,
+            client: Client::with_config(config),
             model: model.unwrap_or_else(|| "gpt-4o".to_string()),
             tool_bus: ToolBus::new(),
+            provider: LlmProvider::OpenAI,
         }
+    }
+
+    /// 创建 Ollama 网关 (本地 LLM)
+    pub fn ollama(base_url: Option<String>, model: Option<String>) -> Self {
+        let url = base_url.unwrap_or_else(|| "http://localhost:11434/v1".to_string());
+        let config = OpenAIConfig::new()
+            .with_api_base(&url)
+            .with_api_key("ollama"); // Ollama 不需要 key，但 async-openai 需要非空值
+
+        Self {
+            client: Client::with_config(config),
+            model: model.unwrap_or_else(|| "llama3.2".to_string()),
+            tool_bus: ToolBus::new(),
+            provider: LlmProvider::Ollama { base_url: url },
+        }
+    }
+
+    /// 创建自定义端点网关
+    pub fn custom(base_url: String, api_key: Option<String>, model: Option<String>) -> Self {
+        let config = if let Some(key) = &api_key {
+            OpenAIConfig::new()
+                .with_api_base(&base_url)
+                .with_api_key(key)
+        } else {
+            OpenAIConfig::new()
+                .with_api_base(&base_url)
+                .with_api_key("none")
+        };
+
+        Self {
+            client: Client::with_config(config),
+            model: model.unwrap_or_else(|| "local-model".to_string()),
+            tool_bus: ToolBus::new(),
+            provider: LlmProvider::Custom { base_url, api_key },
+        }
+    }
+
+    /// 从环境变量自动创建网关
+    pub fn from_env() -> Self {
+        // 优先检查本地 LLM 配置
+        if let Ok(provider) = std::env::var("AGENTOS_LLM_PROVIDER") {
+            match provider.to_lowercase().as_str() {
+                "ollama" | "local" => {
+                    return Self::ollama(
+                        std::env::var("OLLAMA_BASE_URL").ok(),
+                        std::env::var("AGENTOS_MODEL").ok(),
+                    );
+                }
+                "custom" => {
+                    if let Ok(base_url) = std::env::var("AGENTOS_LLM_BASE_URL") {
+                        return Self::custom(
+                            base_url,
+                            std::env::var("AGENTOS_LLM_API_KEY").ok(),
+                            std::env::var("AGENTOS_MODEL").ok(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 检查是否有 Ollama 运行
+        if Self::check_ollama_running() {
+            println!("ℹ Detected Ollama running, using local LLM");
+            return Self::ollama(
+                std::env::var("OLLAMA_BASE_URL").ok(),
+                std::env::var("AGENTOS_MODEL").ok().or(std::env::var("OLLAMA_MODEL").ok()),
+            );
+        }
+
+        // 默认使用 OpenAI
+        Self::openai(
+            std::env::var("OPENAI_API_KEY").ok(),
+            std::env::var("AGENTOS_MODEL").ok(),
+        )
+    }
+
+    /// 检查 Ollama 是否在运行
+    fn check_ollama_running() -> bool {
+        use std::net::TcpStream;
+
+        let url = std::env::var("OLLAMA_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+
+        // 解析主机和端口
+        let host_port = url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://");
+
+        TcpStream::connect(host_port).is_ok()
+    }
+
+    /// 获取当前提供商
+    pub fn provider(&self) -> &LlmProvider {
+        &self.provider
+    }
+
+    /// 获取当前模型
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     /// 获取工具定义

@@ -20,11 +20,7 @@ impl Repl {
         let editor = Reedline::create();
         let prompt = DefaultPrompt::default();
 
-        // 从环境变量获取 API key
-        let api_key = std::env::var("OPENAI_API_KEY").ok();
-        let model = std::env::var("AGENTOS_MODEL").ok();
-
-        let gateway = LlmGateway::new(api_key, model);
+        let gateway = LlmGateway::from_env();
         let scheduler = IntentScheduler::new();
         let state = StateManager::new(".agentos/state.json");
 
@@ -95,6 +91,7 @@ impl Repl {
         );
         println!("{}", Color::Green.paint("  Agent Harness Operating System"));
         println!();
+        println!("Model: {} ({:?})", self.gateway.model(), self.gateway.provider());
         println!("Type your goal and press Enter. Type :help for commands.");
         println!();
     }
@@ -164,12 +161,10 @@ impl Repl {
         // 创建执行器
         let memory = MemoryManager::in_memory()?;
         let scheduler = IntentScheduler::new();
+        let gateway = LlmGateway::from_env();
         let mut executor = AgentExecutor::new(
             agent,
-            LlmGateway::new(
-                std::env::var("OPENAI_API_KEY").ok(),
-                std::env::var("AGENTOS_MODEL").ok(),
-            ),
+            gateway,
             memory,
             scheduler,
         );
