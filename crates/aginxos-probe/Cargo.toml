@@ -1,0 +1,15 @@
+[package]
+name = "aginxos-probe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AginxOS userspace probe for Pixel 5 (redfin) bring-up"
+publish = false
+
+[[bin]]
+name = "aginxos-probe"
+path = "src/main.rs"
+
+[dependencies]
+libc = { workspace = true }
+anyhow = { workspace = true }

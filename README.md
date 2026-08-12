@@ -1,310 +1,65 @@
-# AgentOS
+# AginxOS
 
-An Agent Harness Operating System that schedules **goals** instead of processes and manages **context** as a first-class resource.
+**AginxOS** is a phone-oriented operating system built as:
 
-## Concept
-
-```
-Traditional OS          →    AgentOS
-─────────────────────────────────────────
-Process                 →    Goal (intent-based scheduling)
-CPU time slices         →    Context window (token management)
-System calls            →    Tool calls
-File permissions        →    Capabilities (semantic access control)
-Memory                  →    Persistent memory (SQLite)
+```text
+Linux kernel (drivers)  +  Rust userspace (the system)
 ```
 
-**Formula**: `Model + Harness = Agent`
+First target: **Google Pixel 5** (`redfin`, Snapdragon 765G), experimental device, unlocked bootloader.
 
-The Harness handles:
-- Tool execution
-- Context management (compaction, restoration)
-- Memory persistence
-- Capability enforcement
-- Verification loops
+## Route A
 
-## Architecture
+We do **not** rewrite Wi‑Fi firmware or the 5G baseband in Rust.
 
-```
-┌─────────────────────────────────────────┐
-│              CLI Interface               │
-└─────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────┐
-│           Intent Scheduler               │
-│   Goal Queue │ Scheduler │ Verifier     │
-└─────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────┐
-│           Agent Runtime                  │
-│   Loader │ Context Manager │ Isolator   │
-└─────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────┐
-│           Harness Layer                  │
-│   Tool Bus │ Memory Mgr │ State Persist │
-└─────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────┐
-│           LLM Gateway                    │
-│   Local (llama.cpp) │ Remote (OpenAI)   │
-└─────────────────────────────────────────┘
-```
+| Layer | Owner |
+|-------|--------|
+| Bootloader | Stock Pixel ABOOT/ABL |
+| Kernel + drivers | Android/downstream Linux (bring-up), mainline later where useful |
+| Userspace / policy / UI / telephony front-end | **AginxOS (Rust)** |
 
-## Installation
+## Workspace
+
+| Crate | Role |
+|-------|------|
+| `aginxos-probe` | Bring-up probe: kernel version, input/DRM nodes |
+| `aginxos-agent` | Early system agent: Unix socket + heartbeat |
 
 ```bash
-git clone https://github.com/yinnho/agentos.git
-cd agentos
-cargo build --release
+# Host check
+cargo build -p aginxos-probe
+
+# Phone (once aarch64 musl toolchain is set up)
+rustup target add aarch64-unknown-linux-musl
+cargo build -p aginxos-probe --release --target aarch64-unknown-linux-musl
+adb push target/aarch64-unknown-linux-musl/release/aginxos-probe /data/local/tmp/
+adb shell chmod +x /data/local/tmp/aginxos-probe
+adb shell /data/local/tmp/aginxos-probe
 ```
 
-## Usage
+## Repo layout
 
-### Interactive Mode
-
-```bash
-export OPENAI_API_KEY=your_key
-./target/release/agentos
+```text
+aginxos/
+  crates/           # Rust userspace
+  boot/             # boot.img unpack, initramfs, mkboot scripts
+  rootfs/           # rootfs overlays for the phone
+  docs/             # hardware notes, bring-up log
+  scripts/          # build / push / fastboot helpers
 ```
 
-```
-   ___                  ____  _____
-  / _ | ____  ___  ___ / __ \/ ___/
- / __ |/ __ \/ _ \/ _ // /_/ / /
-/_/ |_/_/ /_/\___/\_,_/\____/_/
+## Near-term milestones
 
-  Agent Harness Operating System
+1. `aginxos-probe` runs on Pixel 5 (Android shell is fine)
+2. Custom `boot.img` via `fastboot boot` (no flash until stable)
+3. Minimal rootfs + SSH or shell
+4. Touch + display loop
+5. Wi‑Fi (host driver + vendor firmware)
+6. Modem control path (QMI/MBIM), not a custom baseband
 
-Type your goal and press Enter. Type :help for commands.
+## Name
 
-> Create a hello world program in Python and run it
-→ Goal: Create a hello world program in Python and run it
-
-Working...
-✓ Goal completed!
-```
-
-### Non-Interactive Mode
-
-```bash
-./target/release/agentos "List all Rust files in the project"
-```
-
-### CLI Commands
-
-| Command | Description |
-|---------|-------------|
-| `:help` | Show available commands |
-| `:status` | Show system status |
-| `:goals` | Show pending goals |
-| `:quit` | Exit AgentOS |
-
-## Core Abstractions
-
-### Agent
-
-An execution unit with a goal, not a code entry point:
-
-```rust
-struct Agent {
-    id: AgentId,
-    goal: Goal,           // What to accomplish
-    state: AgentState,    // Running | Paused | Blocked | Completed
-    context: Context,     // Managed context window
-    capabilities: Vec<Capability>,
-}
-```
-
-### Goal
-
-The scheduling unit - intent, not instruction stream:
-
-```rust
-struct Goal {
-    id: GoalId,
-    description: String,
-    success_criteria: Vec<Test>,
-    priority: Priority,
-    dependencies: Vec<GoalId>,
-}
-```
-
-### Capability
-
-Semantic access control, not file permissions:
-
-```rust
-enum Capability {
-    FileSystem { paths: Vec<PathBuf>, mode: AccessMode },
-    Network { domains: Vec<String>, ports: Vec<u16> },
-    Execute { commands: Vec<String> },
-    CallLLM { model: String, max_tokens: usize },
-}
-```
-
-### Context
-
-Token window as a managed resource:
-
-```rust
-struct Context {
-    messages: Vec<Message>,
-    max_tokens: usize,
-    current_tokens: usize,
-    compaction_policy: CompactionPolicy,
-}
-```
-
-## Built-in Tools
-
-| Tool | Description |
-|------|-------------|
-| `read_file` | Read file contents |
-| `write_file` | Write content to file |
-| `execute` | Run shell commands |
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `OPENAI_API_KEY` | OpenAI API key |
-| `AGENTOS_MODEL` | Model to use (default: gpt-4o / llama3.2) |
-| `AGENTOS_LLM_PROVIDER` | Provider: `openai`, `ollama`, `custom` |
-| `OLLAMA_BASE_URL` | Ollama server URL (default: http://localhost:11434/v1) |
-| `AGENTOS_LLM_BASE_URL` | Custom LLM API base URL |
-| `AGENTOS_LLM_API_KEY` | Custom LLM API key |
-
-### Using Local LLM (Ollama)
-
-1. Install and start Ollama:
-```bash
-# macOS/Linux
-curl -fsSL https://ollama.com/install.sh | sh
-ollama serve
-```
-
-2. Pull a model:
-```bash
-ollama pull llama3.2
-# or
-ollama pull qwen2.5
-ollama pull deepseek-r1
-```
-
-3. Run AgentOS:
-```bash
-# Auto-detect Ollama
-./target/release/agentos
-
-# Or explicitly set
-export AGENTOS_LLM_PROVIDER=ollama
-export AGENTOS_MODEL=llama3.2
-./target/release/agentos
-```
-
-### Using Custom LLM Endpoint
-
-```bash
-export AGENTOS_LLM_PROVIDER=custom
-export AGENTOS_LLM_BASE_URL=http://your-llm-server:8000/v1
-export AGENTOS_LLM_API_KEY=your_key_if_needed
-export AGENTOS_MODEL=your-model-name
-./target/release/agentos
-```
-
-### Using DeepSeek
-
-```bash
-export AGENTOS_LLM_PROVIDER=custom
-export AGENTOS_LLM_BASE_URL=https://api.deepseek.com/v1
-export AGENTOS_LLM_API_KEY=your_deepseek_api_key
-export AGENTOS_MODEL=deepseek-chat
-./target/release/agentos
-```
-
-## Development
-
-```bash
-# Run tests
-cargo test
-
-# Run with debug logging
-RUST_LOG=debug cargo run
-```
-
-## Security
-
-AgentOS implements multiple layers of security to ensure safe agent execution:
-
-### Command Execution Sandbox
-
-Commands are executed with the following restrictions:
-
-- **Blocked commands blacklist**: Dangerous commands are blocked by default:
-  - Destructive: `rm`, `rmdir`, `dd`, `mkfs`, `fdisk`
-  - Privilege escalation: `sudo`, `su`, `chmod`, `chown`, `passwd`
-  - System control: `shutdown`, `reboot`, `init`, `kill`, `killall`
-  - Network download: `curl`, `wget`
-
-- **Execution timeout**: Commands are limited to 30 seconds by default
-
-### Path Traversal Prevention
-
-File operations are protected against directory traversal attacks:
-
-- Paths are canonicalized to resolve `..` and symlinks
-- All file access is validated against the agent's allowed directories
-- Agents cannot access files outside their granted filesystem capabilities
-
-### Rate Limiting
-
-LLM API calls are rate-limited to prevent runaway costs:
-
-- Default: 60 requests per minute
-- Default: 100,000 tokens per minute
-- Configurable via `RateLimitConfig`
-
-### Audit Logging
-
-All tool executions are logged with:
-
-- Timestamp and agent ID
-- Tool name and arguments
-- Result and success status
-- Execution duration
-
-```rust
-// Query audit logs
-let entries = audit_log.query_by_agent(&agent_id, 100)?;
-
-// Get tool statistics
-let stats = audit_log.tool_stats(&agent_id)?;
-println!("Success rate: {:.1}%", stats.success_rate() * 100.0);
-```
-
-## Roadmap
-
-- [x] Local LLM support (Ollama)
-- [x] Context compaction with LLM summarization
-- [x] Vector-based memory retrieval (sqlite-vec)
-- [x] Security hardening (command sandbox, path validation, rate limiting)
-- [ ] Multi-agent coordination
-- [ ] Agent isolation (namespaces/seccomp)
-- [ ] Goal verification framework
-- [ ] Web UI
-
-## License
-
-MIT
-
-## Inspiration
-
-- [Anthropic: Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
-- [Redox OS](https://www.redox-os.org/)
+- Product: **AginxOS**
+- Crate / path prefix: `aginxos-*`
+- Env vars: `AGINXOS_*`
+- Runtime paths: `/run/aginxos/`, `/var/log/aginxos-*`

@@ -1,0 +1,17 @@
+[package]
+name = "aginxos-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AginxOS early userspace agent (socket + heartbeat)"
+publish = false
+
+[[bin]]
+name = "aginxos-agent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

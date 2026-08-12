@@ -2,3 +2,11 @@
 .agentos/
 *.db
 .env
+.DS_Store
+boot/unpack/
+boot/*.img
+boot/*.gz
+boot/*.cpio
+rootfs/work/
+rootfs/*.tar*
+*.img
