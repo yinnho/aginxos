@@ -1,5 +1,7 @@
 # AginxOS
 
+[![GitHub](https://img.shields.io/badge/GitHub-yinnho%2Faginxos-black)](https://github.com/yinnho/aginxos)
+
 **AginxOS** is a phone-oriented operating system built as:
 
 ```text

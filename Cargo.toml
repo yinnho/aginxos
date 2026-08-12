@@ -10,8 +10,8 @@ default-members = ["crates/aginxos-probe"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/sophiehe/aginxos"
-authors = ["AginxOS contributors"]
+repository = "https://github.com/yinnho/aginxos"
+authors = ["yinnho"]
 
 [workspace.dependencies]
 libc = "0.2"
