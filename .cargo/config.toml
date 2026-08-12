@@ -1,0 +1,13 @@
+# Cross-compile defaults for AginxOS (macOS host friendly).
+#
+# Android (probe on stock/Lineage shell):
+#   export ANDROID_NDK_HOME=...  # or rely on scripts/env-cross.sh
+#   cargo build -p aginxos-probe --release --target aarch64-linux-android
+#
+# Linux musl (AginxOS rootfs): prefer cargo-zigbuild
+#   cargo zigbuild -p aginxos-probe --release --target aarch64-unknown-linux-musl
+
+[target.aarch64-linux-android]
+# Linker is injected by scripts/env-cross.sh when NDK is present.
+# If you set it permanently, uncomment and adjust API level:
+# linker = "/path/to/ndk/toolchains/llvm/prebuilt/.../bin/aarch64-linux-android30-clang"

@@ -38,16 +38,29 @@ See [docs/DECISIONS.md](docs/DECISIONS.md) for full locked choices (bring-up pol
 | `aginxos-agent` | Early system agent: Unix socket + heartbeat |
 
 ```bash
+# One-time: verify NDK + zig cross builds
+./scripts/setup-cross.sh
+
 # Host check
 cargo build -p aginxos-probe
 
-# Phone (aarch64 musl toolchain required)
-rustup target add aarch64-unknown-linux-musl
-cargo build -p aginxos-probe --release --target aarch64-unknown-linux-musl
-adb push target/aarch64-unknown-linux-musl/release/aginxos-probe /data/local/tmp/
-adb shell chmod +x /data/local/tmp/aginxos-probe
-adb shell /data/local/tmp/aginxos-probe
+# On Pixel (Android shell) — uses NDK target
+./scripts/push-probe-android.sh
+
+# Static Linux (AginxOS rootfs) — uses cargo-zigbuild
+./scripts/build-phone.sh musl
+
+# Boot image (after you have a stock redfin boot.img)
+./boot/fetch-tools.sh
+./boot/unpack-boot.sh path/to/boot.img
+./boot/pack-boot.sh
+fastboot boot boot/out/boot-test.img
 ```
+
+| Target | Toolchain | Use |
+|--------|-----------|-----|
+| `aarch64-linux-android` | Android NDK | probe/agent via `adb` on stock ROM |
+| `aarch64-unknown-linux-musl` | zig / cargo-zigbuild | binaries inside AginxOS rootfs / initramfs |
 
 Kernel / `boot.img` / rootfs image work: prefer **Linux**. Rust + `adb` can stay on macOS.
 

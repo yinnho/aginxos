@@ -3,12 +3,21 @@
 *.db
 .env
 .DS_Store
+
+# Boot working trees & images (local only)
 boot/unpack/
+boot/out/
+boot/tools/
+boot/stock-boot.img
+boot/initramfs/busybox
+boot/initramfs/aginxos-probe
 boot/*.img
 boot/*.gz
 boot/*.cpio
+
 rootfs/work/
 rootfs/*.tar*
+
 # Vendor / radio firmware — extract locally, never commit
 **/firmware/
 **/vendor-firmware/
