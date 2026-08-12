@@ -9,4 +9,10 @@ boot/*.gz
 boot/*.cpio
 rootfs/work/
 rootfs/*.tar*
+# Vendor / radio firmware — extract locally, never commit
+**/firmware/
+**/vendor-firmware/
+*.fw
+*.mbn
+*.elf
 *.img

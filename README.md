@@ -2,13 +2,14 @@
 
 [![GitHub](https://img.shields.io/badge/GitHub-yinnho%2Faginxos-black)](https://github.com/yinnho/aginxos)
 
-**AginxOS** is a phone-oriented operating system built as:
+**AginxOS** is the **phone host OS**: Linux kernel (drivers) + Rust userspace (the system).  
+Aginx agents and apps run on top of it.
 
 ```text
-Linux kernel (drivers)  +  Rust userspace (the system)
+Pixel bootloader → Linux kernel → AginxOS userspace → Aginx / apps
 ```
 
-First target: **Google Pixel 5** (`redfin`, Snapdragon 765G), experimental device, unlocked bootloader.
+First target: **Google Pixel 5** (`redfin`, Snapdragon 765G) — unlocked, dedicated experiment unit (wipe OK; keep factory image for recovery).
 
 ## Route A
 
@@ -17,8 +18,17 @@ We do **not** rewrite Wi‑Fi firmware or the 5G baseband in Rust.
 | Layer | Owner |
 |-------|--------|
 | Bootloader | Stock Pixel ABOOT/ABL |
-| Kernel + drivers | Android/downstream Linux (bring-up), mainline later where useful |
-| Userspace / policy / UI / telephony front-end | **AginxOS (Rust)** |
+| Kernel + drivers | Android/downstream Linux first; mainline where useful |
+| Host userspace | **AginxOS (Rust)** |
+| Agents / protocol clients | Aginx ecosystem on top |
+
+## MVP
+
+1. Boot AginxOS rootfs  
+2. Touch: one on-screen control  
+3. Wi‑Fi + outbound network  
+
+See [docs/DECISIONS.md](docs/DECISIONS.md) for full locked choices (bring-up policy, UI phases, dev hosts, firmware rules).
 
 ## Workspace
 
@@ -31,7 +41,7 @@ We do **not** rewrite Wi‑Fi firmware or the 5G baseband in Rust.
 # Host check
 cargo build -p aginxos-probe
 
-# Phone (once aarch64 musl toolchain is set up)
+# Phone (aarch64 musl toolchain required)
 rustup target add aarch64-unknown-linux-musl
 cargo build -p aginxos-probe --release --target aarch64-unknown-linux-musl
 adb push target/aarch64-unknown-linux-musl/release/aginxos-probe /data/local/tmp/
@@ -39,29 +49,30 @@ adb shell chmod +x /data/local/tmp/aginxos-probe
 adb shell /data/local/tmp/aginxos-probe
 ```
 
+Kernel / `boot.img` / rootfs image work: prefer **Linux**. Rust + `adb` can stay on macOS.
+
 ## Repo layout
 
 ```text
 aginxos/
   crates/           # Rust userspace
   boot/             # boot.img unpack, initramfs, mkboot scripts
-  rootfs/           # rootfs overlays for the phone
-  docs/             # hardware notes, bring-up log
+  rootfs/           # rootfs overlays (no vendor firmware blobs)
+  docs/             # decisions, hardware log
   scripts/          # build / push / fastboot helpers
 ```
 
-## Near-term milestones
+## Milestones
 
-1. `aginxos-probe` runs on Pixel 5 (Android shell is fine)
-2. Custom `boot.img` via `fastboot boot` (no flash until stable)
-3. Minimal rootfs + SSH or shell
-4. Touch + display loop
-5. Wi‑Fi (host driver + vendor firmware)
-6. Modem control path (QMI/MBIM), not a custom baseband
+1. `aginxos-probe` on Pixel 5  
+2. Custom `boot.img` (`fastboot boot`, then flash when ready)  
+3. Minimal rootfs as primary userspace  
+4. DRM + touch button  
+5. Wi‑Fi (host driver + locally extracted firmware)  
+6. Later: modem control (QMI/MBIM), richer shell  
 
 ## Name
 
-- Product: **AginxOS**
-- Crate / path prefix: `aginxos-*`
-- Env vars: `AGINXOS_*`
-- Runtime paths: `/run/aginxos/`, `/var/log/aginxos-*`
+- Product: **AginxOS**  
+- Crates: `aginxos-*` · Env: `AGINXOS_*` · Runtime: `/run/aginxos/`  
+- GitHub: [yinnho/aginxos](https://github.com/yinnho/aginxos)  
