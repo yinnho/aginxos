@@ -42,4 +42,5 @@ Captured: 2026-08-13 via `./scripts/push-probe-android.sh` on stock Android user
 | Date | boot.img | Result |
 |------|----------|--------|
 | 2026-08-13 | stock factory flash complete | Android boots; adb OK |
-| 2026-08-13 | `boot/out/boot-test.img` (stock kernel + `aginxos-init` ramdisk + probe) via `fastboot boot` | `fastboot boot` OKAY; bootloader note "missing cmdline" is normal for empty v3 cmdline; device left USB (no adbd in initramfs). Long-press power returns to stock Android (partition not flashed). |
+| 2026-08-13 | minimal ramdisk (`aginxos-init` only) | bootloader OK; black Google logo hang (no modules/display path). Recover via force reboot + stock boot flash. |
+| 2026-08-13 | hybrid ramdisk (stock + wrap `/init` → DRM splash → `/init.android`) | `fastboot boot` sent OKAY; expect green splash ~4s then Android. Confirm on device. |

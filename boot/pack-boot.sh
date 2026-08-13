@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Pack boot/out/boot-test.img from unpacked stock kernel + AginxOS initramfs.
 #
+# Modes:
+#   HYBRID=1 (default) — stock ramdisk base, wrap Android /init as /init.android
+#   HYBRID=0           — minimal AginxOS-only ramdisk (no modules; black screen risk)
+#
 # Prerequisites:
 #   ./boot/unpack-boot.sh boot/stock-boot.img
-#   ./boot/fetch-tools.sh   # unless magiskboot-only flow
+#   ./boot/fetch-tools.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,6 +17,7 @@ WORK="${ROOT}/boot/out/initramfs-root"
 OUTDIR="${ROOT}/boot/out"
 TOOLS="${ROOT}/boot/tools"
 OUTIMG="${OUTDIR}/boot-test.img"
+HYBRID="${HYBRID:-1}"
 
 mkdir -p "${OUTDIR}"
 
@@ -30,90 +35,92 @@ for cand in "${UNPACK}/kernel" "${UNPACK}/Image" "${UNPACK}/Image.gz"; do
 done
 if [[ -z "${KERNEL}" ]]; then
   echo "No kernel found in ${UNPACK}" >&2
-  ls -la "${UNPACK}" >&2
   exit 1
 fi
 
-echo "==> building initramfs from ${INITSRC}"
+if [[ ! -f "${INITSRC}/aginxos-init" ]]; then
+  echo "missing ${INITSRC}/aginxos-init — run ./scripts/build-boot-test.sh" >&2
+  exit 1
+fi
+
+echo "==> building initramfs (HYBRID=${HYBRID})"
 rm -rf "${WORK}"
-mkdir -p "${WORK}"/{bin,dev,proc,sys,sysroot,tmp}
+mkdir -p "${WORK}"
 
-# Prefer static ELF init (aginxos-init). Fall back to shell script + busybox.
-if [[ -f "${INITSRC}/aginxos-init" ]]; then
-  cp "${INITSRC}/aginxos-init" "${WORK}/init"
-  chmod 755 "${WORK}/init"
-  echo "note: using static aginxos-init as /init"
-elif [[ -f "${INITSRC}/init" ]]; then
-  cp "${INITSRC}/init" "${WORK}/init"
-  chmod 755 "${WORK}/init"
-  echo "note: using shell init script (needs busybox/sh)"
-else
-  echo "error: no initramfs/aginxos-init or initramfs/init" >&2
-  exit 1
-fi
-
-# Optional busybox helpers (must be aarch64, not armv7)
-if [[ -n "${BUSYBOX:-}" && -f "${BUSYBOX}" ]]; then
-  cp "${BUSYBOX}" "${WORK}/bin/busybox"
-  chmod 755 "${WORK}/bin/busybox"
-elif [[ -f "${INITSRC}/busybox" ]]; then
-  if file "${INITSRC}/busybox" | grep -qiE 'aarch64|ARM aarch64|x86-64'; then
-    # allow aarch64 only for phone; reject 32-bit ARM
-    if file "${INITSRC}/busybox" | grep -qi '32-bit'; then
-      echo "warn: rejecting 32-bit busybox (need aarch64)"
-    else
-      cp "${INITSRC}/busybox" "${WORK}/bin/busybox"
-      chmod 755 "${WORK}/bin/busybox"
-    fi
-  else
-    echo "warn: busybox arch unknown; including anyway"
-    cp "${INITSRC}/busybox" "${WORK}/bin/busybox"
-    chmod 755 "${WORK}/bin/busybox"
+if [[ "${HYBRID}" == "1" ]]; then
+  STOCK_RD="${UNPACK}/ramdisk"
+  if [[ ! -f "${STOCK_RD}" ]]; then
+    echo "missing stock ramdisk at ${STOCK_RD}" >&2
+    exit 1
   fi
-fi
-if [[ -x "${WORK}/bin/busybox" ]]; then
-  (
-    cd "${WORK}/bin"
-    for a in sh mount umount mkdir ls cat echo sleep switch_root mknod; do
-      ln -sfn busybox "${a}"
-    done
-  )
+  # Extract stock ramdisk (lz4 or gzip or raw cpio)
+  if lz4 -dc "${STOCK_RD}" 2>/dev/null | (cd "${WORK}" && cpio -idm 2>/dev/null); then
+    echo "note: extracted stock ramdisk (lz4)"
+  elif gzip -dc "${STOCK_RD}" 2>/dev/null | (cd "${WORK}" && cpio -idm 2>/dev/null); then
+    echo "note: extracted stock ramdisk (gzip)"
+  elif (cd "${WORK}" && cpio -idm <"${STOCK_RD}" 2>/dev/null); then
+    echo "note: extracted stock ramdisk (raw cpio)"
+  else
+    echo "failed to extract stock ramdisk" >&2
+    file "${STOCK_RD}" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "${WORK}/init" ]]; then
+    echo "stock ramdisk has no /init" >&2
+    exit 1
+  fi
+  mv -f "${WORK}/init" "${WORK}/init.android"
+  chmod 755 "${WORK}/init.android"
+  cp -f "${INITSRC}/aginxos-init" "${WORK}/init"
+  chmod 755 "${WORK}/init"
+
+  mkdir -p "${WORK}/aginxos" "${WORK}/bin"
+  if [[ -f "${INITSRC}/aginxos-probe" ]]; then
+    cp -f "${INITSRC}/aginxos-probe" "${WORK}/aginxos/aginxos-probe"
+    cp -f "${INITSRC}/aginxos-probe" "${WORK}/bin/aginxos-probe"
+    chmod 755 "${WORK}/aginxos/aginxos-probe" "${WORK}/bin/aginxos-probe"
+  fi
+  echo "note: hybrid — /init=aginxos-init, /init.android=stock"
+else
+  mkdir -p "${WORK}"/{bin,dev,proc,sys,tmp}
+  cp -f "${INITSRC}/aginxos-init" "${WORK}/init"
+  chmod 755 "${WORK}/init"
+  if [[ -f "${INITSRC}/aginxos-probe" ]]; then
+    cp -f "${INITSRC}/aginxos-probe" "${WORK}/bin/aginxos-probe"
+    chmod 755 "${WORK}/bin/aginxos-probe"
+  fi
+  echo "note: minimal AginxOS-only ramdisk"
 fi
 
-if [[ -f "${INITSRC}/aginxos-probe" ]]; then
-  cp "${INITSRC}/aginxos-probe" "${WORK}/bin/aginxos-probe"
-  chmod 755 "${WORK}/bin/aginxos-probe"
-fi
-
-RAMDISK_CPIO="${OUTDIR}/initramfs.cpio"
-RAMDISK_GZ="${OUTDIR}/initramfs.cpio.gz"
+# Compress ramdisk: prefer lz4 legacy (matches stock redfin), else gzip
+RAMDISK_BLOB="${OUTDIR}/initramfs.blob"
 (
   cd "${WORK}"
-  # newc cpio; root ownership for kernel consumption
-  find . -print0 | cpio --null --create --format=newc 2>/dev/null | gzip -9 >"${RAMDISK_GZ}"
-) || {
-  # macOS bsdtar fallback
-  echo "note: using bsdtar/cpio fallback"
-  (
-    cd "${WORK}"
-    if command -v bsdtar >/dev/null 2>&1; then
-      bsdtar --format=newc -cf - . | gzip -9 >"${RAMDISK_GZ}"
-    else
-      find . | cpio -o -H newc | gzip -9 >"${RAMDISK_GZ}"
-    fi
-  )
-}
-cp "${RAMDISK_GZ}" "${RAMDISK_CPIO}.gz" 2>/dev/null || true
-echo "==> ramdisk: ${RAMDISK_GZ} ($(wc -c <"${RAMDISK_GZ}") bytes)"
+  if command -v lz4 >/dev/null 2>&1; then
+    # Android uses lz4 legacy frame (-l)
+    find . -print0 | cpio --null --create --format=newc 2>/dev/null | lz4 -l -12 >"${RAMDISK_BLOB}" \
+      || find . | cpio -o -H newc | lz4 -l -12 >"${RAMDISK_BLOB}"
+    echo "note: ramdisk compressed with lz4 -l"
+  else
+    find . -print0 | cpio --null --create --format=newc 2>/dev/null | gzip -9 >"${RAMDISK_BLOB}" \
+      || {
+        if command -v bsdtar >/dev/null 2>&1; then
+          bsdtar --format=newc -cf - . | gzip -9 >"${RAMDISK_BLOB}"
+        else
+          find . | cpio -o -H newc | gzip -9 >"${RAMDISK_BLOB}"
+        fi
+      }
+    echo "note: ramdisk compressed with gzip (install lz4 for stock-matching format)"
+  fi
+)
+echo "==> ramdisk: ${RAMDISK_BLOB} ($(wc -c <"${RAMDISK_BLOB}") bytes)"
 
-# Parse cmdline / header hints from unpack info if present
 CMDLINE="${CMDLINE:-}"
 if [[ -z "${CMDLINE}" && -f "${UNPACK}/info.txt" ]]; then
-  # unpack_bootimg --format=mkbootimg: one line of flags, possibly shell-quoted
   CMDLINE="$(python3 - <<'PY' "${UNPACK}/info.txt"
 import shlex, sys
-text = open(sys.argv[1]).read()
-args = shlex.split(text)
+args = shlex.split(open(sys.argv[1]).read())
 for i, a in enumerate(args):
     if a == "--cmdline" and i + 1 < len(args):
         print(args[i + 1])
@@ -121,14 +128,8 @@ for i, a in enumerate(args):
 PY
 )"
 fi
-if [[ -z "${CMDLINE}" && -f "${UNPACK}/cmdline" ]]; then
-  CMDLINE="$(tr -d '\n' <"${UNPACK}/cmdline")"
-fi
-# Pixel boot header v3 often has empty cmdline (bootloader/vendor_boot supplies it).
-# Keep empty unless FORCE_CMDLINE is set.
 if [[ -z "${CMDLINE}" && -n "${FORCE_CMDLINE:-}" ]]; then
   CMDLINE="${FORCE_CMDLINE}"
-  echo "note: using FORCE_CMDLINE"
 elif [[ -z "${CMDLINE}" ]]; then
   echo "note: empty cmdline (normal for redfin header v3)"
 fi
@@ -168,63 +169,36 @@ for key in ("os_version", "os_patch_level"):
 PY
 )"
 fi
-# Drop placeholders like 0.0.0 / 2000-00 from synthetic or broken unpacks
-if [[ "${OS_VERSION}" == "0.0.0" || "${OS_VERSION}" == "0" ]]; then
-  OS_VERSION=""
-fi
+if [[ "${OS_VERSION}" == "0.0.0" || "${OS_VERSION}" == "0" ]]; then OS_VERSION=""; fi
 if [[ ! "${OS_PATCH_LEVEL}" =~ ^[0-9]{4}-[0-9]{2}$ ]] || [[ "${OS_PATCH_LEVEL}" == *"-00" ]]; then
   OS_PATCH_LEVEL=""
 fi
 
-if [[ -f "${TOOLS}/mkbootimg.py" ]]; then
-  echo "==> mkbootimg.py → ${OUTIMG}"
-  args=(
-    python3 "${TOOLS}/mkbootimg.py"
-    --header_version "${HEADER_VERSION}"
-    --kernel "${KERNEL}"
-    --ramdisk "${RAMDISK_GZ}"
-    --cmdline "${CMDLINE}"
-    -o "${OUTIMG}"
-  )
-  # v3+ often needs no base/pagesize; v2 needs them
-  if [[ "${HEADER_VERSION}" -lt 3 ]]; then
-    args+=(--base 0x00000000 --pagesize 4096)
-  fi
-  if [[ -n "${OS_VERSION}" ]]; then
-    args+=(--os_version "${OS_VERSION}")
-  fi
-  if [[ -n "${OS_PATCH_LEVEL}" ]]; then
-    args+=(--os_patch_level "${OS_PATCH_LEVEL}")
-  fi
-  # Vendor boot / dtb: if stock unpack has dtb, pass through
-  if [[ -f "${UNPACK}/dtb" ]]; then
-    args+=(--dtb "${UNPACK}/dtb")
-  fi
-  "${args[@]}"
-elif command -v magiskboot >/dev/null 2>&1; then
-  echo "==> magiskboot repack"
-  cp "${KERNEL}" "${UNPACK}/kernel"
-  cp "${RAMDISK_GZ}" "${UNPACK}/ramdisk.cpio"
-  # magiskboot expects uncompressed cpio sometimes — try gzip path via rename
-  (
-    cd "${UNPACK}"
-    # Decompress to ramdisk.cpio if needed
-    if file ramdisk.cpio | grep -q gzip; then
-      mv ramdisk.cpio ramdisk.cpio.gz
-      gzip -dc ramdisk.cpio.gz >ramdisk.cpio
-    fi
-    magiskboot repack boot.img "${OUTIMG}" 2>/dev/null || magiskboot repack boot.img
-    if [[ -f new-boot.img ]]; then
-      mv -f new-boot.img "${OUTIMG}"
-    fi
-  )
-else
+if [[ ! -f "${TOOLS}/mkbootimg.py" ]]; then
   echo "No pack tool. Run ./boot/fetch-tools.sh" >&2
   exit 1
 fi
+
+echo "==> mkbootimg.py → ${OUTIMG}"
+args=(
+  python3 "${TOOLS}/mkbootimg.py"
+  --header_version "${HEADER_VERSION}"
+  --kernel "${KERNEL}"
+  --ramdisk "${RAMDISK_BLOB}"
+  --cmdline "${CMDLINE}"
+  -o "${OUTIMG}"
+)
+if [[ "${HEADER_VERSION}" -lt 3 ]]; then
+  args+=(--base 0x00000000 --pagesize 4096)
+fi
+[[ -n "${OS_VERSION}" ]] && args+=(--os_version "${OS_VERSION}")
+[[ -n "${OS_PATCH_LEVEL}" ]] && args+=(--os_patch_level "${OS_PATCH_LEVEL}")
+[[ -f "${UNPACK}/dtb" ]] && args+=(--dtb "${UNPACK}/dtb")
+"${args[@]}"
 
 ls -la "${OUTIMG}"
 echo
 echo "Test boot (does not flash):"
 echo "  adb reboot bootloader"
 echo "  fastboot boot ${OUTIMG}"
+echo "Expect: green splash ~4s, then stock Android if HYBRID=1."
