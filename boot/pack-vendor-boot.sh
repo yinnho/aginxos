@@ -58,12 +58,32 @@ rm -f "${WORK}/init.android"
 cp -f "${WORK}/system/bin/init.android" "${WORK}/init.android"
 
 mkdir -p "${WORK}/aginxos"
-cp -f "${INITSRC}/aginxos-init" "${WORK}/aginxos/aginxos-init"
-chmod 755 "${WORK}/aginxos/aginxos-init"
-# Also replace /init (in case rdinit is ignored)
-rm -f "${WORK}/init"
-cp -f "${INITSRC}/aginxos-init" "${WORK}/init"
-chmod 755 "${WORK}/init"
+
+# C trampoline is the rdinit entry (Rust handoff is unreliable on redfin).
+TRAMP="${ROOT}/boot/initramfs/trampoline"
+if [[ ! -x "${TRAMP}" ]]; then
+  echo "==> build C trampoline"
+  zig cc -target aarch64-linux-musl -static -O2 \
+    -o "${TRAMP}" "${ROOT}/boot/trampoline/trampoline.c"
+fi
+cp -f "${TRAMP}" "${WORK}/aginxos/trampoline"
+chmod 755 "${WORK}/aginxos/trampoline"
+
+# Optional Rust helper (splash-test child)
+if [[ -f "${INITSRC}/aginxos-init" ]]; then
+  cp -f "${INITSRC}/aginxos-init" "${WORK}/aginxos/aginxos-init"
+  chmod 755 "${WORK}/aginxos/aginxos-init"
+fi
+
+# Static first-stage init from stock boot.img
+if [[ -f "${INITSRC}/first_stage_init" ]]; then
+  cp -f "${INITSRC}/first_stage_init" "${WORK}/aginxos/first_stage_init"
+  chmod 755 "${WORK}/aginxos/first_stage_init"
+  echo "note: included first_stage_init"
+else
+  echo "error: missing boot/initramfs/first_stage_init" >&2
+  exit 1
+fi
 
 if [[ -f "${INITSRC}/aginxos-probe" ]]; then
   cp -f "${INITSRC}/aginxos-probe" "${WORK}/aginxos/aginxos-probe"
@@ -115,9 +135,9 @@ PY
 if [[ -z "${VCMD}" ]]; then
   VCMD="console=ttyMSM0,115200n8 androidboot.console=ttyMSM0 androidboot.hardware=redfin"
 fi
-# Force kernel to run our binary as early userspace init (survives ramdisk merge order).
+# Proven entry on redfin: C trampoline → first_stage_init → Android
 if [[ "${VCMD}" != *rdinit=* ]]; then
-  VCMD="${VCMD} rdinit=/aginxos/aginxos-init"
+  VCMD="${VCMD} rdinit=/aginxos/trampoline"
 fi
 echo "vendor_cmdline: ${VCMD:0:100}..."
 

@@ -367,18 +367,27 @@ fn drm_paint(color: u32) -> Result<(), String> {
 }
 
 fn handoff_android() -> ! {
-    for path in [
-        "/system/bin/init.android",
-        "/init.android",
-        "/system/bin/init",
-    ] {
-        if Path::new(path).exists() {
-            klog(&format!("exec {path} as /init"));
-            let err = Command::new(path).arg0("/init").exec();
-            klog(&format!("exec failed: {err}"));
-        }
+    // Match the proven C trampoline: execve(first_stage, ["/init"], environ)
+    extern "C" {
+        static environ: *const *const libc::c_char;
     }
-    klog("no android init — holding");
+    let path = "/aginxos/first_stage_init";
+    if Path::new(path).exists() {
+        let c_path = std::ffi::CString::new(path).unwrap();
+        let arg0 = std::ffi::CString::new("/init").unwrap();
+        let argv = [arg0.as_ptr(), std::ptr::null()];
+        // Do not log here if possible — keep world pristine; still try once.
+        unsafe {
+            libc::execve(c_path.as_ptr(), argv.as_ptr(), environ);
+        }
+        klog(&format!(
+            "execve {path} failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    } else {
+        klog("missing /aginxos/first_stage_init");
+    }
+    klog("handoff exhausted — holding");
     loop {
         thread::sleep(Duration::from_secs(30));
         klog("heartbeat");
@@ -390,17 +399,24 @@ fn main() {
     let do_modules = flag("/aginxos/load-modules");
     let do_splash = flag("/aginxos/splash");
     let do_full_modules = flag("/aginxos/load-modules-full");
+    // Immediate handoff without mounting (cleanest path to Android).
+    let handoff_only = !hold && !do_modules && !do_splash && !do_full_modules;
 
     klog(&format!(
-        "start v{} pid={} hold={hold} modules={do_modules} splash={do_splash}",
+        "start v{} pid={} hold={hold} handoff_only={handoff_only} modules={do_modules} splash={do_splash}",
         env!("CARGO_PKG_VERSION"),
         std::process::id()
     ));
 
+    if handoff_only {
+        // Do not mount anything — leave a pristine world for first-stage init.
+        klog("handoff-only: exec first_stage immediately");
+        handoff_android();
+    }
+
     ensure_basics();
     klog("basics ok");
 
-    // Write marker into devtmpfs (debug only; does not survive Android).
     let _ = fs::create_dir_all("/aginxos");
     let _ = fs::write("/dev/aginxos_ran", b"1\n");
 

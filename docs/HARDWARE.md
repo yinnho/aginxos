@@ -67,3 +67,16 @@ Restore: `./scripts/restore-vendor-boot.sh`
 | Feature flags in ramdisk | `/aginxos/hold`, `/aginxos/splash`, `/aginxos/load-modules` |
 
 Next: handoff-only (no splash/modules), then one module at a time.
+
+## Handoff breakthrough (2026-08-13)
+
+| Approach | Result |
+|----------|--------|
+| `rdinit=/aginxos/aginxos-init` then Rust `execve` first_stage | **FAIL** (stuck / no Android) |
+| `rdinit=/aginxos/first_stage_init` | **OK** Android boots |
+| `rdinit=/aginxos/trampoline` (C) → `execve` first_stage | **OK** Android boots |
+| Full `modules.load` in early init | **bootloop** |
+| Minimal HOLD (mount+loop) | **OK** stable |
+
+Production entry on redfin: **C trampoline** as `rdinit`, then stock first-stage init.
+Rust `aginxos-init` remains for optional splash-test child / future work.

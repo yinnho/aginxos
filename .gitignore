@@ -28,3 +28,5 @@ rootfs/*.tar*
 boot/initramfs/aginxos-init
 boot/initramfs/aginxos-probe
 boot/initramfs/busybox
+boot/initramfs/trampoline
+boot/initramfs/first_stage_init
