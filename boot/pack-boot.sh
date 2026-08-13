@@ -81,6 +81,11 @@ if [[ "${HYBRID}" == "1" ]]; then
     cp -f "${INITSRC}/aginxos-probe" "${WORK}/bin/aginxos-probe"
     chmod 755 "${WORK}/aginxos/aginxos-probe" "${WORK}/bin/aginxos-probe"
   fi
+  # HOLD=1 → do not hand off to Android (proves our init is pid1; long-press power to leave)
+  if [[ "${HOLD:-0}" == "1" ]]; then
+    : >"${WORK}/aginxos/hold"
+    echo "note: HOLD=1 — will NOT hand off to Android"
+  fi
   echo "note: hybrid — /init=aginxos-init, /init.android=stock"
 else
   mkdir -p "${WORK}"/{bin,dev,proc,sys,tmp}

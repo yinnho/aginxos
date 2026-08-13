@@ -15,6 +15,9 @@ use std::time::Duration;
 
 fn klog(msg: &str) {
     let line = format!("aginxos-init: {msg}\n");
+    // Always mirror to stdout when available (adb shell splash-test).
+    let _ = std::io::stdout().write_all(line.as_bytes());
+    let _ = std::io::stdout().flush();
     if let Ok(mut f) = OpenOptions::new().write(true).open("/dev/kmsg") {
         let _ = f.write_all(line.as_bytes());
     }
@@ -294,6 +297,8 @@ fn drm_splash_on_card(path: &str, color: u32) -> Result<(), String> {
     // Become DRM master if possible (ignore failure).
     const DRM_IOCTL_SET_MASTER: libc::Ioctl = 0x641e as libc::Ioctl; // _IO('d', 0x1e)
     let _ = unsafe { libc::ioctl(fd, DRM_IOCTL_SET_MASTER) };
+    const DRM_IOCTL_DROP_MASTER: libc::Ioctl = 0x641f as libc::Ioctl;
+    let _ = DRM_IOCTL_DROP_MASTER;
 
     // GETRESOURCES
     let req_get_res = drm_iowr(0xA0, std::mem::size_of::<DrmModeCardRes>());
@@ -311,61 +316,86 @@ fn drm_splash_on_card(path: &str, color: u32) -> Result<(), String> {
     if ioctl_raw(fd, req_get_res, &mut res as *mut _ as *mut _) != 0 {
         return Err(format!("GETRESOURCES ids: {}", std::io::Error::last_os_error()));
     }
-    if connector_ids.is_empty() || crtc_ids.is_empty() {
-        return Err("no connectors/crtcs".into());
+    klog(&format!(
+        "drm {path} crtcs={} connectors={} encoders={}",
+        crtc_ids.len(),
+        connector_ids.len(),
+        encoder_ids.len()
+    ));
+    if crtc_ids.is_empty() {
+        return Err("no crtcs".into());
     }
 
-    // Find first connected connector with modes.
-    let req_get_conn = drm_iowr(0xA7, std::mem::size_of::<DrmModeGetConnector>());
-    let mut chosen_conn = 0u32;
-    let mut mode = unsafe { std::mem::zeroed::<DrmModeModeInfo>() };
-    let mut encoder_id = 0u32;
-    for &cid in &connector_ids {
-        let mut conn = unsafe { std::mem::zeroed::<DrmModeGetConnector>() };
-        conn.connector_id = cid;
-        if ioctl_raw(fd, req_get_conn, &mut conn as *mut _ as *mut _) != 0 {
+    // Path A (best for continuous splash): reuse an already-programmed CRTC mode.
+    let req_getcrtc = drm_iowr(0xA1, std::mem::size_of::<DrmModeCrtc>());
+    let req_setcrtc = drm_iowr(0xA2, std::mem::size_of::<DrmModeCrtc>());
+    let req_create = drm_iowr(0xB2, std::mem::size_of::<DrmModeCreateDumb>());
+    let req_addfb = drm_iowr(0xAE, std::mem::size_of::<DrmModeFbCmd>());
+    let req_map = drm_iowr(0xB3, std::mem::size_of::<DrmModeMapDumb>());
+
+    let mut active: Option<(u32, DrmModeModeInfo, u32 /*width*/, u32 /*height*/)> = None;
+    for &crtc_id in &crtc_ids {
+        let mut crtc = unsafe { std::mem::zeroed::<DrmModeCrtc>() };
+        crtc.crtc_id = crtc_id;
+        if ioctl_raw(fd, req_getcrtc, &mut crtc as *mut _ as *mut _) != 0 {
             continue;
         }
-        if conn.count_modes == 0 {
+        if crtc.mode_valid == 0 {
             continue;
         }
-        let mut modes = vec![unsafe { std::mem::zeroed::<DrmModeModeInfo>() }; conn.count_modes as usize];
-        let mut encs = vec![0u32; conn.count_encoders as usize];
-        conn.modes_ptr = modes.as_mut_ptr() as u64;
-        conn.encoders_ptr = encs.as_mut_ptr() as u64;
-        if ioctl_raw(fd, req_get_conn, &mut conn as *mut _ as *mut _) != 0 {
+        let w = crtc.mode.hdisplay as u32;
+        let h = crtc.mode.vdisplay as u32;
+        if w == 0 || h == 0 {
             continue;
         }
-        // connection: 1 = connected
-        if conn.connection != 1 && conn.connection != 2 {
-            // 2 unknown — still try
-        }
-        if modes.is_empty() {
-            continue;
-        }
-        chosen_conn = cid;
-        mode = modes[0];
-        encoder_id = conn.encoder_id;
-        if encoder_id == 0 && !encs.is_empty() {
-            encoder_id = encs[0];
-        }
+        klog(&format!(
+            "drm active crtc={crtc_id} fb={} mode={w}x{h}",
+            crtc.fb_id
+        ));
+        active = Some((crtc_id, crtc.mode, w, h));
         break;
     }
-    if chosen_conn == 0 {
-        return Err("no usable connector".into());
+
+    // Path B: pick first connector mode if nothing active yet.
+    let mut chosen_conn = 0u32;
+    if active.is_none() {
+        let req_get_conn = drm_iowr(0xA7, std::mem::size_of::<DrmModeGetConnector>());
+        for &cid in &connector_ids {
+            let mut conn = unsafe { std::mem::zeroed::<DrmModeGetConnector>() };
+            conn.connector_id = cid;
+            if ioctl_raw(fd, req_get_conn, &mut conn as *mut _ as *mut _) != 0 {
+                continue;
+            }
+            if conn.count_modes == 0 {
+                continue;
+            }
+            let mut modes =
+                vec![unsafe { std::mem::zeroed::<DrmModeModeInfo>() }; conn.count_modes as usize];
+            conn.modes_ptr = modes.as_mut_ptr() as u64;
+            if ioctl_raw(fd, req_get_conn, &mut conn as *mut _ as *mut _) != 0 {
+                continue;
+            }
+            if modes.is_empty() {
+                continue;
+            }
+            let mode = modes[0];
+            let w = mode.hdisplay as u32;
+            let h = mode.vdisplay as u32;
+            if w == 0 || h == 0 {
+                continue;
+            }
+            chosen_conn = cid;
+            active = Some((crtc_ids[0], mode, w, h));
+            klog(&format!("drm connector={cid} mode={w}x{h}"));
+            break;
+        }
     }
 
-    let width = mode.hdisplay as u32;
-    let height = mode.vdisplay as u32;
-    if width == 0 || height == 0 {
-        return Err(format!("bad mode {width}x{height}"));
-    }
-    klog(&format!(
-        "drm {path} connector={chosen_conn} mode={width}x{height}"
-    ));
+    let Some((crtc_id, mode, width, height)) = active else {
+        return Err("no active CRTC/mode".into());
+    };
 
-    // CREATE_DUMB
-    let req_create = drm_iowr(0xB2, std::mem::size_of::<DrmModeCreateDumb>());
+    // CREATE_DUMB + fill
     let mut dumb = DrmModeCreateDumb {
         height,
         width,
@@ -379,8 +409,6 @@ fn drm_splash_on_card(path: &str, color: u32) -> Result<(), String> {
         return Err(format!("CREATE_DUMB: {}", std::io::Error::last_os_error()));
     }
 
-    // ADDFB
-    let req_addfb = drm_iowr(0xAE, std::mem::size_of::<DrmModeFbCmd>());
     let mut fb = DrmModeFbCmd {
         fb_id: 0,
         width,
@@ -394,8 +422,6 @@ fn drm_splash_on_card(path: &str, color: u32) -> Result<(), String> {
         return Err(format!("ADDFB: {}", std::io::Error::last_os_error()));
     }
 
-    // MAP_DUMB + mmap
-    let req_map = drm_iowr(0xB3, std::mem::size_of::<DrmModeMapDumb>());
     let mut map = DrmModeMapDumb {
         handle: dumb.handle,
         pad: 0,
@@ -419,46 +445,80 @@ fn drm_splash_on_card(path: &str, color: u32) -> Result<(), String> {
         return Err(format!("mmap dumb: {}", std::io::Error::last_os_error()));
     }
     unsafe {
-        let pixels = len / 4;
-        let slice = std::slice::from_raw_parts_mut(ptr as *mut u32, pixels);
-        // DRM often XRGB8888 little-endian: 0x00RRGGBB works on many panels.
-        for p in slice.iter_mut() {
-            *p = color;
+        let pitch_px = (dumb.pitch / 4) as usize;
+        let base = ptr as *mut u32;
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                *base.add(y * pitch_px + x) = color;
+            }
+        }
+        // Draw a thick white border so it's obvious even if color is wrong.
+        let border = 0x00FF_FFFF;
+        let t = 20usize.min(width as usize / 10).min(height as usize / 10);
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                if x < t || y < t || x >= width as usize - t || y >= height as usize - t {
+                    *base.add(y * pitch_px + x) = border;
+                }
+            }
         }
         libc::munmap(ptr, len);
     }
 
-    // SETCRTC
-    let req_setcrtc = drm_iowr(0xA2, std::mem::size_of::<DrmModeCrtc>());
-    let mut conn_for_crtc = [chosen_conn];
+    // SETCRTC with new fb (reuse mode).
+    let mut conn_for_crtc = if chosen_conn != 0 {
+        vec![chosen_conn]
+    } else if !connector_ids.is_empty() {
+        vec![connector_ids[0]]
+    } else {
+        Vec::new()
+    };
     let mut crtc = unsafe { std::mem::zeroed::<DrmModeCrtc>() };
-    crtc.crtc_id = crtc_ids[0];
+    crtc.crtc_id = crtc_id;
     crtc.fb_id = fb.fb_id;
-    crtc.set_connectors_ptr = conn_for_crtc.as_mut_ptr() as u64;
-    crtc.count_connectors = 1;
     crtc.mode = mode;
     crtc.mode_valid = 1;
     crtc.x = 0;
     crtc.y = 0;
-    // Prefer CRTC linked via encoder if we can guess.
-    let _ = encoder_id;
+    if !conn_for_crtc.is_empty() {
+        crtc.set_connectors_ptr = conn_for_crtc.as_mut_ptr() as u64;
+        crtc.count_connectors = conn_for_crtc.len() as u32;
+    }
     if ioctl_raw(fd, req_setcrtc, &mut crtc as *mut _ as *mut _) != 0 {
-        // try each crtc
-        let mut ok = false;
-        for &crtc_id in &crtc_ids {
-            crtc.crtc_id = crtc_id;
-            if ioctl_raw(fd, req_setcrtc, &mut crtc as *mut _ as *mut _) == 0 {
-                ok = true;
-                break;
-            }
-        }
-        if !ok {
-            return Err(format!("SETCRTC: {}", std::io::Error::last_os_error()));
+        let err = std::io::Error::last_os_error();
+        // Try without connector list (some drivers accept fb replace only).
+        crtc.set_connectors_ptr = 0;
+        crtc.count_connectors = 0;
+        if ioctl_raw(fd, req_setcrtc, &mut crtc as *mut _ as *mut _) != 0 {
+            return Err(format!("SETCRTC: {err} / {}", std::io::Error::last_os_error()));
         }
     }
 
-    klog(&format!("drm splash ok fb_id={} color={color:#08x}", fb.fb_id));
+    klog(&format!(
+        "drm splash ok crtc={crtc_id} fb_id={} {width}x{height} color={color:#08x}",
+        fb.fb_id
+    ));
     Ok(())
+}
+
+fn write_boot_marker() {
+    // Survives into early Android if metadata is usable; best-effort.
+    for path in [
+        "/aginxos/BOOTED",
+        "/dev/aginxos_booted",
+        "/metadata/aginxos_booted",
+    ] {
+        if let Some(parent) = Path::new(path).parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if fs::write(path, b"aginxos-init\n").is_ok() {
+            klog(&format!("marker written {path}"));
+        }
+    }
+    // pmsg is world-writable on Android; format is free-text for some kernels.
+    if let Ok(mut f) = OpenOptions::new().write(true).open("/dev/pmsg0") {
+        let _ = f.write_all(b"aginxos-init: boot marker\n");
+    }
 }
 
 fn list_dir(label: &str, path: &str) {
@@ -473,48 +533,131 @@ fn list_dir(label: &str, path: &str) {
     }
 }
 
+fn wait_for_path(path: &str, total_ms: u64) -> bool {
+    let step = 100;
+    let mut waited = 0;
+    while waited <= total_ms {
+        if Path::new(path).exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(step));
+        waited += step;
+    }
+    Path::new(path).exists()
+}
+
+fn try_sysfs_backlight_max() {
+    let roots = ["/sys/class/backlight", "/sys/devices"];
+    for root in roots {
+        let Ok(rd) = fs::read_dir(root) else { continue };
+        for ent in rd.flatten() {
+            let p = ent.path().join("brightness");
+            if p.exists() {
+                let max_p = ent.path().join("max_brightness");
+                let val = fs::read_to_string(&max_p)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(255);
+                if fs::write(&p, format!("{val}")).is_ok() {
+                    klog(&format!("backlight {} -> {val}", p.display()));
+                }
+            }
+        }
+    }
+    // Direct known Pixel path
+    let p = Path::new("/sys/class/backlight/panel0-backlight/brightness");
+    if p.exists() {
+        let _ = fs::write(p, "4095");
+        let _ = fs::write(p, "255");
+        let _ = fs::write(p, "2047");
+        klog("wrote panel0-backlight brightness");
+    }
+}
+
+fn paint_splash(color: u32) -> bool {
+    try_sysfs_backlight_max();
+    // Poll for DRM node — driver may probe late in early boot.
+    let _ = wait_for_path("/dev/dri/card0", 3000);
+    match try_drm_splash(color) {
+        Ok(()) => {
+            klog("splash: DRM ok");
+            true
+        }
+        Err(e) => {
+            klog(&format!("splash: DRM failed ({e}), try fb"));
+            for fb in ["/dev/fb0", "/dev/graphics/fb0"] {
+                if !Path::new(fb).exists() {
+                    continue;
+                }
+                // try_fb_splash opens /dev/fb0 only — temporarily symlink not possible without root dirs.
+                if fb == "/dev/fb0" {
+                    match try_fb_splash(color) {
+                        Ok(()) => {
+                            klog("splash: fb0 ok");
+                            return true;
+                        }
+                        Err(e2) => klog(&format!("splash: fb0 failed ({e2})")),
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let splash_test = args.iter().any(|a| a == "splash-test");
+    let hold_only = args.iter().any(|a| a == "hold") || Path::new("/aginxos/hold").exists();
+
     klog(&format!(
-        "starting v{} pid={}",
+        "starting v{} pid={} splash_test={splash_test} hold_only={hold_only}",
         env!("CARGO_PKG_VERSION"),
         std::process::id()
     ));
 
-    // Only mount if not already present (hybrid handoff to Android init).
-    if !Path::new("/proc/self").exists() {
-        mount("proc", "proc", "/proc", 0, "");
-    }
-    if !Path::new("/sys/class").exists() {
-        mount("sysfs", "sysfs", "/sys", 0, "");
-    }
-    if !Path::new("/dev/null").exists() {
-        mount("devtmpfs", "devtmpfs", "/dev", 0, "mode=0755");
-        if !Path::new("/dev/null").exists() {
-            mount("tmpfs", "tmpfs", "/dev", 0, "mode=0755");
+    if !splash_test {
+        // Only mount if not already present (hybrid handoff to Android init).
+        if !Path::new("/proc/self").exists() {
+            mount("proc", "proc", "/proc", 0, "");
         }
-    }
-    mkdir_p("/dev/pts");
-    let _ = mount("devpts", "devpts", "/dev/pts", 0, "");
-    mkdir_p("/tmp");
-    if !Path::new("/tmp").is_dir() {
-        mount("tmpfs", "tmpfs", "/tmp", 0, "");
+        if !Path::new("/sys/class").exists() {
+            mount("sysfs", "sysfs", "/sys", 0, "");
+        }
+        if !Path::new("/dev/null").exists() {
+            mount("devtmpfs", "devtmpfs", "/dev", 0, "mode=0755");
+            if !Path::new("/dev/null").exists() {
+                mount("tmpfs", "tmpfs", "/dev", 0, "mode=0755");
+            }
+        }
+        mkdir_p("/dev/pts");
+        let _ = mount("devpts", "devpts", "/dev/pts", 0, "");
+        mkdir_p("/tmp");
     }
 
     klog("filesystems ready");
     list_dir("input", "/dev/input");
     list_dir("dri", "/dev/dri");
+    list_dir("graphics", "/dev/graphics");
+    write_boot_marker();
 
-    // Bright green (XRGB) — obvious "AginxOS init is alive" signal.
-    let color = 0x00_22_CC_44;
-    match try_drm_splash(color) {
-        Ok(()) => klog("splash: DRM ok"),
-        Err(e) => {
-            klog(&format!("splash: DRM failed ({e}), try fb0"));
-            match try_fb_splash(color) {
-                Ok(()) => klog("splash: fb0 ok"),
-                Err(e2) => klog(&format!("splash: fb0 failed ({e2})")),
-            }
-        }
+    // Cycle colors so a human can notice even if one frame is missed.
+    let colors = [
+        0x00_22_CC_44, // green
+        0x00_CC_22_22, // red
+        0x00_22_44_CC, // blue
+        0x00_EE_EE_22, // yellow
+    ];
+    for (i, color) in colors.iter().enumerate() {
+        klog(&format!("paint frame {i} color={color:#08x}"));
+        let ok = paint_splash(*color);
+        klog(&format!("paint frame {i} ok={ok}"));
+        thread::sleep(Duration::from_millis(if splash_test { 800 } else { 2500 }));
+    }
+
+    if splash_test {
+        klog("splash-test done, exiting");
+        return;
     }
 
     if Path::new("/bin/aginxos-probe").exists() || Path::new("/aginxos/aginxos-probe").exists() {
@@ -534,17 +677,31 @@ fn main() {
         }
     }
 
-    // Hold splash so human can see it, then hand off if hybrid ramdisk.
-    klog("holding splash 4s");
-    thread::sleep(Duration::from_secs(4));
+    // Hold so human can see last color, then hand off if hybrid ramdisk.
+    klog("holding last frame 6s");
+    thread::sleep(Duration::from_secs(6));
 
-    if Path::new("/init.android").exists() {
-        // Drop our mounts carefully? Android first-stage usually tolerates existing mounts.
-        let _ = Command::new("/init.android").exec();
-        klog("handoff returned unexpectedly");
+    if hold_only {
+        klog("hold mode — not handing off (long-press power to leave)");
+        loop {
+            thread::sleep(Duration::from_secs(30));
+            klog("heartbeat");
+        }
     }
 
-    klog("no /init.android — staying in bring-up hold (long-press power to leave)");
+    for handoff in [
+        "/init.android",
+        "/system/bin/init.android",
+        "/system/bin/init",
+    ] {
+        if Path::new(handoff).exists() {
+            klog(&format!("handoff -> {handoff}"));
+            let err = Command::new(handoff).exec();
+            klog(&format!("handoff {handoff} failed: {err}"));
+        }
+    }
+
+    klog("no android init found — bring-up hold (long-press power to leave)");
     loop {
         thread::sleep(Duration::from_secs(30));
         klog("heartbeat");

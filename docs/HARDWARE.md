@@ -44,3 +44,15 @@ Captured: 2026-08-13 via `./scripts/push-probe-android.sh` on stock Android user
 | 2026-08-13 | stock factory flash complete | Android boots; adb OK |
 | 2026-08-13 | minimal ramdisk (`aginxos-init` only) | bootloader OK; black Google logo hang (no modules/display path). Recover via force reboot + stock boot flash. |
 | 2026-08-13 | hybrid ramdisk (stock + wrap `/init` → DRM splash → `/init.android`) | `fastboot boot` sent OKAY; expect green splash ~4s then Android. Confirm on device. |
+
+## Boot path finding (2026-08-13)
+
+Pixel 5 loads **boot.img ramdisk + vendor_boot ramdisk**. Vendor entries overwrite boot for the same path, so patching only `boot.img` `/init` has no effect (`vendor` has `init -> /system/bin/init`).
+
+Working approach:
+- Patch `vendor_boot` ramdisk
+- Set `rdinit=/aginxos/aginxos-init` on vendor cmdline
+- Place binary at `/aginxos/aginxos-init`
+- `HOLD=1` with `/aginxos/hold` confirmed: no Android for 70s+ (our pid1 holds)
+
+Restore: `./scripts/restore-vendor-boot.sh`
