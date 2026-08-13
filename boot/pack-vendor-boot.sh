@@ -70,9 +70,26 @@ if [[ -f "${INITSRC}/aginxos-probe" ]]; then
   chmod 755 "${WORK}/aginxos/aginxos-probe"
 fi
 
+# Feature flags (empty files). Safe default: HOLD only, no modules/splash.
+HOLD="${HOLD:-0}"
+SPLASH="${SPLASH:-0}"
+MODULES="${MODULES:-0}"
+MODULES_FULL="${MODULES_FULL:-0}"
 if [[ "${HOLD}" == "1" ]]; then
   : >"${WORK}/aginxos/hold"
   echo "note: HOLD=1"
+fi
+if [[ "${SPLASH}" == "1" ]]; then
+  : >"${WORK}/aginxos/splash"
+  echo "note: SPLASH=1"
+fi
+if [[ "${MODULES}" == "1" ]]; then
+  : >"${WORK}/aginxos/load-modules"
+  echo "note: MODULES=1 (safe allow-list only)"
+fi
+if [[ "${MODULES_FULL}" == "1" ]]; then
+  : >"${WORK}/aginxos/load-modules-full"
+  echo "note: MODULES_FULL=1 (RISKY)"
 fi
 
 echo "==> repack vendor ramdisk (lz4 -l)"

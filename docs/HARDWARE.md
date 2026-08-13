@@ -56,3 +56,14 @@ Working approach:
 - `HOLD=1` with `/aginxos/hold` confirmed: no Android for 70s+ (our pid1 holds)
 
 Restore: `./scripts/restore-vendor-boot.sh`
+
+## Progressive bring-up (2026-08-13 cont.)
+
+| Experiment | Result |
+|------------|--------|
+| modules.load full insmod in init | **bootloop** |
+| handoff to Android init after splash | **bootloop** |
+| minimal HOLD (`rdinit`, mount only, no modules/splash) | **stable 60s+, no Android** |
+| Feature flags in ramdisk | `/aginxos/hold`, `/aginxos/splash`, `/aginxos/load-modules` |
+
+Next: handoff-only (no splash/modules), then one module at a time.
