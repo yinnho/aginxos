@@ -2,22 +2,15 @@
 
 | File | Purpose |
 |------|---------|
-| `init` | First userspace process in the test boot.img |
-| `busybox` | Optional aarch64 static busybox (gitignored if you add it) |
-| `aginxos-probe` | Optional: copy musl probe here before `pack-boot.sh` |
+| `aginxos-init` | Static aarch64 ELF `/init` (from `cargo zigbuild -p aginxos-init`) |
+| `aginxos-probe` | Optional probe binary copied into `/bin` |
+| `init` | Legacy shell script fallback (needs busybox) |
+| `busybox` | Optional aarch64-only helpers |
 
 ```bash
-# Optional: embed the musl probe in the ramdisk
-./scripts/build-phone.sh musl probe
-cp target/aarch64-unknown-linux-musl/release/aginxos-probe boot/initramfs/
-./boot/pack-boot.sh
+./scripts/build-boot-test.sh
+adb reboot bootloader
+fastboot boot boot/out/boot-test.img
 ```
 
-Obtain static busybox (example):
-
-```text
-https://busybox.net/downloads/binaries/
-# or build: make ARCH=arm64 CROSS_COMPILE=...
-```
-
-Place the binary at `boot/initramfs/busybox` (aarch64, preferably static).
+Do **not** use 32-bit ARM busybox; the phone is aarch64.

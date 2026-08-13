@@ -38,34 +38,49 @@ echo "==> building initramfs from ${INITSRC}"
 rm -rf "${WORK}"
 mkdir -p "${WORK}"/{bin,dev,proc,sys,sysroot,tmp}
 
-# BusyBox is optional: if not provided, ship a tiny /init shell script only.
+# Prefer static ELF init (aginxos-init). Fall back to shell script + busybox.
+if [[ -f "${INITSRC}/aginxos-init" ]]; then
+  cp "${INITSRC}/aginxos-init" "${WORK}/init"
+  chmod 755 "${WORK}/init"
+  echo "note: using static aginxos-init as /init"
+elif [[ -f "${INITSRC}/init" ]]; then
+  cp "${INITSRC}/init" "${WORK}/init"
+  chmod 755 "${WORK}/init"
+  echo "note: using shell init script (needs busybox/sh)"
+else
+  echo "error: no initramfs/aginxos-init or initramfs/init" >&2
+  exit 1
+fi
+
+# Optional busybox helpers (must be aarch64, not armv7)
 if [[ -n "${BUSYBOX:-}" && -f "${BUSYBOX}" ]]; then
   cp "${BUSYBOX}" "${WORK}/bin/busybox"
   chmod 755 "${WORK}/bin/busybox"
-  (
-    cd "${WORK}/bin"
-    for a in sh mount umount mkdir ls cat echo sleep switch_root mknod; do
-      ln -sfn busybox "${a}"
-    done
-  )
 elif [[ -f "${INITSRC}/busybox" ]]; then
-  cp "${INITSRC}/busybox" "${WORK}/bin/busybox"
-  chmod 755 "${WORK}/bin/busybox"
+  if file "${INITSRC}/busybox" | grep -qiE 'aarch64|ARM aarch64|x86-64'; then
+    # allow aarch64 only for phone; reject 32-bit ARM
+    if file "${INITSRC}/busybox" | grep -qi '32-bit'; then
+      echo "warn: rejecting 32-bit busybox (need aarch64)"
+    else
+      cp "${INITSRC}/busybox" "${WORK}/bin/busybox"
+      chmod 755 "${WORK}/bin/busybox"
+    fi
+  else
+    echo "warn: busybox arch unknown; including anyway"
+    cp "${INITSRC}/busybox" "${WORK}/bin/busybox"
+    chmod 755 "${WORK}/bin/busybox"
+  fi
+fi
+if [[ -x "${WORK}/bin/busybox" ]]; then
   (
     cd "${WORK}/bin"
     for a in sh mount umount mkdir ls cat echo sleep switch_root mknod; do
       ln -sfn busybox "${a}"
     done
   )
-else
-  echo "note: no busybox; init will be a static-friendly shell script only"
-  echo "      put aarch64 busybox at boot/initramfs/busybox or set BUSYBOX=..."
 fi
 
-cp "${INITSRC}/init" "${WORK}/init"
-chmod 755 "${WORK}/init"
 if [[ -f "${INITSRC}/aginxos-probe" ]]; then
-  mkdir -p "${WORK}/bin"
   cp "${INITSRC}/aginxos-probe" "${WORK}/bin/aginxos-probe"
   chmod 755 "${WORK}/bin/aginxos-probe"
 fi
@@ -109,9 +124,13 @@ fi
 if [[ -z "${CMDLINE}" && -f "${UNPACK}/cmdline" ]]; then
   CMDLINE="$(tr -d '\n' <"${UNPACK}/cmdline")"
 fi
-if [[ -z "${CMDLINE}" ]]; then
-  CMDLINE="console=ttyMSM0,115200n8 androidboot.console=ttyMSM0 androidboot.hardware=redfin"
-  echo "warn: using fallback cmdline (replace after inspecting stock boot)"
+# Pixel boot header v3 often has empty cmdline (bootloader/vendor_boot supplies it).
+# Keep empty unless FORCE_CMDLINE is set.
+if [[ -z "${CMDLINE}" && -n "${FORCE_CMDLINE:-}" ]]; then
+  CMDLINE="${FORCE_CMDLINE}"
+  echo "note: using FORCE_CMDLINE"
+elif [[ -z "${CMDLINE}" ]]; then
+  echo "note: empty cmdline (normal for redfin header v3)"
 fi
 
 HEADER_VERSION="${HEADER_VERSION:-3}"

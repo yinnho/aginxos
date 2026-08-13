@@ -25,3 +25,6 @@ rootfs/*.tar*
 *.mbn
 *.elf
 *.img
+boot/initramfs/aginxos-init
+boot/initramfs/aginxos-probe
+boot/initramfs/busybox

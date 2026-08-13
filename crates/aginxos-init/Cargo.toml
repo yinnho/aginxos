@@ -1,0 +1,14 @@
+[package]
+name = "aginxos-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal AginxOS initramfs init (static musl)"
+publish = false
+
+[[bin]]
+name = "aginxos-init"
+path = "src/main.rs"
+
+[dependencies]
+libc = { workspace = true }
