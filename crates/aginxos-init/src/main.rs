@@ -406,7 +406,47 @@ fn reap_zombies() {
     }
 }
 
+/// Operator reboot via the usb console: `/aginxos/aginxos-init reboot [mode]`.
+/// RESTART2 with a mode string only reaches fastboot when msm-poweroff's
+/// restart handler is loaded (translates the string into the PMIC PON
+/// scratch register — verified 2026-08-27: "bootloader" → fastboot in 6 s).
+fn do_reboot(mode: Option<&str>) -> i32 {
+    unsafe { libc::sync() };
+    // Raw syscall: musl's reboot(2) wrapper takes no RESTART2 mode argument.
+    const MAGIC1: libc::c_ulong = 0xfee1_dead;
+    const MAGIC2: libc::c_ulong = 0x2812_1969; // LINUX_REBOOT_MAGIC2 (RESTART2 family)
+    const CMD_RESTART: libc::c_ulong = 0x0123_4567;
+    const CMD_RESTART2: libc::c_ulong = 0xa1b2_c3d4;
+    let rc = match mode {
+        Some(m) => {
+            let Ok(c) = std::ffi::CString::new(m) else {
+                eprintln!("aginxos-init: bad mode string");
+                return 1;
+            };
+            unsafe {
+                libc::syscall(libc::SYS_reboot, MAGIC1, MAGIC2, CMD_RESTART2, c.as_ptr())
+            }
+        }
+        None => unsafe { libc::syscall(libc::SYS_reboot, MAGIC1, MAGIC2, CMD_RESTART, 0) },
+    };
+    if rc != 0 {
+        eprintln!(
+            "aginxos-init: reboot({}) failed: {}",
+            mode.unwrap_or(""),
+            std::io::Error::last_os_error()
+        );
+        return 1;
+    }
+    0
+}
+
 fn main() {
+    // `aginxos-init reboot [mode]` — operator command, not the init path.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("reboot") {
+        std::process::exit(do_reboot(args.get(2).map(String::as_str)));
+    }
+
     let hold = flag("/aginxos/hold");
     let do_modules = flag("/aginxos/load-modules");
     let do_splash = flag("/aginxos/splash");

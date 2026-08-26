@@ -188,6 +188,10 @@ pinctrl-lito.ko
 pinctrl-spmi-gpio.ko
 pinctrl-spmi-mpp.ko
 cmd-db.ko
+# hwspinlock BEFORE smem: smem's probe defers on its hwlock supplier — without
+# this, smem stays "deferred probe pending" and the reboot chain below fails
+# ("Minidump: SMEM is not initialized"). Found 2026-08-27.
+qcom_hwspinlock.ko
 smem.ko
 qcom_rpmh.ko
 clk-rpmh.ko
@@ -261,6 +265,18 @@ phy-msm-snps-hs.ko
 roles.ko
 tcpm.ko
 qpnp_pdphy.ko
+# Reboot-reason chain (2026-08-27): msm-poweroff registers the kernel restart
+# handler that translates RESTART2 mode strings ("bootloader") into the PMIC
+# PON scratch register — without it reboot(2) mode strings are lost and the
+# box always boots normal. Verified live: chain loaded -> `reboot2 bootloader`
+# reached fastboot in 6 s (vs button-combo before). Order matters:
+# smem(minidump needs it, loaded above) -> smem_state -> minidump -> watchdog
+# -> PON (needs SPMI stack, loaded above) -> msm-poweroff (needs all).
+smem_state.ko
+msm_minidump.ko
+watchdog_v2.ko
+qpnp-power-on.ko
+msm-poweroff.ko
 EOF
 fi
 if [[ "${USBADB}" == "1" ]]; then
