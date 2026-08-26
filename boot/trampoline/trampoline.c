@@ -923,6 +923,31 @@ static void cleanup_gadget(void) {
   kmsg("aginxos-trampoline: gadget cleanup done\n");
 }
 
+/* mkdir that refuses to fail silently (2026-08-27 v25 postmortem: the ffs
+ * symlink died with ENOENT because one of these had failed with no log line;
+ * configfs default groups make EEXIST routine, everything else is a signal). */
+static int mk(const char *path) {
+  int r = mkdir(path, 0755);
+  if (r != 0 && errno != EEXIST) {
+    char b[160];
+    snprintf(b, sizeof b, "aginxos-trampoline: mkdir %s errno=%d\n", path,
+             errno);
+    kmsg(b);
+  }
+  return r;
+}
+
+/* wf() with failure logging for the gadget-tree writes. */
+static int wf_log(const char *path, const char *val) {
+  int r = wf(path, val);
+  if (r != 0) {
+    char b[200];
+    snprintf(b, sizeof b, "aginxos-trampoline: write %s errno=%d\n", path, -r);
+    kmsg(b);
+  }
+  return r;
+}
+
 static void usb_console(void) {
   kmsg("aginxos-trampoline: usb console begin\n");
 
@@ -1036,8 +1061,8 @@ static void usb_console(void) {
     kmsg("aginxos-trampoline: mkdir g1 done, no writes (usb-mkg1-only bisect)\n");
     return;
   }
-  wf("/config/usb_gadget/g1/idVendor", "0x18d1");
-  wf("/config/usb_gadget/g1/idProduct", "0xd001");
+  wf_log("/config/usb_gadget/g1/idVendor", "0x18d1");
+  wf_log("/config/usb_gadget/g1/idProduct", "0xd001");
   if (exists("/aginxos/usb-vidpid-only")) {
     /* Bisect v16 (2026-08-27): v14 (g1 mkdir only) OK; v15 (g1 + 4 prop
      * writes) bootlooped. This gate keeps only idVendor+idProduct to split
@@ -1047,8 +1072,8 @@ static void usb_console(void) {
     kmsg(b);
     return;
   }
-  wf("/config/usb_gadget/g1/bcdDevice", "0x0100");
-  wf("/config/usb_gadget/g1/bcdUSB", "0x0200");
+  wf_log("/config/usb_gadget/g1/bcdDevice", "0x0100");
+  wf_log("/config/usb_gadget/g1/bcdUSB", "0x0200");
   if (exists("/aginxos/usb-props-only")) {
     /* Bisect v15 (2026-08-26): g1 dir alone was safe (v14). This mode adds
      * the idVendor/idProduct/bcd* + strings writes but creates NO functions
@@ -1056,17 +1081,21 @@ static void usb_console(void) {
     kmsg("aginxos-trampoline: props written, no functions/configs (usb-props-only bisect)\n");
     return;
   }
-  mkdir("/config/usb_gadget/g1/strings", 0755);
-  mkdir("/config/usb_gadget/g1/strings/0x409", 0755);
-  wf("/config/usb_gadget/g1/strings/0x409/serialnumber", "aginxosredfin");
-  wf("/config/usb_gadget/g1/strings/0x409/manufacturer", "AginxOS");
-  wf("/config/usb_gadget/g1/strings/0x409/product", "aginxos-redfin");
-  mkdir("/config/usb_gadget/g1/functions", 0755);
-  mkdir("/config/usb_gadget/g1/functions/ffs.adb", 0755);
-  mkdir("/config/usb_gadget/g1/configs", 0755);
-  mkdir("/config/usb_gadget/g1/configs/b.1", 0755);
-  wf("/config/usb_gadget/g1/configs/b.1/MaxPower", "500");
-  if (symlink("../../functions/ffs.adb",
+  mk("/config/usb_gadget/g1/strings");
+  mk("/config/usb_gadget/g1/strings/0x409");
+  wf_log("/config/usb_gadget/g1/strings/0x409/serialnumber", "aginxosredfin");
+  wf_log("/config/usb_gadget/g1/strings/0x409/manufacturer", "AginxOS");
+  wf_log("/config/usb_gadget/g1/strings/0x409/product", "aginxos-redfin");
+  mk("/config/usb_gadget/g1/functions");
+  mk("/config/usb_gadget/g1/functions/ffs.adb");
+  mk("/config/usb_gadget/g1/configs");
+  mk("/config/usb_gadget/g1/configs/b.1");
+  wf_log("/config/usb_gadget/g1/configs/b.1/MaxPower", "500");
+  /* configfs symlink targets resolve via kern_path() from the CALLER's cwd
+   * (v25: "../../functions/ffs.adb" resolved from / -> ENOENT, gadget build
+   * silently aborted one step from the bind). Stock init.usb.rc uses an
+   * absolute source path; so must we. */
+  if (symlink("/config/usb_gadget/g1/functions/ffs.adb",
               "/config/usb_gadget/g1/configs/b.1/ffs.adb") != 0 &&
       errno != EEXIST) {
     char b[96];
@@ -1103,6 +1132,25 @@ static void usb_console(void) {
     _exit(127); /* exec failed — die quietly, parent logs via ep1 timeout */
   }
   for (int t = 0; t < 40; t++) { /* adbd writes ep0 + opens ep1/ep2 */
+    int st;
+    pid_t r = waitpid(pid, &st, WNOHANG);
+    if (r == pid) {
+      /* v26 postmortem prep: if adbd dies before opening ep0 (no property
+       * area, linker/env issues), the ffs function has no descriptors and
+       * the UDC bind cannot enumerate. Record HOW it died. */
+      char b[128];
+      if (WIFEXITED(st))
+        snprintf(b, sizeof b, "aginxos-trampoline: adbd EXITED code=%d\n",
+                 WEXITSTATUS(st));
+      else if (WIFSIGNALED(st))
+        snprintf(b, sizeof b, "aginxos-trampoline: adbd KILLED signal=%d\n",
+                 WTERMSIG(st));
+      else
+        snprintf(b, sizeof b, "aginxos-trampoline: adbd status=%d\n", st);
+      kmsg(b);
+      g_adbd_pid = 0;
+      break;
+    }
     if (exists("/dev/usb-ffs/adb/ep1"))
       break;
     usleep(50000);

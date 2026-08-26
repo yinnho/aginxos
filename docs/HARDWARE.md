@@ -466,3 +466,46 @@ PID 1 waitpids with 180 s timeout and kmsgs exit code/signal, then hands
 off. A userspace fault then only kills the child and the run reaches
 Android: bugreport shows the last stage marker + the waitpid status.
 Clean child + LOOP would finally confirm a kernel-side fault.
+
+## v25 fork isolation: no kernel panic exists; symlink bug found (2026-08-27)
+
+v25 (`USBADB=1` full gadget, whole `usb_console()` in a forked child, PID 1
+waitpids and hands off): **ANDROID_OK at 52 s** — first run ever to reach
+Android with the gadget path executed. Bugreport kernel log:
+
+- child (pid 200) starts 0.497 s, `modules ok=52` at 0.997 s,
+  `udc=a600000.dwc3` at 1.098 s
+- extcon2 (pdphy) reads `USB=0` at 1.098 s but **`USB=1` at 4.098 s** —
+  VBUS/pull-up conditions turn good during the settle window
+- configfs mounted 4.098 s; kernel `file system registered` at 4.099082 s
+  (= the functionfs instance created by `mkdir functions/ffs.adb`, proving
+  g1 + strings + functions all built fine)
+- `ffs symlink errno=2` at 4.099150 s → usb_console early-returns, child
+  `exited code=0`, parent runs the FULL cleanup (UDC skip, rmdir chain,
+  configfs umount) **in PID 1** with zero trouble, execs first_stage 4.199 s
+
+Findings:
+
+- **There is no kernel panic in the creation or teardown paths.** The exact
+  syscalls that bootlooped v6-v24 (mkdir g1, prop writes, ffs instance,
+  rmdir gadget) are all harmless — when issued from a non-PID-1 process,
+  and the teardown even from PID 1 itself. The v6-v24 "panic" was a
+  PID-1-process-domain failure (exact mechanism still unidentified; fork
+  isolation sidesteps it completely).
+- **The symlink was a real userland bug**: configfs `symlink()` resolves
+  the target with kern_path() from the *caller's cwd* (we run at `/`), so
+  `"../../functions/ffs.adb"` → `/functions/ffs.adb` → ENOENT. Stock
+  init.usb.rc uses absolute source paths. Every run since v6 silently
+  aborted the gadget one step before the bind. Fixed: absolute target +
+  mkdir/write failures now logged (`mk`/`wf_log` helpers).
+
+v26 (`USBADB=1 HOLD=1` + symlink fix): **still no enumeration** — host saw
+no 18d1:d001/d002, no adb, silent freeze. P1 persists with a correctly
+built tree. New prime suspect: adbd itself dies in our env (no property
+area → adbd exits/crashes before writing ffs ep0 descriptors → composite
+bind has no function descriptors → nothing to enumerate). HOLD mode has no
+readback channel; manual Power+VolDown recovery needed.
+
+v27 (next): handoff variant of v26 — child also waitpid-watches adbd and
+kmsgs exit code/signal; bind result + udc-state land in the ring buffer
+and come back via `adb bugreport`.
