@@ -764,3 +764,19 @@ image** (HOLD, STORAGE=1, aginxos-init v0.4.0 as PID 1 with storage up,
 authorized root adb, software fastboot route). Recovery:
 `adb shell /aginxos/aginxos-init reboot bootloader` → flash
 `boot/stock-vendor_boot.img`.
+
+## v0.5.0: /dev/block/by-name (2026-08-27)
+
+aginxos-init now parses each LUN's GPT itself (entries at LBA2, 128-byte
+records, UTF-16LE names; all six LUNs are 4096-byte logical blocks — probed)
+and maps name→partition by matching `first_lba × 8` against the kernel's
+`/sys/block/*/start` (512-byte units). Boot log:
+`storage up: ufs mods ok=6, 95 block nodes, 73 by-name links (by-name ok)` —
+73 = every named GPT entry across sda–sdf. Spot-checked:
+misc→sda3, super→sda18, userdata→sda19, vendor_boot_a→sda8, boot_a/b,
+vbmeta*, metadata, logfs all present. (The mojibake entries seen in the
+earlier host-side dd+parse were parse artifacts, not partition names —
+they vanish once entries are read from the proper LBA2 offset.)
+
+Device state unchanged in kind: v35 image (now aginxos-init v0.5.0) HOLD +
+STORAGE, storage and by-name up at t=29.4 s.
