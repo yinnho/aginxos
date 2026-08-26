@@ -5,8 +5,12 @@
 //!   /aginxos/load-modules — load /lib/modules/modules.load
 //!   /aginxos/splash       — attempt DRM solid-color frames
 //!   /aginxos/storage      — load the UFS chain, create block nodes
+//!   /aginxos/super        — parse super, map+mount its _a sub-partitions
+//!                           (implies storage)
 //!
-//! Operator subcommand: `/aginxos/aginxos-init reboot [mode]`.
+//! Operator subcommands:
+//!   /aginxos/aginxos-init reboot [mode]
+//!   /aginxos/aginxos-init parse-super <file>   (host-side metadata check)
 //! Default with only `hold`: mount basics + heartbeat (safest bring-up).
 
 use std::fs::{self, File, OpenOptions};
@@ -296,6 +300,377 @@ fn bring_up_storage() {
     klog(&format!(
         "storage up: ufs mods ok={ok}, {made} block nodes, {links} by-name links ({misc})"
     ));
+}
+
+// --- super / dynamic partitions (/aginxos/super) ---
+
+/// liblp metadata lives at a fixed offset in super: geometry @0x1000,
+/// header @0x3000 (bootstrapped from a dump 2026-08-27 — see HARDWARE.md;
+/// the online sources were unreachable, the format is self-describing).
+const SUPER_GEOMETRY_OFF: u64 = 0x1000;
+const SUPER_HEADER_OFF: u64 = 0x3000;
+const LP_GEOMETRY_MAGIC: u32 = 0x616c_4467;
+const LP_HEADER_MAGIC: u32 = 0x414c_5030;
+
+#[derive(PartialEq)]
+struct SuperPart {
+    name: String,
+    num_sectors: u64,
+    /// Linear source offset inside super, 512-byte sectors.
+    source_sector: u64,
+}
+
+fn read_at(f: &mut File, off: u64, len: usize) -> Option<Vec<u8>> {
+    f.seek(SeekFrom::Start(off)).ok()?;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// Parse the liblp geometry+header+tables out of super (a block device or a
+/// dumped metadata file). Only single-extent LINEAR partitions are returned;
+/// multi-extent or non-linear ones are skipped and logged by the caller.
+///
+/// Layout (verified byte-by-byte against a dump 2026-08-27): tables live at
+/// header+header_size; partition name is plain ASCII[36]; extents are packed
+/// {u64 num_sectors; u32 target_type; u64 source_data} with source_data at
+/// offset 12 — NOT 16, which produced overlapping extents until the raw
+/// hexdump settled it.
+fn parse_super(f: &mut File) -> Result<Vec<SuperPart>, String> {
+    let geo = read_at(f, SUPER_GEOMETRY_OFF, 32)
+        .ok_or_else(|| "read geometry".to_string())?;
+    if u32::from_le_bytes(geo[0..4].try_into().unwrap()) != LP_GEOMETRY_MAGIC {
+        return Err("bad geometry magic".into());
+    }
+    let hdr = read_at(f, SUPER_HEADER_OFF, 0x80)
+        .ok_or_else(|| "read header".to_string())?;
+    if u32::from_le_bytes(hdr[0..4].try_into().unwrap()) != LP_HEADER_MAGIC {
+        return Err("bad header magic".into());
+    }
+    let header_size = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as u64;
+    let tables_base = SUPER_HEADER_OFF + header_size;
+    // Table descriptors at header+0x50: 4 x {u32 offset, u32 num_entries,
+    // u32 entry_size} in order partitions, extents, groups, block_devices.
+    // Offsets are relative to the end of the header.
+    let desc = |i: usize| -> (u64, usize, usize) {
+        let d = &hdr[0x50 + i * 12..];
+        let off = u32::from_le_bytes(d[0..4].try_into().unwrap()) as u64;
+        let n = u32::from_le_bytes(d[4..8].try_into().unwrap()) as usize;
+        let sz = u32::from_le_bytes(d[8..12].try_into().unwrap()) as usize;
+        (tables_base + off, n, sz)
+    };
+    let (p_off, p_n, p_sz) = desc(0);
+    let (e_off, e_n, e_sz) = desc(1);
+    let parts = read_at(f, p_off, p_n * p_sz).ok_or_else(|| "read partitions".to_string())?;
+    let exts = read_at(f, e_off, e_n * e_sz).ok_or_else(|| "read extents".to_string())?;
+
+    let mut out = Vec::new();
+    for p in parts.chunks_exact(p_sz) {
+        if p[..16].iter().all(|&b| b == 0) {
+            break; // unused entry ends the table
+        }
+        let name = String::from_utf8_lossy(&p[..36]).to_string();
+        let name = name.split('\0').next().unwrap_or("").to_string();
+        let first_extent = u32::from_le_bytes(p[40..44].try_into().unwrap()) as usize;
+        let num_extents = u32::from_le_bytes(p[44..48].try_into().unwrap()) as usize;
+        if num_extents != 1 || first_extent >= e_n {
+            klog(&format!("super: skip {name} ({num_extents} extents)"));
+            continue;
+        }
+        let e = &exts[first_extent * e_sz..];
+        let num_sectors = u64::from_le_bytes(e[0..8].try_into().unwrap());
+        let target_type = u32::from_le_bytes(e[8..12].try_into().unwrap());
+        let source = u64::from_le_bytes(e[12..20].try_into().unwrap());
+        if target_type != 0 {
+            klog(&format!("super: skip {name} (target_type {target_type})"));
+            continue;
+        }
+        out.push(SuperPart {
+            name,
+            num_sectors,
+            source_sector: source,
+        });
+    }
+    Ok(out)
+}
+
+/// Extents must tile super without overlap and stay inside the partition.
+/// This doubles as corruption detection: right after the UFS probe the first
+/// metadata reads came back garbage (kernel saw linear start=30726 where the
+/// real value is 3072 — boot run 2026-08-27, t+44.8s; minutes later the same
+/// read was correct). Two consecutive identical, valid reads are required.
+fn tiles(parts: &[SuperPart], super_sectors: Option<u64>) -> bool {
+    let mut spans: Vec<(u64, u64)> = parts
+        .iter()
+        .map(|p| (p.source_sector, p.source_sector + p.num_sectors))
+        .collect();
+    spans.sort_unstable();
+    for w in spans.windows(2) {
+        if w[0].1 > w[1].0 {
+            return false; // overlap
+        }
+    }
+    if let Some(sz) = super_sectors {
+        if let Some(&(_, end)) = spans.last() {
+            if end > sz {
+                return false; // beyond super
+            }
+        }
+    }
+    true
+}
+
+fn parse_super_stable(
+    f: &mut File,
+    super_sectors: Option<u64>,
+) -> Result<Vec<SuperPart>, String> {
+    let mut prev: Option<Vec<SuperPart>> = None;
+    for attempt in 0..10 {
+        let parts = parse_super(f)?;
+        if !tiles(&parts, super_sectors) {
+            klog(&format!("super: read {attempt} failed validation, retrying"));
+            prev = None; // corrupted read — require two fresh identical ones
+        } else if let Some(p) = &prev {
+            if *p == parts {
+                if attempt > 0 {
+                    klog(&format!("super: stable after {attempt} retries"));
+                }
+                return Ok(parts);
+            }
+            klog("super: consecutive reads differ, retrying");
+        }
+        prev = Some(parts);
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err("metadata reads never stabilized".into())
+}
+
+// device-mapper ioctls (linux/dm-ioctl.h layout; _IOWR size = sizeof header).
+#[repr(C)]
+struct DmIoctlHdr {
+    version: [u32; 3],
+    data_size: u32,
+    data_start: u32,
+    target_count: u32,
+    open_count: u32,
+    flags: u32,
+    event_nr: u32,
+    padding1: u32,
+    dev: u64,
+    name: [u8; 16],
+    uuid: [u8; 129],
+    data: [u8; 7],
+}
+
+#[repr(C)]
+struct DmTargetSpec {
+    sector_start: u64,
+    length: u64,
+    status: i32,
+    next: u32,
+    target_type: [u8; 16],
+}
+
+const fn dm_iowr(nr: u8) -> libc::Ioctl {
+    let hdr_size = std::mem::size_of::<DmIoctlHdr>() as u64;
+    ((3u64 << 30) | (hdr_size << 16) | (0xfdu64 << 8) | nr as u64) as libc::Ioctl
+}
+const DM_VERSION: libc::Ioctl = dm_iowr(0x00);
+const DM_DEV_CREATE: libc::Ioctl = dm_iowr(0x03);
+const DM_DEV_REMOVE: libc::Ioctl = dm_iowr(0x04);
+const DM_DEV_SUSPEND: libc::Ioctl = dm_iowr(0x06);
+const DM_TABLE_LOAD: libc::Ioctl = dm_iowr(0x09);
+
+const DM_BUF: usize = 4096;
+
+fn dm_hdr(buf: &mut [u8; DM_BUF], version: [u32; 3], name: &str) -> *mut DmIoctlHdr {
+    *buf = [0u8; DM_BUF];
+    for (i, v) in version.iter().enumerate() {
+        buf[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    buf[12..16].copy_from_slice(&(DM_BUF as u32).to_le_bytes());
+    buf[16..20].copy_from_slice(&(std::mem::size_of::<DmIoctlHdr>() as u32).to_le_bytes());
+    let b = name.as_bytes();
+    let n = b.len().min(15);
+    buf[48..48 + n].copy_from_slice(&b[..n]);
+    buf.as_mut_ptr() as *mut DmIoctlHdr
+}
+
+/// Map one linear window of `src_dev` ("maj:min") and mount it ext4 ro.
+/// Returns the mount point on success.
+fn map_and_mount(
+    ctl: &mut File,
+    version: [u32; 3],
+    name: &str,
+    src_dev: &str,
+    start: u64,
+    len: u64,
+) -> Result<String, String> {
+    let err = || std::io::Error::last_os_error();
+    let mut buf = [0u8; DM_BUF];
+    unsafe { libc::ioctl(ctl.as_raw_fd(), DM_DEV_REMOVE, dm_hdr(&mut buf, version, name)) };
+
+    let h = dm_hdr(&mut buf, version, name);
+    if unsafe { libc::ioctl(ctl.as_raw_fd(), DM_DEV_CREATE, h) } != 0 {
+        return Err(format!("DM_DEV_CREATE: {}", err()));
+    }
+    let dev = unsafe { (*h).dev };
+    let dm_minor = (dev & 0xff) | ((dev >> 12) & 0xfff_00);
+
+    let h = dm_hdr(&mut buf, version, name);
+    unsafe {
+        (*h).target_count = 1;
+        let spec = &mut *(buf
+            .as_mut_ptr()
+            .add(std::mem::size_of::<DmIoctlHdr>()) as *mut DmTargetSpec);
+        spec.sector_start = 0;
+        spec.length = len;
+        spec.status = 0;
+        spec.next = 0;
+        spec.target_type[..6].copy_from_slice(b"linear");
+        // Params string + explicit NUL. Rust Strings are not NUL-terminated:
+        // copying len+1 bytes reads one byte PAST the heap allocation, which
+        // overwrote the zeroed buffer with garbage — product_a's start came
+        // out as "30726" (a stray '6') and the others failed sscanf outright
+        // (found 2026-08-27; see HARDWARE.md).
+        let params = format!("{src_dev} {start}");
+        let dst = buf.as_mut_ptr().add(std::mem::size_of::<DmIoctlHdr>() + 40);
+        dst.copy_from(params.as_bytes().as_ptr(), params.len());
+        *dst.add(params.len()) = 0;
+        if libc::ioctl(ctl.as_raw_fd(), DM_TABLE_LOAD, h) != 0 {
+            return Err(format!("DM_TABLE_LOAD: {}", err()));
+        }
+    }
+
+    // flags=0 on DEV_SUSPEND means resume (no DM_SUSPEND_FLAG set).
+    let h = dm_hdr(&mut buf, version, name);
+    if unsafe { libc::ioctl(ctl.as_raw_fd(), DM_DEV_SUSPEND, h) } != 0 {
+        return Err(format!("DM_DEV_RESUME: {}", err()));
+    }
+
+    let devpath = format!("/dev/dm-{dm_minor}");
+    let c_path = std::ffi::CString::new(devpath.clone()).unwrap();
+    let rc = unsafe { libc::mknod(c_path.as_ptr(), libc::S_IFBLK | 0o600, dev as libc::dev_t) };
+    if rc != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+        return Err(format!("mknod {devpath}: {}", err()));
+    }
+    let _ = std::os::unix::fs::symlink(&devpath, format!("/dev/block/mapper/{name}"));
+
+    let mnt = format!("/{name}");
+    mkdir_p(&mnt);
+    let src = std::ffi::CString::new(devpath.clone()).unwrap();
+    let tgt = std::ffi::CString::new(mnt.clone()).unwrap();
+    let fst = std::ffi::CString::new("ext4").unwrap();
+    let rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            tgt.as_ptr(),
+            fst.as_ptr(),
+            libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(format!("mount ext4 ro {devpath}: {}", err()));
+    }
+    Ok(mnt)
+}
+
+/// Parse super and expose its big _a sub-partitions as dm-linear + ext4 ro
+/// mounts at /system_a, /vendor_a, /product_a (live-proven 2026-08-27 with
+/// the same recipe via a scratch C tool — see HARDWARE.md).
+fn bring_up_super() {
+    const ALLOW: &[&str] = &["system", "vendor", "product", "system_ext"];
+    let Some(super_dev) = fs::read_link("/dev/block/by-name/super")
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    else {
+        klog("super: no /dev/block/by-name/super (storage flag?)");
+        return;
+    };
+    // major:minor of the super partition from /proc/partitions.
+    let sm = fs::read_to_string("/proc/partitions").ok().and_then(|c| {
+        c.lines().find_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            (f.len() == 4 && f[3] == super_dev)
+                .then(|| (format!("{}:{}", f[0], f[1]), f[2].parse::<u64>().ok()))
+        })
+    });
+    let Some((src_dev, blocks)) = sm else {
+        klog(&format!("super: {super_dev} not in /proc/partitions"));
+        return;
+    };
+    let super_sectors = blocks.map(|kb| kb * 2); // /proc/partitions is 1K blocks
+
+    let Ok(mut f) = File::open(format!("/dev/{super_dev}")) else {
+        klog(&format!("super: open /dev/{super_dev} failed"));
+        return;
+    };
+    let parts = match parse_super_stable(&mut f, super_sectors) {
+        Ok(p) => p,
+        Err(e) => {
+            klog(&format!("super: parse failed: {e}"));
+            return;
+        }
+    };
+    drop(f);
+
+    mkdir_p("/dev/block/mapper");
+    // /dev/mapper itself must exist before the control node can go in it —
+    // caught on the first boot-time run (ENOENT, 2026-08-27): the live test
+    // had inherited a hand-made directory and masked this.
+    mkdir_p("/dev/mapper");
+    let control = "/dev/mapper/control";
+    if !Path::new(control).exists() {
+        let c = std::ffi::CString::new(control).unwrap();
+        let rc =
+            unsafe { libc::mknod(c.as_ptr(), libc::S_IFCHR | 0o600, makedev(10, 236)) };
+        if rc != 0 {
+            klog(&format!(
+                "super: mknod mapper/control: {}",
+                std::io::Error::last_os_error()
+            ));
+            return;
+        }
+    }
+    let mut ctl = match OpenOptions::new().read(true).write(true).open(control) {
+        Ok(f) => f,
+        Err(e) => {
+            klog(&format!("super: open mapper/control: {e}"));
+            return;
+        }
+    };
+    let mut buf = [0u8; DM_BUF];
+    let h = dm_hdr(&mut buf, [4, 39, 0], "");
+    if unsafe { libc::ioctl(ctl.as_raw_fd(), DM_VERSION, h) } != 0 {
+        klog(&format!("super: DM_VERSION: {}", std::io::Error::last_os_error()));
+        return;
+    }
+    let version = unsafe { (*h).version };
+    klog(&format!(
+        "super: {} parts, dm {}.{}, src {src_dev}",
+        parts.len(),
+        version[0],
+        version[1]
+    ));
+
+    let mut mounted = Vec::new();
+    for base in ALLOW {
+        let name = format!("{base}_a");
+        let Some(p) = parts.iter().find(|p| p.name == name) else {
+            continue;
+        };
+        let (len, start) = (p.num_sectors, p.source_sector);
+        klog(&format!("super: {name} {len} sectors @ {start}"));
+        match map_and_mount(&mut ctl, version, &name, &src_dev, start, len) {
+            Ok(mnt) => {
+                klog(&format!("super: mounted {name} at {mnt}"));
+                mounted.push(name);
+            }
+            Err(e) => klog(&format!("super: {name} failed: {e}")),
+        }
+    }
+    klog(&format!("super up: mounted {} [{}]", mounted.len(), mounted.join(",")));
 }
 
 fn load_modules_from_list() {
@@ -633,18 +1008,49 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("reboot") {
         std::process::exit(do_reboot(args.get(2).map(String::as_str)));
     }
+    // `aginxos-init mount-super` — live test of the super flag on a running
+    // console (no flash cycle needed).
+    if args.get(1).map(String::as_str) == Some("mount-super") {
+        ensure_basics();
+        if !partitions_have("sda") {
+            bring_up_storage();
+        }
+        bring_up_super();
+        std::process::exit(0);
+    }
+    // `aginxos-init parse-super <file>` — host-side metadata sanity check.
+    if args.get(1).map(String::as_str) == Some("parse-super") {
+        let Some(path) = args.get(2) else {
+            eprintln!("usage: aginxos-init parse-super <file>");
+            std::process::exit(2);
+        };
+        let mut f = File::open(path).expect("open");
+        match parse_super_stable(&mut f, None) {
+            Ok(parts) => {
+                for p in parts {
+                    println!("{}: {} sectors @ {}", p.name, p.num_sectors, p.source_sector);
+                }
+            }
+            Err(e) => {
+                eprintln!("parse failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(0);
+    }
 
     let hold = flag("/aginxos/hold");
     let do_modules = flag("/aginxos/load-modules");
     let do_splash = flag("/aginxos/splash");
     let do_full_modules = flag("/aginxos/load-modules-full");
-    let do_storage = flag("/aginxos/storage");
+    let do_super = flag("/aginxos/super");
+    let do_storage = flag("/aginxos/storage") || do_super;
     // Immediate handoff without mounting (cleanest path to Android).
     let handoff_only =
         !hold && !do_modules && !do_splash && !do_full_modules && !do_storage;
 
     klog(&format!(
-        "start v{} pid={} hold={hold} handoff_only={handoff_only} modules={do_modules} splash={do_splash} storage={do_storage}",
+        "start v{} pid={} hold={hold} handoff_only={handoff_only} modules={do_modules} splash={do_splash} storage={do_storage} super={do_super}",
         env!("CARGO_PKG_VERSION"),
         std::process::id()
     ));
@@ -674,6 +1080,12 @@ fn main() {
         bring_up_storage();
     } else {
         klog("skip storage (safe default)");
+    }
+
+    if do_super {
+        bring_up_super();
+    } else {
+        klog("skip super (safe default)");
     }
 
     if do_splash {

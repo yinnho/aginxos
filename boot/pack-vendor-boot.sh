@@ -314,6 +314,13 @@ if [[ "${STORAGE}" == "1" ]]; then
   : >"${WORK}/aginxos/storage"
   echo "note: STORAGE=1 → aginxos-init brings up UFS after takeover"
 fi
+# SUPER=1: aginxos-init also parses super and mounts its _a sub-partitions
+# (system/vendor/product/system_ext) ext4 ro via dm-linear. Implies STORAGE.
+SUPER="${SUPER:-0}"
+if [[ "${SUPER}" == "1" ]]; then
+  : >"${WORK}/aginxos/super"
+  echo "note: SUPER=1 → aginxos-init mounts super _a sub-partitions after takeover"
+fi
 # USBCFGONLY=1: mount configfs, create no gadget tree (bisect v13)
 USBCFGONLY="${USBCFGONLY:-0}"
 # USBG1ONLY=1: create /config/usb_gadget/g1 only, nothing else (bisect v14)

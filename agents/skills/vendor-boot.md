@@ -48,11 +48,12 @@ after the PID 1 takeover:
 | `/aginxos/load-modules-loadfile` | load stock `modules.load` but stop at `msm_drm.ko`. |
 | `/aginxos/load-modules-full` | load the entire `modules.load`. Riskier. |
 | `/aginxos/storage` | aginxos-init (as PID 1) loads the UFS chain and mknods the block nodes from `/proc/partitions`. |
+| `/aginxos/super` | aginxos-init also parses super's liblp metadata and mounts the `_a` sub-partitions (system, vendor, product, system_ext) ext4-ro via dm-linear at `/<name>`; implies `storage`. |
 
 `pack-vendor-boot.sh` takes env flags that write these:
 
 ```bash
-HOLD=1 SPLASH=0 USBADB=1 STORAGE=1 ./boot/pack-vendor-boot.sh
+HOLD=1 SPLASH=0 USBADB=1 STORAGE=1 SUPER=1 ./boot/pack-vendor-boot.sh
 # HOLD:       0|1
 # SPLASH:     0|1
 # USBADB:     0|1  — ffs.adb console + /aginxos/modules.usb chain
@@ -61,6 +62,7 @@ HOLD=1 SPLASH=0 USBADB=1 STORAGE=1 ./boot/pack-vendor-boot.sh
 # MODULES:    0 | 1 (modules.allow) | drm (modules.load through msm_drm)
 # MODULES_FULL: 0|1
 # STORAGE:    0|1  — aginxos-init brings up UFS after the takeover
+# SUPER:      0|1  — aginxos-init mounts super _a sub-partitions after the takeover
 ```
 
 ### USB gadget console (`/aginxos/usb-adb`)
