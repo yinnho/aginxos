@@ -855,3 +855,78 @@ image** (HOLD+SPLASH+USBADB+STORAGE+SUPER, aginxos-init v0.6.0 as PID 1,
 four super partitions mounted ro, authorized root adb). Recovery unchanged:
 `adb shell /aginxos/aginxos-init reboot bootloader` → flash
 `boot/stock-vendor_boot.img`.
+
+## v0.7.0: M2 — rootfs on userdata, switch_root, busybox init (2026-08-27)
+
+Milestone 2 reached and **verified reproducible across cold boots**: from a
+clean boot the device now runs *our* rootfs — aginxos-init (PID 1 in the
+initramfs) mounts a 512 MB ext4 image on `userdata`, carries the live mounts
+across, `switch_root`s, and busybox init becomes the new PID 1 with a
+respawned adbd as the console. Android userspace no longer runs.
+
+Image built host-side: `scripts/build-rootfs.sh` assembles
+`/system` + `default.prop` + `*_contexts` from the unpacked vendor ramdisk,
+static busybox 1.36.1 (`boot/rootfs/busybox`), `/etc` templates
+(`boot/rootfs/etc/`), and the musl release binaries, then
+`mke2fs -t ext4 -F -d` (the android-platform-tools build, e2fsprogs 1.46.6)
+writes raw ext4 → `fastboot flash userdata out/rootfs.img`. New flags:
+`/aginxos/rootfs` (pack env `ROOTFS=1`, implies STORAGE) and
+`/aginxos/keep-adbd` (`KEEPADBD=1`, diagnostic only).
+
+Cold-boot timing of the final image (HOLD+SPLASH+USBADB+ROOTFS): adbd
+console up t≈21 s; old adbd killed at the switch → USB drops ≈ t+44 s;
+re-enumeration ≈ +12 s later, now respawned by busybox init. In the new
+root: `/proc/1/comm` = `init`, adbd PPID 1, `/proc/mounts` shows
+`/dev/sda19 / ext4 rw`, `uptime`/`hostname` (aginxos) work, rcS marker
+fresh, ownership normalized to root:root.
+
+Getting there cost two dark boots; every failure mode below is observed:
+
+- **`/dev` is not a mount in the initramfs.** The trampoline mknod'd console,
+  urandom, `__properties__` and block nodes directly into the initramfs root
+  directory, so `/proc/mounts` never lists /dev — any "move all mounts"
+  loop silently skips it. First ROOTFS boot: the new adbd died at
+  `getentropy failed: No such file or directory` (no /dev/urandom), and with
+  no adbd alive the already-torn-down UDC never re-enumerated → device dark
+  until forced power-off. Fix: explicit `mount("/dev", newroot/dev,
+  MS_BIND|MS_REC)` *before* iterating /proc/mounts.
+- **adbd's death tears the gadget down.** Closing ffs ep0 clears
+  `/config/usb_gadget/g1/UDC` (observed empty in /var/wdt.log). A fresh adbd
+  opening ep0 on the *surviving* ffs mount re-activates the function; then
+  `echo a600000.dwc3 > .../UDC` re-binds and USB re-enumerates (~12 s).
+  Mounting a *new* functionfs over /dev/usb-ffs/adb is wrong — it shadows
+  the instance g1 is linked to and the bind becomes a no-op. The respawn
+  wrapper (`etc/init.d/adbd`) therefore self-binds the UDC with a retry
+  loop, backgrounded so `exec adbd` isn't delayed.
+- **Processes don't cross a covering root mount.** With KEEPADBD=1 the kept
+  trampoline adbd kept its old fs root, so `adb shell` aborted
+  (SIGABRT, shell_service.cpp:385 "Failed to get SELinux context"), and
+  `adb reboot` failed ("failed to create pty master" — no /dev/ptmx in its
+  world). Diagnostic value only; the shipping path kills the old adbd and
+  lets busybox init respawn it in the new root.
+- **MS_MOVE vs MS_BIND:** moving mounts broke the kept console (above);
+  `remounts_into(newroot, keep)` chooses bind for the diagnostic path and
+  move otherwise.
+- **busybox init ordering:** `::sysinit:` (rcS) completes before
+  `::respawn:` entries start — rcS does the one-shot setup (applet install,
+  uid-501 → root chown of the mke2fs-built tree, idempotent mounts, lo up)
+  and the respawn wrapper handles everything adbd needs per instance.
+- **No pstore on this kernel** (empty /sys/fs/pstore, no ramoops module):
+  kmsg dies with the old world, so `/var/adbd.log` + `/var/wdt.log` on the
+  ext4 root are the only cross-boot evidence. That's how the getentropy and
+  UDC-teardown failures were actually diagnosed (keep-adbd build + bind
+  mounts + `/proc/1/root` as a bridge into the new root).
+- **Slot retry counter:** several failed boots in a row drop redfin to
+  fastboot on its own; `fastboot set_active a` before reboot resets it.
+
+Recipe committed alongside: `boot/rootfs/` (busybox + etc templates,
+byte-identical to the proven on-device files — verified by md5 against the
+live rootfs) and `scripts/build-rootfs.sh`. The built image lives in
+`out/rootfs.img` (gitignored).
+
+Device state (2026-08-27, end of session): **running the AginxOS rootfs**
+(v0.7.0 test vendor_boot, HOLD+SPLASH+USBADB+ROOTFS, keep-adbd off; userdata
+is our ext4 — Android userdata is gone). Root adb authorized, serial string
+`aginxosredfin`. Recovery: `adb shell /aginxos/aginxos-init reboot bootloader`
+→ `scripts/restore-vendor-boot.sh` (back to stock vendor_boot, still our
+userdata); full Android restore = flash-all from `.factory/`.
