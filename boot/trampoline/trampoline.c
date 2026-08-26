@@ -79,7 +79,85 @@ static void try_mount(const char *src, const char *tgt, const char *fstype,
 static void ensure_fs(void) {
   try_mount("proc", "/proc", "proc", "");
   try_mount("sysfs", "/sys", "sysfs", "");
-  try_mount("devtmpfs", "/dev", "devtmpfs", "mode=0755");
+  mkdir("/dev", 0755);
+  if (mount("devtmpfs", "/dev", "devtmpfs", 0, "mode=0755") == 0) {
+    kmsg("aginxos-trampoline: devtmpfs mounted\n");
+    return;
+  }
+  /* v28 root cause of the adbd SIGABRT: bionic's getentropy() needs
+   * /dev/urandom and fatal()s on ENOENT ("getentropy failed: No such file
+   * or directory"). This kernel likely has no devtmpfs (stock Android
+   * mounts tmpfs on /dev and lets ueventd mknod); fall back to creating
+   * the major-1 char essentials ourselves — those drivers are always
+   * registered, only the nodes are missing. */
+  {
+    char b[96];
+    snprintf(b, sizeof b, "aginxos-trampoline: devtmpfs mount errno=%d\n",
+             errno);
+    kmsg(b);
+  }
+  static const struct { const char *name; int minor; } nodes[] = {
+      {"null", 3}, {"zero", 5}, {"full", 7},
+      {"random", 8}, {"urandom", 9}, {"kmsg", 11},
+  };
+  for (unsigned i = 0; i < sizeof nodes / sizeof nodes[0]; i++) {
+    char p[24];
+    snprintf(p, sizeof p, "/dev/%s", nodes[i].name);
+    if (!exists(p))
+      mknod(p, S_IFCHR | 0666, makedev(1, nodes[i].minor));
+  }
+}
+
+/* Copy /aginxos/props/ contents (packed property area files pulled from a real
+ * Android boot of this unit) into /dev/__properties__/ so bionic resolves
+ * properties in the rdinit env. Called before adbd is forked — bionic
+ * maps the area at first property access inside adbd. Filenames are the
+ * SELinux context of each area (e.g. "u:object_r:default_prop:s0"); flat
+ * directory, contexts file included. 0444: readers map read-only. */
+static void stage_property_area(void) {
+  if (!exists("/aginxos/props/property_info")) {
+    kmsg("aginxos-trampoline: no /aginxos/props/property_info, skipping property area\n");
+    return;
+  }
+  mkdir("/dev/__properties__", 0755);
+  DIR *d = opendir("/aginxos/props");
+  if (!d) {
+    char b[96];
+    snprintf(b, sizeof b, "aginxos-trampoline: opendir /aginxos/props errno=%d\n",
+             errno);
+    kmsg(b);
+    return;
+  }
+  int n = 0;
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (de->d_name[0] == '.')
+      continue;
+    char src[80], dst[80];
+    snprintf(src, sizeof src, "/aginxos/props/%s", de->d_name);
+    snprintf(dst, sizeof dst, "/dev/__properties__/%s", de->d_name);
+    struct stat st;
+    if (stat(src, &st) != 0 || !S_ISREG(st.st_mode))
+      continue;
+    int in = open(src, O_RDONLY | O_CLOEXEC);
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0444);
+    if (in >= 0 && out >= 0) {
+      char buf[4096];
+      ssize_t r;
+      while ((r = read(in, buf, sizeof buf)) > 0)
+        if (write(out, buf, r) < 0)
+          break;
+      n++;
+    }
+    if (in >= 0)
+      close(in);
+    if (out >= 0)
+      close(out);
+  }
+  closedir(d);
+  char b[96];
+  snprintf(b, sizeof b, "aginxos-trampoline: staged %d property area files\n", n);
+  kmsg(b);
 }
 
 /* "msm_drm.ko" or "/lib/modules/msm_drm.ko" → "msm_drm" */
@@ -1123,11 +1201,55 @@ static void usb_console(void) {
     kmsg(b);
     return;
   }
+  /* v32: A14 adbd forces the RSA auth handshake because it decides via
+   * __android_log_is_debuggable() -> property ro.debuggable, which reads
+   * as "0" when no property area exists (the "ro.adb.secure" property of
+   * older docs is gone — the string appears in none of this device's
+   * binaries). The framework socket that would deliver trusted keys never
+   * appears in the rdinit env, and this device's libadbd_auth.so contains
+   * ZERO code references to /data/misc/adb/adb_keys (dead strings — the
+   * file was seeded in v31 and provably ignored). So skip the handshake
+   * entirely: stage a real property area (pulled from this device's own
+   * Android boot, values patched by scripts/patch-prop-area.py) with
+   * ro.debuggable=1 -> auth off, and ro.secure=0 -> should_drop_privileges()
+   * keeps adbd root. */
+  stage_property_area();
+  /* adbd's shell service execs /system/bin/sh -c, but the vendor ramdisk
+   * ships no shell (only adbd + libs) — an authorized connection would
+   * immediately fail every command. The device's own toybox (pulled from
+   * /system/bin, deps all present in the ramdisk lib64 set) serves as sh
+   * and applets via symlink-name dispatch. getprop included: lets us read
+   * back the staged property area from inside the rdinit console. */
+  if (exists("/aginxos/toybox")) {
+    static const char *const applets[] = {
+        "sh", "getprop", "id",   "ls",  "cat", "dmesg", "uname",
+        "ps", "env",     "echo", "pwd", "head", "grep", NULL,
+    };
+    for (unsigned i = 0; applets[i]; i++) {
+      char p[40];
+      snprintf(p, sizeof p, "/system/bin/%s", applets[i]);
+      if (symlink("/aginxos/toybox", p) != 0 && errno != EEXIST)
+        kmsg("aginxos-trampoline: toybox applet symlink failed\n");
+    }
+    kmsg("aginxos-trampoline: toybox linked as /system/bin/sh\n");
+  }
   pid_t pid = fork();
   g_adbd_pid = pid;
   if (pid == 0) {
+    /* v28: adbd died SIGABRT ~50 ms after exec (v27) and its reason died
+     * with it — PID 1 has no console, so fd 2 went nowhere. Bionic's
+     * linker and adbd's own fatal() both print to stderr; wire 0/1/2 to
+     * /dev/kmsg (NO O_CLOEXEC — the fd must survive execve). */
+    int kfd = open("/dev/kmsg", O_WRONLY);
+    if (kfd >= 0) {
+      dup2(kfd, 0);
+      dup2(kfd, 1);
+      dup2(kfd, 2);
+      if (kfd > 2)
+        close(kfd);
+    }
     char *a[] = {"/system/bin/adbd", NULL};
-    char *env[] = {"PATH=/system/bin", NULL};
+    char *env[] = {"PATH=/system/bin", "LD_LIBRARY_PATH=/system/lib64", NULL};
     execve(a[0], a, env);
     _exit(127); /* exec failed — die quietly, parent logs via ep1 timeout */
   }

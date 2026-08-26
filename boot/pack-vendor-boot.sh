@@ -266,6 +266,30 @@ fi
 if [[ "${USBADB}" == "1" ]]; then
   : >"${WORK}/aginxos/usb-adb"
   echo "note: USBADB=1 → ffs.adb console (first test with HOLD=1)"
+  # Shell for adbd's shell service: the vendor ramdisk has no /system/bin/sh.
+  # Device's own toybox, deps all in the ramdisk lib64 set (boot/out/, local
+  # only). Trampoline links it as sh + applets before forking adbd.
+  if [[ -x "${OUTDIR}/toybox" ]]; then
+    cp -f "${OUTDIR}/toybox" "${WORK}/aginxos/toybox"
+    chmod 755 "${WORK}/aginxos/toybox"
+  else
+    echo "warning: no ${OUTDIR}/toybox — adb shell will have no sh" >&2
+  fi
+  # Headless adb auth (v32): A14 adbd forces the RSA handshake via
+  # __android_log_is_debuggable() (ro.debuggable; "0" without a property
+  # area) and this unit's libadbd_auth.so never reads adb_keys files.
+  # Instead the trampoline stages a real /dev/__properties__/ area, pulled
+  # from a normal Android boot of THIS unit and patched with
+  # scripts/patch-prop-area.py (ro.debuggable=1, ro.secure=0). Device-
+  # specific dump → boot/out/props{-min}/, never committed.
+  PROPSRC="${OUTDIR}/props-min"
+  if [[ -f "${PROPSRC}/property_info" ]]; then
+    mkdir -p "${WORK}/aginxos/props"
+    cp -f "${PROPSRC}"/* "${WORK}/aginxos/props/"
+    echo "note: staged property area from ${PROPSRC}"
+  else
+    echo "warning: no ${PROPSRC}/property_info — adbd will come up unauthorized (run scripts/pull-prop-area.sh + scripts/patch-prop-area.py first)" >&2
+  fi
 fi
 # USBCFGONLY=1: mount configfs, create no gadget tree (bisect v13)
 USBCFGONLY="${USBCFGONLY:-0}"
