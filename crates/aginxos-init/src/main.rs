@@ -394,6 +394,18 @@ fn handoff_android() -> ! {
     }
 }
 
+/// PID 1 inherits every orphan, including the forked usb-console branch.
+/// Reap finished children so they do not linger as zombies between beats.
+fn reap_zombies() {
+    loop {
+        let rc = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        if rc <= 0 {
+            break;
+        }
+        klog(&format!("reaped child pid {rc}"));
+    }
+}
+
 fn main() {
     let hold = flag("/aginxos/hold");
     let do_modules = flag("/aginxos/load-modules");
@@ -450,11 +462,12 @@ fn main() {
     }
 
     if hold {
-        klog("HOLD — staying in init (VolDown+Power for fastboot restore)");
+        klog("HOLD — aginxos-init is PID 1 (VolDown+Power for fastboot restore)");
         let mut n = 0u32;
         loop {
             thread::sleep(Duration::from_secs(10));
             n += 1;
+            reap_zombies();
             klog(&format!("hold heartbeat {n}"));
         }
     }

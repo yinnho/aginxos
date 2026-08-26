@@ -34,9 +34,10 @@ build_musl() {
 
 pkgs=()
 case "${CRATE}" in
-  all) pkgs=(aginxos-probe aginxos-agent) ;;
+  all) pkgs=(aginxos-probe aginxos-agent aginxos-init) ;;
   probe|aginxos-probe) pkgs=(aginxos-probe) ;;
   agent|aginxos-agent) pkgs=(aginxos-agent) ;;
+  init|aginxos-init) pkgs=(aginxos-init) ;;
   *) echo "unknown crate: ${CRATE}" >&2; exit 1 ;;
 esac
 
@@ -48,8 +49,14 @@ for pkg in "${pkgs[@]}"; do
       build_android "${pkg}"
       build_musl "${pkg}"
       ;;
-    *) echo "usage: $0 [android|musl|both] [all|probe|agent]" >&2; exit 1 ;;
+    *) echo "usage: $0 [android|musl|both] [all|probe|agent|init]" >&2; exit 1 ;;
   esac
 done
+
+# The musl init is a ramdisk artifact (pack-vendor-boot.sh needs it in place).
+if [[ -f "target/aarch64-unknown-linux-musl/release/aginxos-init" ]]; then
+  cp -f "target/aarch64-unknown-linux-musl/release/aginxos-init" boot/initramfs/aginxos-init
+  echo "==> updated boot/initramfs/aginxos-init"
+fi
 
 echo "done."

@@ -1574,6 +1574,17 @@ int main(int argc, char **argv, char **envp) {
     kmsg("aginxos-trampoline: HOLD (no handoff)\n");
     if (exists("/aginxos/splash"))
       splash_sequence();
+    if (exists("/aginxos/aginxos-init")) {
+      /* PID 1 takeover (2026-08-27): exec the Rust init in place. The usb
+       * console already lives in its forked child, so exec here does not
+       * touch it; /proc /sys /dev stay mounted and aginxos-init's
+       * ensure_basics is idempotent. exec failure falls through to the C
+       * hold loop — PID 1 must never exit. */
+      kmsg("aginxos-trampoline: exec aginxos-init (PID 1 takeover)\n");
+      char *a[] = {"/aginxos/aginxos-init", NULL};
+      execve("/aginxos/aginxos-init", a, envp);
+      kmsg("aginxos-trampoline: exec aginxos-init FAILED - C hold loop\n");
+    }
     for (int n = 0;; n++) {
       if ((n % 10) == 0)
         kmsg("aginxos-trampoline: still holding\n");
