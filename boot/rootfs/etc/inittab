@@ -1,0 +1,9 @@
+# AginxOS rootfs inittab — busybox init as PID 1 after switch_root.
+# Our console is the ffs.adb gadget (adbd), not a serial tty.
+::sysinit:/etc/init.d/rcS
+# aginxos-init kills the trampoline's adbd before the switch, so this
+# respawn is what brings the console back (~12s to re-enumerate).
+::respawn:/etc/init.d/adbd
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/sync
+::restart:/sbin/init

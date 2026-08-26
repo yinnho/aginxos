@@ -49,6 +49,8 @@ after the PID 1 takeover:
 | `/aginxos/load-modules-full` | load the entire `modules.load`. Riskier. |
 | `/aginxos/storage` | aginxos-init (as PID 1) loads the UFS chain and mknods the block nodes from `/proc/partitions`. |
 | `/aginxos/super` | aginxos-init also parses super's liblp metadata and mounts the `_a` sub-partitions (system, vendor, product, system_ext) ext4-ro via dm-linear at `/<name>`; implies `storage`. |
+| `/aginxos/rootfs` | aginxos-init mounts the ext4 rootfs on userdata read-write and `switch_root`s into it: mounts move into `/newroot`, old adbd is killed, busybox init becomes PID 1 and respawns adbd from the rootfs `/system` tree. The ext4 image is built host-side and flashed to userdata separately. Implies `storage`. |
+| `/aginxos/keep-adbd` | diagnostic companion to `rootfs`: skip the old-adbd kill — the trampoline's adbd survives chroot and keeps the console alive inside the new root (pair with an inittab that does not respawn adbd; ffs ep0 is single-open). |
 
 `pack-vendor-boot.sh` takes env flags that write these:
 
@@ -63,6 +65,8 @@ HOLD=1 SPLASH=0 USBADB=1 STORAGE=1 SUPER=1 ./boot/pack-vendor-boot.sh
 # MODULES_FULL: 0|1
 # STORAGE:    0|1  — aginxos-init brings up UFS after the takeover
 # SUPER:      0|1  — aginxos-init mounts super _a sub-partitions after the takeover
+# ROOTFS:     0|1  — aginxos-init switch_roots into the ext4 rootfs on userdata
+# KEEPADBD:   0|1  — with ROOTFS: keep old adbd alive through the switch (diagnostic)
 ```
 
 ### USB gadget console (`/aginxos/usb-adb`)

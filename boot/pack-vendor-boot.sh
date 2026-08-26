@@ -321,6 +321,22 @@ if [[ "${SUPER}" == "1" ]]; then
   : >"${WORK}/aginxos/super"
   echo "note: SUPER=1 → aginxos-init mounts super _a sub-partitions after takeover"
 fi
+# ROOTFS=1: aginxos-init mounts the ext4 rootfs on userdata and switch_roots
+# into busybox init (M2). The rootfs image is flashed separately to userdata.
+# Implies STORAGE.
+ROOTFS="${ROOTFS:-0}"
+if [[ "${ROOTFS}" == "1" ]]; then
+  : >"${WORK}/aginxos/rootfs"
+  echo "note: ROOTFS=1 → aginxos-init switch_roots into the userdata rootfs"
+fi
+# KEEPADBD=1 (diagnostic): with ROOTFS, do not kill the trampoline's adbd at
+# the switch — it survives chroot and keeps the console alive in the new root.
+# Pair with an inittab that does not respawn adbd (ep0 is single-open).
+KEEPADBD="${KEEPADBD:-0}"
+if [[ "${KEEPADBD}" == "1" ]]; then
+  : >"${WORK}/aginxos/keep-adbd"
+  echo "note: KEEPADBD=1 → old adbd kept alive through the switch (diagnostic)"
+fi
 # USBCFGONLY=1: mount configfs, create no gadget tree (bisect v13)
 USBCFGONLY="${USBCFGONLY:-0}"
 # USBG1ONLY=1: create /config/usb_gadget/g1 only, nothing else (bisect v14)

@@ -1,0 +1,24 @@
+#!/bin/sh
+# AginxOS rcS - one-shot setup, runs before the respawns in inittab.
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/system/bin
+
+# Fill in the full applet set (image ships only a curated symlink list).
+/bin/busybox --install -s /bin 2>/dev/null
+
+# Host mke2fs -d stored the macOS build user (uid 501) as owner - the
+# filesystem is rw, so the first boot normalizes it for good.
+chown -R 0:0 /bin /sbin /etc /aginxos /system /home /root /var /opt /srv /media 2>/dev/null
+chown 0:0 /default.prop /prop.default /*_contexts 2>/dev/null
+
+# /proc, /sys and /dev were carried in by aginxos-init before chroot;
+# these only run if something is missing (idempotent).
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t tmpfs tmpfs /tmp 2>/dev/null
+
+hostname aginxos
+ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null
+
+echo "aginxos: rcS done, rootfs up on userdata" > /dev/kmsg
+date > /etc/.rcs-ran

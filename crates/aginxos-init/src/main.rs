@@ -7,6 +7,8 @@
 //!   /aginxos/storage      — load the UFS chain, create block nodes
 //!   /aginxos/super        — parse super, map+mount its _a sub-partitions
 //!                           (implies storage)
+//!   /aginxos/rootfs       — mount the ext4 rootfs on userdata and
+//!                           switch_root into busybox init (implies storage)
 //!
 //! Operator subcommands:
 //!   /aginxos/aginxos-init reboot [mode]
@@ -673,6 +675,261 @@ fn bring_up_super() {
     klog(&format!("super up: mounted {} [{}]", mounted.len(), mounted.join(",")));
 }
 
+// --- rootfs switch (/aginxos/rootfs) ---
+
+/// Terminal parking state: PID 1 must never exit (that is a kernel panic),
+/// so every failure path in the switch_root sequence ends here with the
+/// trampoline's adbd console still alive for a post-mortem.
+fn hold_forever(reason: &str) -> ! {
+    klog(reason);
+    klog("HOLD — aginxos-init is PID 1 (VolDown+Power for fastboot restore)");
+    let mut n = 0u32;
+    loop {
+        thread::sleep(Duration::from_secs(10));
+        n += 1;
+        reap_zombies();
+        klog(&format!("hold heartbeat {n}"));
+    }
+}
+
+/// Remount every mount except the initramfs root and the new root itself
+/// into the new root, so the busybox world inherits /proc, /sys and /dev
+/// (with the ffs gadget mount adbd needs) already up. With MS_MOVE the
+/// initramfs view is emptied (used by the real flow, after adbd is killed);
+/// with MS_BIND the initramfs keeps its mounts so the old adbd — whose
+/// shell service aborts the moment it loses them (observed 2026-08-27:
+/// "Failed to get SELinux context" SIGABRT once /proc had been moved away;
+/// exec-out then died on the missing /dev/ptmx) — stays a working console,
+/// and the new world is reachable through its /proc/<pid>/root.
+///
+/// The table is read fully before the first change — iterating /proc/mounts
+/// while remounting /proc is a self-inflicted race. Submounts travel with
+/// their parent (MS_REC for the bind case); stale entries for them are
+/// recognized by prefix and skipped.
+fn remounts_into(newroot: &str, move_not_bind: bool) -> usize {
+    // /dev on this initramfs is NOT a mount: the trampoline mknod'd its
+    // nodes (console, urandom, __properties__, block nodes) straight into
+    // the initramfs rootfs /dev directory, so /proc/mounts never lists it
+    // and a pure mount-loop silently skips it. The new root then has no
+    // /dev/urandom and the respawned adbd dies at its first getentropy —
+    // "getentropy failed: No such file or directory" in /var/adbd.log,
+    // which is exactly how the first ROOTFS boot went dark (2026-08-27;
+    // no pstore on this kernel, so the log was the only witness). Bind it
+    // explicitly — MS_MOVE needs a real mount — with MS_REC so the devpts
+    // and ffs submounts travel too.
+    let mut done = 0usize;
+    let mut done_from: Vec<String> = Vec::new();
+    if Path::new("/dev/null").exists() && !Path::new(&format!("{newroot}/dev/null")).exists() {
+        let target = format!("{newroot}/dev");
+        mkdir_p(&target);
+        let src = std::ffi::CString::new("/dev").unwrap();
+        let tgt = std::ffi::CString::new(target).unwrap();
+        let rc = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                tgt.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND | libc::MS_REC,
+                std::ptr::null(),
+            )
+        };
+        if rc == 0 {
+            done += 1;
+            done_from.push("/dev".to_string());
+        } else {
+            klog(&format!("rootfs: bind /dev: {}", std::io::Error::last_os_error()));
+        }
+    }
+    let Ok(table) = fs::read_to_string("/proc/mounts") else {
+        return done;
+    };
+    let flags = if move_not_bind {
+        libc::MS_MOVE
+    } else {
+        libc::MS_BIND | libc::MS_REC
+    };
+    for line in table.lines() {
+        // /proc/mounts escapes spaces as \040; our mountpoints have none.
+        let Some(mp) = line.split(' ').nth(1).map(|m| m.replace("\\040", " ")) else {
+            continue;
+        };
+        if mp == "/" || mp == newroot || mp.starts_with(&format!("{newroot}/")) {
+            continue;
+        }
+        if done_from.iter().any(|m| mp.starts_with(&format!("{m}/"))) {
+            continue; // already traveled inside a remounted parent
+        }
+        let target = format!("{newroot}{mp}");
+        mkdir_p(&target);
+        let src = std::ffi::CString::new(mp.clone()).unwrap();
+        let tgt = std::ffi::CString::new(target).unwrap();
+        let rc = unsafe {
+            libc::mount(src.as_ptr(), tgt.as_ptr(), std::ptr::null(), flags, std::ptr::null())
+        };
+        if rc == 0 {
+            done += 1;
+            done_from.push(mp);
+        } else {
+            klog(&format!("rootfs: remount {mp}: {}", std::io::Error::last_os_error()));
+        }
+    }
+    done
+}
+
+/// Stop the trampoline's adbd (our child) so the respawned one can re-open
+/// the ffs endpoints: ep0 is single-open, a second adbd would EBUSY-loop.
+/// TERM, brief wait, then KILL, then reap.
+fn kill_adbd() {
+    let mut pids: Vec<i32> = Vec::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let Ok(name) = e.file_name().into_string() else {
+                continue;
+            };
+            if !name.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            let comm = fs::read_to_string(format!("/proc/{name}/comm")).unwrap_or_default();
+            if comm.trim() == "adbd" {
+                if let Ok(pid) = name.parse::<i32>() {
+                    pids.push(pid);
+                }
+            }
+        }
+    }
+    for &pid in &pids {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    for _ in 0..30 {
+        if pids.iter().all(|p| !Path::new(&format!("/proc/{p}")).exists()) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    for &pid in &pids {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    for pid in pids {
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+    }
+    klog("rootfs: old adbd stopped");
+}
+
+/// /aginxos/rootfs: mount the ext4 rootfs on userdata, switch_root into it,
+/// exec busybox init as the new PID 1. Everything that can fail runs while
+/// the console is still alive; only the irreversible tail (MS_MOVE, chroot,
+/// execve) runs after the old adbd is killed. Never returns — success is an
+/// execve, failure parks in `hold_forever`.
+fn switch_to_rootfs() -> ! {
+    const NEWROOT: &str = "/newroot";
+    let Some(dev) = fs::read_link("/dev/block/by-name/userdata")
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    else {
+        hold_forever("rootfs: no /dev/block/by-name/userdata (storage flag?)");
+    };
+    let devpath = format!("/dev/{dev}");
+    klog(&format!("rootfs: userdata is {devpath}"));
+    mkdir_p(NEWROOT);
+    let src = std::ffi::CString::new(devpath.clone()).unwrap();
+    let tgt = std::ffi::CString::new(NEWROOT).unwrap();
+    let fst = std::ffi::CString::new("ext4").unwrap();
+    let rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            tgt.as_ptr(),
+            fst.as_ptr(),
+            0, // no MS_RDONLY: rw, so rcS can normalize ownership
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        hold_forever(&format!(
+            "rootfs: mount {devpath} ext4 rw: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    klog("rootfs: userdata mounted rw at /newroot");
+    // The next PID 1 must exist before the console is burned down.
+    for must in [
+        "/newroot/sbin/init",
+        "/newroot/bin/busybox",
+        "/newroot/etc/inittab",
+        "/newroot/system/bin/adbd",
+    ] {
+        if !Path::new(must).exists() {
+            hold_forever(&format!("rootfs: {must} missing on userdata"));
+        }
+    }
+
+    // Diagnostic mode (/aginxos/keep-adbd): the trampoline's adbd survives
+    // the switch (its fds pin the ffs endpoints open), leaving a live console
+    // to inspect the busybox world with — but only if its mounts are NOT
+    // moved out from under it, so this path bind-mounts instead.
+    let keep = flag("/aginxos/keep-adbd");
+    if keep {
+        klog("rootfs: keep-adbd set — old adbd stays as the console");
+    } else {
+        kill_adbd();
+    }
+    let n = remounts_into(NEWROOT, !keep);
+    klog(&format!(
+        "rootfs: {} mounts {} into {NEWROOT}",
+        n,
+        if keep { "bind-mounted" } else { "moved" }
+    ));
+
+    // Irreversible tail. chdir first so "." is unambiguously in the new root;
+    // then MS_MOVE it onto / (the ext4 becomes the root — the initramfs
+    // cannot be unmounted, it is shadowed beneath and keeps serving text
+    // pages to anything still executing from it); chroot; exec.
+    let c_new = std::ffi::CString::new(NEWROOT).unwrap();
+    let c_root = std::ffi::CString::new("/").unwrap();
+    if unsafe { libc::chdir(c_new.as_ptr()) } != 0 {
+        let e = std::io::Error::last_os_error();
+        hold_forever(&format!("rootfs: chdir {NEWROOT}: {e}"));
+    }
+    if unsafe {
+        libc::mount(
+            c_new.as_ptr(),
+            c_root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_MOVE,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        let e = std::io::Error::last_os_error();
+        hold_forever(&format!("rootfs: MS_MOVE {NEWROOT}->/: {e}"));
+    }
+    if unsafe { libc::chroot(b".\0".as_ptr() as *const libc::c_char) } != 0 {
+        let e = std::io::Error::last_os_error();
+        hold_forever(&format!("rootfs: chroot: {e}"));
+    }
+    if unsafe { libc::chdir(c_root.as_ptr()) } != 0 {
+        let e = std::io::Error::last_os_error();
+        hold_forever(&format!("rootfs: chdir /: {e}"));
+    }
+    klog("rootfs: exec /sbin/init (busybox)");
+    let c_init = std::ffi::CString::new("/sbin/init").unwrap();
+    let arg0 = std::ffi::CString::new("/sbin/init").unwrap();
+    let argv = [arg0.as_ptr(), std::ptr::null()];
+    let env_home = std::ffi::CString::new("HOME=/").unwrap();
+    let env_path = std::ffi::CString::new("PATH=/sbin:/bin:/usr/sbin:/usr/bin:/system/bin").unwrap();
+    let env_term = std::ffi::CString::new("TERM=linux").unwrap();
+    let envp = [
+        env_home.as_ptr(),
+        env_path.as_ptr(),
+        env_term.as_ptr(),
+        std::ptr::null(),
+    ];
+    unsafe { libc::execve(c_init.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+    hold_forever(&format!(
+        "rootfs: execve /sbin/init: {}",
+        std::io::Error::last_os_error()
+    ));
+}
+
 fn load_modules_from_list() {
     // Kept for opt-in experiments; not used by default.
     let list = Path::new("/lib/modules/modules.load");
@@ -1044,13 +1301,14 @@ fn main() {
     let do_splash = flag("/aginxos/splash");
     let do_full_modules = flag("/aginxos/load-modules-full");
     let do_super = flag("/aginxos/super");
-    let do_storage = flag("/aginxos/storage") || do_super;
+    let do_rootfs = flag("/aginxos/rootfs");
+    let do_storage = flag("/aginxos/storage") || do_super || do_rootfs;
     // Immediate handoff without mounting (cleanest path to Android).
     let handoff_only =
         !hold && !do_modules && !do_splash && !do_full_modules && !do_storage;
 
     klog(&format!(
-        "start v{} pid={} hold={hold} handoff_only={handoff_only} modules={do_modules} splash={do_splash} storage={do_storage} super={do_super}",
+        "start v{} pid={} hold={hold} handoff_only={handoff_only} modules={do_modules} splash={do_splash} storage={do_storage} super={do_super} rootfs={do_rootfs}",
         env!("CARGO_PKG_VERSION"),
         std::process::id()
     ));
@@ -1088,6 +1346,14 @@ fn main() {
         klog("skip super (safe default)");
     }
 
+    // Diverges: success execve's busybox init in the new root, failure parks
+    // in hold_forever — splash/hold below are unreachable with this flag.
+    if do_rootfs {
+        switch_to_rootfs();
+    } else {
+        klog("skip rootfs (safe default)");
+    }
+
     if do_splash {
         for (i, c) in [
             0x00_22_CC_44u32,
@@ -1109,14 +1375,7 @@ fn main() {
     }
 
     if hold {
-        klog("HOLD — aginxos-init is PID 1 (VolDown+Power for fastboot restore)");
-        let mut n = 0u32;
-        loop {
-            thread::sleep(Duration::from_secs(10));
-            n += 1;
-            reap_zombies();
-            klog(&format!("hold heartbeat {n}"));
-        }
+        hold_forever("HOLD");
     }
 
     klog("handoff to Android");
