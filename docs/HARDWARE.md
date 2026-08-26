@@ -780,3 +780,78 @@ they vanish once entries are read from the proper LBA2 offset.)
 
 Device state unchanged in kind: v35 image (now aginxos-init v0.5.0) HOLD +
 STORAGE, storage and by-name up at t=29.4 s.
+
+## v0.6.0: super sub-partitions mounted at boot (2026-08-27)
+
+Goal reached: from a clean boot, aginxos-init (PID 1) now mounts
+**system_a, vendor_a, product_a, system_ext_a** ext4-ro at `/<name>` — the
+Android dynamic partitions are first-class readable filesystems in our
+world, ~0.15 s after the storage chain comes up. New `/aginxos/super` flag
+(pack env `SUPER=1`, implies STORAGE).
+
+Chain, in boot order: UFS modules → /proc/partitions nodes → GPT parse →
+by-name → **liblp super metadata parse** (geometry@0x1000, header@0x3000,
+tables at header+header_size; partition names are plain ASCII[36];
+first_extent/num_extents are u32@40/@44; extents are *packed*
+`{u64 num_sectors; u32 target_type; u64 source_data}` with source_data at
+offset 12 — not 16) → dm ioctls on /dev/mapper/control (mknod 10:236) →
+DM_DEV_CREATE + DM_TABLE_LOAD `linear <super maj:min> <src> <len>` +
+DM_DEV_RESUME → mknod /dev/dm-N → mount(2) ext4 ro. Verified extent map
+(tile, no gaps in the used region): product_a [3072, 5467648), system_a
+[5468160, 7192544), system_ext_a [7193088, 7879392), system_b
+[7879680, 7919352), vendor_a [7919616, 9396192) — 512-byte sectors inside
+super. The earlier "system_ext overlaps system" reading was an artifact of
+reading source_data at +16.
+
+Three lessons, each cost a flash cycle or was caught just in time:
+
+- **DM_DEV_CREATE is picky about the version tuple and buffer size.**
+  Version 4.37 with an exact 200-byte data_size → silent EINVAL (no dmesg).
+  Querying DM_VERSION first and reusing the kernel's tuple (4.39.0) with a
+  4096-byte buffer works. Also: DM_DEV_CREATE returns the dm dev in
+  *userspace new encoding* (253:0 → 0xfd00) — pass it to mknod as-is.
+- **UFS reads right after probe can return garbage.** First boot run
+  (t=44.8 s) fed the kernel corrupted extents (dmesg:
+  `linear: Invalid device sector` ×2, `start=30726 not aligned` — real value
+  3072); the same code minutes later read everything correctly. Fixed with
+  double-read-until-identical + tiling/bounds validation in
+  `parse_super_stable` (observed: one 50 ms retry, then stable).
+- **Rust Strings are not NUL-terminated — the boot-blocker bug.**
+  `copy_from(ptr, len + 1)` read one byte past the String allocation and
+  overwrote the zeroed ioctl buffer with heap garbage. product_a's params
+  became "259:29 30726" (stray '6') on *every* boot while the others drew
+  zeros or non-digits by luck, and live runs never reproduced it (different
+  heap history). The kernel messages pinning it: `dm-linear: Invalid device
+  sector` (trailing junk fails `%llu%c` sscanf) and
+  `start=15731712 … not aligned to h/w logical block size 4096`.
+
+Also observed: the super partition's device number differs between boots
+(259:29 one boot, 259:2 the next — LUN scan order varies), so resolving
+super through by-name + /proc/partitions at runtime is required, not a
+convenience.
+
+Boot log (final flash, HOLD+SPLASH+USBADB+STORAGE+SUPER):
+
+    aginxos-init: start v0.6.0 pid=1 hold=true ... storage=true super=true
+    aginxos-init: storage up: ufs mods ok=6, 95 block nodes, 73 by-name links (by-name ok)
+    aginxos-init: super: stable after 1 retries
+    aginxos-init: super: system_a 1724384 sectors @ 5468160
+    aginxos-init: super: mounted system_a at /system_a        (dm-0)
+    ... vendor_a (dm-1), product_a (dm-2), system_ext_a (dm-3)
+    aginxos-init: super up: mounted 4 [system_a,vendor_a,product_a,system_ext_a]
+
+`/proc/mounts`: `/dev/dm-0..3 → /system_a /vendor_a /product_a
+/system_ext_a ext4 ro,relatime`. Full Android trees readable
+(system_a has apex/bin/init, vendor_a has bin/etc/firmware, product_a
+app/bin/fonts, system_ext_a app/bin/etc).
+
+Operator subcommands added: `aginxos-init parse-super <file>` (metadata
+dump) and `aginxos-init mount-super` (live re-run of the super flag — how
+the String-NUL bug was isolated without extra flashes; note a re-run leaves
+already-mounted names with `DM_DEV_CREATE: EBUSY`, which is expected).
+
+Device state (2026-08-27, end of session): **running the v0.6.0 test
+image** (HOLD+SPLASH+USBADB+STORAGE+SUPER, aginxos-init v0.6.0 as PID 1,
+four super partitions mounted ro, authorized root adb). Recovery unchanged:
+`adb shell /aginxos/aginxos-init reboot bootloader` → flash
+`boot/stock-vendor_boot.img`.
