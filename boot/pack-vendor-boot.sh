@@ -164,6 +164,10 @@ fi
 #            handoff so the full kernel log can be read via adb+root dmesg.
 USBADB="${USBADB:-0}"
 USBDIAG="${USBDIAG:-0}"
+# USBNOBIND=1 (with USBADB=1): full gadget setup but skip the final UDC bind,
+# then hand off - bisects bind vs pre-bind stages and preserves the run's
+# kmsg for reading from booted Android. Log-collection mode, not console mode.
+USBNOBIND="${USBNOBIND:-0}"
 if [[ "${USBADB}" == "1" || "${USBDIAG}" == "1" ]]; then
   cat >"${WORK}/aginxos/modules.usb" <<'EOF'
 # USB gadget console chain. Raw finit_module in listed order.
@@ -262,6 +266,70 @@ fi
 if [[ "${USBADB}" == "1" ]]; then
   : >"${WORK}/aginxos/usb-adb"
   echo "note: USBADB=1 → ffs.adb console (first test with HOLD=1)"
+fi
+# USBCFGONLY=1: mount configfs, create no gadget tree (bisect v13)
+USBCFGONLY="${USBCFGONLY:-0}"
+# USBG1ONLY=1: create /config/usb_gadget/g1 only, nothing else (bisect v14)
+USBG1ONLY="${USBG1ONLY:-0}"
+# USBPROPSONLY=1: g1 + property writes, no functions/configs (bisect v15)
+USBPROPSONLY="${USBPROPSONLY:-0}"
+# USBVIDPIDONLY=1: g1 + idVendor/idProduct writes only (bisect v16)
+USBVIDPIDONLY="${USBVIDPIDONLY:-0}"
+# USBMKG1ONLY=1: mkdir usb_gadget/g1 only, no writes (bisect v17)
+USBMKG1ONLY="${USBMKG1ONLY:-0}"
+# USBNOG1=1: usb_gadget dir only, never mkdir g1 (control, bisect v18)
+USBNOG1="${USBNOG1:-0}"
+# USBNOCLEANUP=1: build gadget, skip teardown before handoff (bisect v19)
+USBNOCLEANUP="${USBNOCLEANUP:-0}"
+# USBNOMODS=1: usb_console with NO module load, straight to configfs g1 (bisect v21)
+USBNOMODS="${USBNOMODS:-0}"
+if [[ "${USBNOMODS}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-nomods"
+  echo "note: USBNOMODS=1 -> no modules, mkdir g1 only (bisect v21)"
+fi
+if [[ "${USBNOCLEANUP}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-nocleanup"
+  echo "note: USBNOCLEANUP=1 -> no gadget teardown before handoff (bisect v19)"
+fi
+if [[ "${USBNOG1}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-nog1"
+  echo "note: USBNOG1=1 -> usb_gadget dir only, no g1 (control v18)"
+fi
+if [[ "${USBMKG1ONLY}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-mkg1-only"
+  echo "note: USBMKG1ONLY=1 -> mkdir g1 only, no prop writes (bisect v17)"
+fi
+if [[ "${USBVIDPIDONLY}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-vidpid-only"
+  echo "note: USBVIDPIDONLY=1 -> g1 + vid/pid only (bisect v16)"
+fi
+if [[ "${USBPROPSONLY}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-props-only"
+  echo "note: USBPROPSONLY=1 -> g1 + props only (bisect v15)"
+fi
+if [[ "${USBG1ONLY}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-g1-only"
+  echo "note: USBG1ONLY=1 -> g1 dir only (bisect v14)"
+fi
+if [[ "${USBCFGONLY}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-configfs-only"
+  echo "note: USBCFGONLY=1 -> configfs mount only, no gadget tree (bisect v13)"
+fi
+if [[ "${USBNOBIND}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-nobind"
+  echo "note: USBNOBIND=1 -> gadget setup, no UDC bind, Android handoff (log-collection mode)"
+fi
+# USBNOBIND=1: skip final UDC bind (log-collection bisect)
+# USBNOFFS=1: stop after configfs tree, skip ffs mount + adbd (bisect v12)
+USBNOBIND="${USBNOBIND:-0}"
+USBNOFFS="${USBNOFFS:-0}"
+if [[ "${USBNOFFS}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-noffs"
+  echo "note: USBNOFFS=1 -> configfs tree only, no ffs/adbd/bind (bisect)"
+fi
+if [[ "${USBNOBIND}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-nobind"
+  echo "note: USBNOBIND=1 -> gadget setup, no UDC bind, Android handoff (log-collection mode)"
 fi
 if [[ "${USBDIAG}" == "1" ]]; then
   : >"${WORK}/aginxos/usb-diag"

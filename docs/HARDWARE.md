@@ -408,3 +408,61 @@ Next: `USBADB=1` (gadget console with the 52-module chain), first with
 flashed (serial 13201FDD4001N8 confirmed before flash), `set_active a`,
 Android rebooted. Working tree holds the 52-module chain + diag tooling,
 not yet committed.
+
+## USB gadget bisect v6-v24: every configfs touch bootloops (2026-08-27)
+
+Goal of `USBADB=1` was a working ffs.adb console in the rdinit env. It has
+never enumerated, and every handoff run that creates anything under
+`/config/usb_gadget` bootloops the device. 20 flashes isolated where it
+breaks; all runs on serial 13201FDD4001N8.
+
+Matrix (gates are flag files; see trampoline.c comments for exact cut
+points; outcome ANDROID_OK = adb shell after handoff, LOOP = slot retries
+exhausted to fastboot, FREEZE = silent hold):
+
+| run | config | outcome |
+|-----|--------|---------|
+| v6-v11 | USBADB variants (full gadget, adbd kill fixes, umount fixes) | LOOP |
+| v12 | gadget tree, skip ffs/adbd/bind | LOOP |
+| v13 | configfs mount, NO tree | **ANDROID_OK** |
+| v14 | gate sat *before* mkdir g1 (flawed) | ANDROID_OK (no g1 made) |
+| v15 | g1 + 4 prop writes | LOOP |
+| v16 | g1 + idVendor/idProduct only | LOOP |
+| v17 | mkdir g1 only, zero writes | LOOP |
+| v18 | usb_gadget dir, no g1 (control) | **ANDROID_OK** |
+| v19 | full gadget, cleanup skipped | LOOP |
+| v20 | UDC "" write guarded by g_bound | LOOP |
+| v21 | no modules + gate (flawed: forced no-UDC early return, g1 never created) | uninformative |
+| v22/v23 | +3 s settle + extcon dump before configfs | LOOP |
+| v24 | HOLD, full gadget + bind, never teardown | FREEZE 9+ min, no host USB, no fastboot |
+
+Readings:
+
+- Minimal repro: 52-module chain loaded + `mkdir /config/usb_gadget/g1` +
+  Android handoff = LOOP. configfs mount alone is safe (v13), `usb_gadget`
+  dir alone is safe (v18).
+- BUT v13 also proves the kernel is not simply "modules + g1 = panic":
+  in v13's handoff Android's own init later creates g1, loads ffs, binds
+  adbd — USB works, the bugreport that documents all of this came over
+  that very link. So *who* creates the gadget, and *when*, matters.
+- Failure-domain is unresolved: every LOOP run also ran `cleanup_gadget`
+  (rmdir chain) before handoff — creation and teardown paths are both
+  candidates; v19 (skip cleanup) LOOPs too, and v24 (HOLD, no teardown,
+  no handoff) freezes but HOLD freezes by design, so v24 is NOT panic
+  evidence — its only datum is "no enumeration even with nothing pending".
+- Kernel panic vs PID-1 userspace death were never separated: no log
+  survives either (ring buffer dies on reboot; ramoops dead on this
+  unit). "Attempted to kill init" from a fault in our own PID 1 code
+  would look identical from outside.
+- Disproved along the way: adbd-child-holds-root (v11 SIGKILL+reap),
+  UDC-unbind-write panic (v20 guard), probe race (v22/v23 settle),
+  leftover mounts (v8 class fix, separate real bug, fixed).
+
+v24 recovery: manual Power+VolDown force-restart to fastboot; stock
+`vendor_boot` restored + `set_active a` + Android verified 2026-08-27.
+
+Next (v25, in flight): fork isolation — entire `usb_console()` in a child,
+PID 1 waitpids with 180 s timeout and kmsgs exit code/signal, then hands
+off. A userspace fault then only kills the child and the run reaches
+Android: bugreport shows the last stage marker + the waitpid status.
+Clean child + LOOP would finally confirm a kernel-side fault.

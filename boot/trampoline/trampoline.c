@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -857,25 +858,102 @@ static void usb_diag(void) {
   kmsg("aginxos-trampoline: diag done - modules stay loaded for Android handoff\n");
 }
 
+/* Tear the gadget down before Android handoff: stock init mounts its own
+ * functionfs/configfs on the same paths, and a half-bound UDC or a leftover
+ * ffs mount breaks Android's adbd (which is our only log channel afterwards).
+ *
+ * CRITICAL (v7-v9 bootloop, 2026-08-26): adbd is a daemon that never exits on
+ * SIGTERM, and it is OUR child with root/cwd in the vendor-ramdisk rootfs.
+ * first_stage_init's switch_root cannot free the old root while any process
+ * holds it -> boot failure -> slot retries exhausted -> fastboot. Kill with
+ * SIGKILL and reap before exec; verify the exit, not just the send. */
+static pid_t g_adbd_pid;
+
+static void kill_adbd(void) {
+  if (g_adbd_pid <= 0)
+    return;
+  if (kill(g_adbd_pid, 0) != 0 && errno == ESRCH) {
+    g_adbd_pid = 0; /* already gone */
+    return;
+  }
+  kill(g_adbd_pid, SIGKILL);
+  for (int i = 0; i < 100; i++) { /* reap or confirm death within 1s */
+    if (kill(g_adbd_pid, 0) != 0 && errno == ESRCH)
+      break;
+    int st;
+    pid_t r = waitpid(g_adbd_pid, &st, WNOHANG);
+    if (r == g_adbd_pid || (r < 0 && errno == ECHILD))
+      break;
+    usleep(10000);
+  }
+  char b[96];
+  snprintf(b, sizeof b, "aginxos-trampoline: adbd killed: %s\n",
+           (kill(g_adbd_pid, 0) != 0 && errno == ESRCH) ? "yes" : "STILL ALIVE");
+  kmsg(b);
+  g_adbd_pid = 0;
+}
+
+static int g_bound; /* set only after a successful UDC bind */
+
+static void cleanup_gadget(void) {
+  kmsg("aginxos-trampoline: gadget cleanup begin\n");
+  /* NEVER write "" to the UDC file unless WE bound it. v17 (mkdir g1 + this
+   * unconditional write) bootlooped while v18 (no g1) booted - prime suspect
+   * for a kernel panic in the unbind path of this 4.19 gadget code. */
+  if (g_bound || exists("/aginxos/.usb-bound")) {
+    /* v25: when usb_console ran in the forked child, the parent's copy of
+     * g_bound is 0 — the child drops this flag file on a successful bind. */
+    wf("/config/usb_gadget/g1/UDC", "");
+  } else
+    kmsg("aginxos-trampoline: never bound - skipping UDC unbind write\n");
+  kill_adbd();
+  umount2("/dev/usb-ffs/adb", MNT_DETACH);
+  rmdir("/dev/usb-ffs/adb");
+  rmdir("/dev/usb-ffs");
+  unlink("/config/usb_gadget/g1/configs/b.1/ffs.adb");
+  rmdir("/config/usb_gadget/g1/configs/b.1");
+  rmdir("/config/usb_gadget/g1/functions/ffs.adb");
+  rmdir("/config/usb_gadget/g1/functions");
+  rmdir("/config/usb_gadget/g1/strings/0x409");
+  rmdir("/config/usb_gadget/g1/strings");
+  rmdir("/config/usb_gadget/g1/configs");
+  rmdir("/config/usb_gadget/g1");
+  rmdir("/config/usb_gadget");
+  umount2("/config", MNT_DETACH);
+  kmsg("aginxos-trampoline: gadget cleanup done\n");
+}
+
 static void usb_console(void) {
   kmsg("aginxos-trampoline: usb console begin\n");
 
   /* 1. controller chain (topological per modules.dep); failures are logged
    *    by load_list_file and are non-fatal — worst case no UDC appears. */
-  if (exists("/aginxos/modules.usb"))
+  if (exists("/aginxos/usb-nomods")) {
+    /* Bisect v21 (2026-08-27): mkdir g1 alone bootloops WITH our module chain
+     * loaded (v17). This gate skips module loading entirely (no UDC will
+     * ever appear, so wait_udc is bypassed) - separates "gadget registration
+     * panics on its own" from "module chain + gadget interact". */
+    kmsg("aginxos-trampoline: modules SKIPPED (usb-nomods bisect v21)\n");
+  } else if (exists("/aginxos/modules.usb"))
     load_list_file("/aginxos/modules.usb", 0);
   else
     kmsg("aginxos-trampoline: no /aginxos/modules.usb list\n");
 
   /* 2. wait for the dwc3 UDC to register */
   char udc[64];
-  int have_udc = (wait_udc(udc, sizeof udc, 300) == 0);
+  int have_udc = exists("/aginxos/usb-nomods") ? 0
+                                                : (wait_udc(udc, sizeof udc, 300) == 0);
   if (have_udc) {
     char b[96];
     snprintf(b, sizeof b, "aginxos-trampoline: udc=%s\n", udc);
     kmsg(b);
+    /* Runtime supplier state: pull-up/enumeration depends on smb5 seeing VBUS
+     * and the role being peripheral, not just on dwc3_probe() succeeding. */
+    dump_extcon();
   } else {
     kmsg("aginxos-trampoline: usb NO UDC — controller did not come up\n");
+    dump_extcon();
+    dump_regulators();
   }
 
   /* probe verdict mode: no display (msm_drm never modesets from rdinit on
@@ -899,7 +977,17 @@ static void usb_console(void) {
   if (!have_udc)
     return;
 
-  /* 3. configfs gadget g1 (stock recovery IDs) */
+  /* 3. configfs gadget g1 (stock recovery IDs)
+   *
+   * SETTLE BEFORE TREE (2026-08-27): creating /config/usb_gadget/g1 right
+   * after the module loads bootloops the device (v17: mkdir g1 + modules =
+   * reboot loop; v21: mkdir g1 with NO modules = fine). Our finit_module
+   * spam leaves dwc3/smb5/pdphy probes still in flight when gadget
+   * registration runs - stock never does this because its configfs writes
+   * happen seconds after coldplug, with extcon settled. Give async probe 3s
+   * to land before touching configfs. */
+  sleep(3);
+  dump_extcon();
   mkdir("/config", 0755);
   if (mount("none", "/config", "configfs", 0, "") != 0 && errno != EBUSY) {
     char b[96];
@@ -908,12 +996,66 @@ static void usb_console(void) {
     kmsg(b);
     return;
   }
+  dump_dir("/config");
+  if (exists("/aginxos/usb-configfs-only")) {
+    /* Bisect v13 (2026-08-26): v12 proved the ffs mount + adbd fork + bind are
+     * NOT the handoff breaker (all skipped, still bootlooped). This mode
+     * mounts configfs and creates NOTHING under it - splits "mount" from
+     * "gadget tree" (mkdirs/writes/symlink). */
+    kmsg("aginxos-trampoline: configfs mounted, tree SKIPPED (usb-configfs-only bisect)\n");
+    return;
+  }
   mkdir("/config/usb_gadget", 0755);
+  if (!exists("/config/usb_gadget")) {
+    kmsg("aginxos-trampoline: no usb_gadget in configfs (CONFIG_USB_CONFIGFS?)\n");
+    dump_dir("/config");
+    return;
+  }
+  if (exists("/aginxos/usb-g1-only")) {
+    /* Bisect v14 (2026-08-26): v13 proved configfs mount is safe. v12 proved
+     * the gadget tree is the handoff breaker. Create ONLY the g1 directory -
+     * if this still bootloops, mkdir g1 (gadget registration) is the culprit;
+     * if Android boots, it is something further down (strings/functions/
+     * configs/ffs.adb/symlink). */
+    kmsg("aginxos-trampoline: g1 mkdir done, rest SKIPPED (usb-g1-only bisect)\n");
+    dump_dir("/config/usb_gadget");
+    return;
+  }
+  if (exists("/aginxos/usb-nog1")) {
+    /* Bisect v18 (2026-08-27): mkdir g1 alone bootloops (v17). Control run:
+     * stop exactly where v14 did (usb_gadget dir only, no g1) to confirm the
+     * v14 success still reproduces - guards against an unrelated regression. */
+    kmsg("aginxos-trampoline: usb_gadget dir only, NO g1 (usb-nog1 control)\n");
+    return;
+  }
   mkdir("/config/usb_gadget/g1", 0755);
+  if (exists("/aginxos/usb-mkg1-only")) {
+    /* Bisect v17 (2026-08-27): v14's gate sat BEFORE this mkdir, so g1 was
+     * never actually tested - v15/v16 (mkdir g1 + writes) both bootlooped.
+     * This gate isolates mkdir g1 itself with zero property writes. */
+    kmsg("aginxos-trampoline: mkdir g1 done, no writes (usb-mkg1-only bisect)\n");
+    return;
+  }
   wf("/config/usb_gadget/g1/idVendor", "0x18d1");
   wf("/config/usb_gadget/g1/idProduct", "0xd001");
+  if (exists("/aginxos/usb-vidpid-only")) {
+    /* Bisect v16 (2026-08-27): v14 (g1 mkdir only) OK; v15 (g1 + 4 prop
+     * writes) bootlooped. This gate keeps only idVendor+idProduct to split
+     * the four writes in half. */
+    char b[128];
+    snprintf(b, sizeof b, "aginxos-trampoline: vid/pid written, rest SKIPPED (v16)\n");
+    kmsg(b);
+    return;
+  }
   wf("/config/usb_gadget/g1/bcdDevice", "0x0100");
   wf("/config/usb_gadget/g1/bcdUSB", "0x0200");
+  if (exists("/aginxos/usb-props-only")) {
+    /* Bisect v15 (2026-08-26): g1 dir alone was safe (v14). This mode adds
+     * the idVendor/idProduct/bcd* + strings writes but creates NO functions
+     * or configs dirs - splits "property writes" from "tree structure". */
+    kmsg("aginxos-trampoline: props written, no functions/configs (usb-props-only bisect)\n");
+    return;
+  }
   mkdir("/config/usb_gadget/g1/strings", 0755);
   mkdir("/config/usb_gadget/g1/strings/0x409", 0755);
   wf("/config/usb_gadget/g1/strings/0x409/serialnumber", "aginxosredfin");
@@ -934,6 +1076,14 @@ static void usb_console(void) {
   }
 
   /* 4. functionfs + adbd (adbd must open endpoints before UDC bind) */
+  if (exists("/aginxos/usb-noffs")) {
+    /* Bisect v12 (2026-08-26): diag handoff works; v7-v11 (USBADB) all
+     * bootlooped. v9 proved bind is not the cause. This mode stops after the
+     * configfs gadget tree - if Android boots, the root cause is the ffs
+     * mount or the adbd child, not configfs. */
+    kmsg("aginxos-trampoline: ffs+adbd SKIPPED (usb-noffs bisect mode)\n");
+    return;
+  }
   mkdir("/dev/usb-ffs", 0755);
   mkdir("/dev/usb-ffs/adb", 0755);
   if (mount("adb", "/dev/usb-ffs/adb", "functionfs", 0, "uid=2000,gid=2000") !=
@@ -945,6 +1095,7 @@ static void usb_console(void) {
     return;
   }
   pid_t pid = fork();
+  g_adbd_pid = pid;
   if (pid == 0) {
     char *a[] = {"/system/bin/adbd", NULL};
     char *env[] = {"PATH=/system/bin", NULL};
@@ -958,12 +1109,56 @@ static void usb_console(void) {
   }
   if (!exists("/dev/usb-ffs/adb/ep1"))
     kmsg("aginxos-trampoline: adbd did not open ep1 (exec ok?)\n");
+  {
+    char b[96];
+    snprintf(b, sizeof b, "aginxos-trampoline: adbd alive: %s\n",
+             (g_adbd_pid > 0 && kill(g_adbd_pid, 0) == 0) ? "yes" : "no");
+    kmsg(b);
+  }
 
-  /* 5. bind UDC — device enumerates on host now */
-  if (wf("/config/usb_gadget/g1/UDC", udc) == 0)
+  /* 5. bind UDC - device enumerates on host now */
+  if (exists("/aginxos/usb-nobind")) {
+    /* Bisect mode (v9, 2026-08-26): binding the UDC was suspected of breaking
+     * the first_stage handoff. Skip the bind, hand off, and read this run's
+     * full kmsg from Android - it carries every diagnostic line above. */
+    char p[128];
+    kmsg("aginxos-trampoline: UDC bind SKIPPED (usb-nobind diag mode)\n");
+    snprintf(p, sizeof p, "/sys/class/udc/%s/state", udc);
+    kmsg_file(p, "udc-state");
+    kmsg_file("/config/usb_gadget/g1/UDC", "gadget-udc");
+    return;
+  }
+  if (wf("/config/usb_gadget/g1/UDC", udc) == 0) {
+    g_bound = 1;
+    /* v25: parent (PID 1) reads this — its g_bound copy stays 0 across fork. */
+    int bfd = open("/aginxos/.usb-bound", O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+    if (bfd >= 0)
+      close(bfd);
     kmsg("aginxos-trampoline: usb gadget BOUND — adb should enumerate\n");
-  else
-    kmsg("aginxos-trampoline: UDC bind FAILED\n");
+  } else {
+    char b[96];
+    snprintf(b, sizeof b, "aginxos-trampoline: UDC bind FAILED errno-ish=%d\n",
+             -wf("/config/usb_gadget/g1/UDC", udc));
+    kmsg(b);
+  }
+  /* 6. settle and record the kernel-side enumeration state (state goes
+   *    "not attached" -> "addressed"/"configured" only if the host sees us).
+   *    The long second window is a live-observation slot: if the gadget
+   *    works, the host can see it (and us) before cleanup unbinds it. */
+  {
+    char p[128];
+    sleep(3);
+    snprintf(p, sizeof p, "/sys/class/udc/%s/state", udc);
+    kmsg_file(p, "udc-state");
+    snprintf(p, sizeof p, "/sys/class/udc/%s/current_speed", udc);
+    kmsg_file(p, "udc-speed");
+    kmsg_file("/config/usb_gadget/g1/UDC", "gadget-udc");
+    sleep(22);
+    snprintf(p, sizeof p, "/sys/class/udc/%s/state", udc);
+    kmsg_file(p, "udc-state-late");
+    snprintf(p, sizeof p, "/sys/class/udc/%s/current_speed", udc);
+    kmsg_file(p, "udc-speed-late");
+  }
 }
 
 static void backlight_max(void) {
@@ -1115,7 +1310,59 @@ int main(int argc, char **argv, char **envp) {
   int diag_on = exists("/aginxos/usb-diag");
   if (usb_on) {
     ensure_fs();
-    usb_console();
+    /* v25 (2026-08-27): run the entire gadget bring-up in a CHILD process.
+     * Every prior USB run (v6-v24) failed with no surviving log: any fault in
+     * PID 1 — our own segfault just as much as a kernel panic — takes the
+     * kernel down ("Attempted to kill init"), and the ring buffer dies on the
+     * reboot (ramoops is dead on this unit). In a child, a userspace fault
+     * only kills the child: PID 1 records the waitpid status and hands off,
+     * so adb bugreport shows both WHERE the child stopped (kmsg stage
+     * markers) and HOW it died (signal vs clean exit). Separates "our
+     * userspace bug" from "kernel panics on configfs interaction" in one
+     * flash. */
+    pid_t c = fork();
+    if (c == 0) {
+      usb_console();
+      /* adbd (if forked) is OUR child; PID 1's g_adbd_pid copy is 0, so the
+       * parent's cleanup_gadget can never kill it. Die clean — except under
+       * HOLD, where the whole point is keeping the console alive. */
+      if (!exists("/aginxos/hold"))
+        kill_adbd();
+      _exit(0);
+    }
+    if (c < 0) {
+      kmsg("aginxos-trampoline: fork failed - usb console inline\n");
+      usb_console();
+    } else {
+      kmsg("aginxos-trampoline: usb child spawned\n");
+      int st = 0, seen = 0;
+      for (int t = 0; t < 1800; t++) { /* 180 s: ~25 s chain + 30 s observe */
+        pid_t r = waitpid(c, &st, WNOHANG);
+        if (r == c) {
+          seen = 1;
+          break;
+        }
+        if (r < 0 && errno == ECHILD)
+          break;
+        usleep(100000);
+      }
+      char b[128];
+      if (seen) {
+        if (WIFEXITED(st))
+          snprintf(b, sizeof b, "aginxos-trampoline: usb child exited code=%d\n",
+                   WEXITSTATUS(st));
+        else if (WIFSIGNALED(st))
+          snprintf(b, sizeof b,
+                   "aginxos-trampoline: usb child DIED signal=%d%s\n",
+                   WTERMSIG(st), WCOREDUMP(st) ? " (core)" : "");
+        else
+          snprintf(b, sizeof b, "aginxos-trampoline: usb child status=%d\n", st);
+      } else {
+        snprintf(b, sizeof b,
+                 "aginxos-trampoline: usb child STUCK >180s - proceeding\n");
+      }
+      kmsg(b);
+    }
   } else if (diag_on) {
     ensure_fs();
     usb_diag();
@@ -1138,6 +1385,30 @@ int main(int argc, char **argv, char **envp) {
         kmsg("aginxos-trampoline: still holding\n");
       sleep(1);
     }
+  }
+
+  /* Unwind the gadget before Android builds its own USB stack on the same
+   * controller — a leftover ffs mount or bound UDC breaks stock adbd, which
+   * is our only channel for reading this run's ring buffer. */
+  if (usb_on && exists("/aginxos/usb-nocleanup")) {
+    /* Bisect v19 (2026-08-27): mkdir g1 then handoff = reboot loop (v17);
+     * mkdir g1 + cleanup = same (v15/v16). Hypothesis: kernel panic, not a
+     * userspace hang (a hung boot would not re-enter fastboot; slot-retry
+     * exhaustion implies actual reboots). This gate skips cleanup entirely -
+     * if v19 boots, the panic is in the TEARDOWN (rmdir gadget/umount
+     * configfs -> dwc3 gadget teardown); if it still reboots, mkdir g1
+     * itself panics. */
+    kmsg("aginxos-trampoline: cleanup SKIPPED (usb-nocleanup bisect v19)\n");
+  } else if (usb_on) {
+    cleanup_gadget();
+    /* Same regression class as the diag path (2026-08-26): first_stage_init's
+     * switch_root breaks if our ensure_fs mounts are still live. The diag path
+     * unmounts before exec; the usb path must too (found via v7 bootloop ->
+     * fastboot fallback). kmsg is dead after this point, by design. */
+    umount2("/sys/kernel/debug", MNT_DETACH);
+    umount2("/sys", MNT_DETACH);
+    umount2("/proc", MNT_DETACH);
+    umount2("/dev", MNT_DETACH);
   }
 
   splash_sequence();
