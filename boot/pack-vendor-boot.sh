@@ -307,6 +307,13 @@ if [[ "${USBADB}" == "1" ]]; then
     echo "warning: no ${PROPSRC}/property_info — adbd will come up unauthorized (run scripts/pull-prop-area.sh + scripts/patch-prop-area.py first)" >&2
   fi
 fi
+# STORAGE=1: aginxos-init (after the PID 1 takeover) loads the UFS chain and
+# creates the /dev block nodes — boot-time storage, no manual insmod.
+STORAGE="${STORAGE:-0}"
+if [[ "${STORAGE}" == "1" ]]; then
+  : >"${WORK}/aginxos/storage"
+  echo "note: STORAGE=1 → aginxos-init brings up UFS after takeover"
+fi
 # USBCFGONLY=1: mount configfs, create no gadget tree (bisect v13)
 USBCFGONLY="${USBCFGONLY:-0}"
 # USBG1ONLY=1: create /config/usb_gadget/g1 only, nothing else (bisect v14)

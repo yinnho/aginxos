@@ -4,7 +4,9 @@
 //!   /aginxos/hold         — do not hand off to Android
 //!   /aginxos/load-modules — load /lib/modules/modules.load
 //!   /aginxos/splash       — attempt DRM solid-color frames
+//!   /aginxos/storage      — load the UFS chain, create block nodes
 //!
+//! Operator subcommand: `/aginxos/aginxos-init reboot [mode]`.
 //! Default with only `hold`: mount basics + heartbeat (safest bring-up).
 
 use std::fs::{self, File, OpenOptions};
@@ -77,9 +79,9 @@ fn load_module(path: &Path) -> Result<(), String> {
     let f = File::open(path).map_err(|e| format!("open: {e}"))?;
     let fd = f.as_raw_fd();
     let params = std::ffi::CString::new("").unwrap();
-    // aarch64 Linux SYS_finit_module
-    const SYS_FINIT_MODULE: libc::c_long = 313;
-    let rc = unsafe { libc::syscall(SYS_FINIT_MODULE, fd, params.as_ptr(), 0i32) };
+    // 438 on aarch64 — the previously hardcoded 313 is x86_64 and cost a full
+    // flash cycle to discover (ENOSYS from every storage module, 2026-08-27).
+    let rc = unsafe { libc::syscall(libc::SYS_finit_module, fd, params.as_ptr(), 0i32) };
     if rc == 0 {
         return Ok(());
     }
@@ -109,6 +111,98 @@ fn load_safe_modules() {
         }
     }
     klog(&format!("safe modules done ok={ok}"));
+}
+
+// --- storage bring-up (/aginxos/storage) ---
+
+/// UFS chain, live-verified 2026-08-27 (see docs/HARDWARE.md). Order from the
+/// modules' modinfo depends=; the reboot-reason chain (qcom_hwspinlock etc.)
+/// already ran in the trampoline's modules.usb before this PID 1 takeover.
+const UFS_MODULES: &[&str] = &[
+    "phy-qcom-ufs.ko",
+    "phy-qcom-ufs-qmp-v4.ko",
+    "phy-qcom-ufs-qmp-v4-lito.ko", // lito = SM7250 = this SoC
+    "ufshcd-core.ko",
+    "ufshcd-pltfrm.ko",
+    "ufs_qcom.ko",
+];
+
+/// glibc-compatible makedev (new large encoding) — the libc crate does not
+/// export one we can rely on.
+fn makedev(ma: u32, mi: u32) -> libc::dev_t {
+    (((mi & 0xff) | ((ma & 0xfff) << 8)) as libc::dev_t)
+        | (((mi & !0xff) as libc::dev_t) << 12)
+        | (((ma & !0xfff) as libc::dev_t) << 32)
+}
+
+fn partitions_have(disk: &str) -> bool {
+    let Ok(content) = fs::read_to_string("/proc/partitions") else {
+        return false;
+    };
+    content.lines().any(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.len() == 4 && f[3] == disk
+    })
+}
+
+/// /dev is tmpfs with no ueventd: nodes for the UFS LUNs must be mknod'd by
+/// hand from /proc/partitions (the trampoline does the same for console fds).
+fn create_block_nodes() -> usize {
+    let Ok(content) = fs::read_to_string("/proc/partitions") else {
+        return 0;
+    };
+    let mut made = 0usize;
+    for line in content.lines().skip(2) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() != 4 {
+            continue;
+        }
+        let (Ok(ma), Ok(mi), name) = (f[0].parse::<u32>(), f[1].parse::<u32>(), f[3]) else {
+            continue;
+        };
+        let path = format!("/dev/{name}");
+        if Path::new(&path).exists() {
+            continue;
+        }
+        let c_path = std::ffi::CString::new(path.clone()).unwrap();
+        let rc = unsafe {
+            libc::mknod(c_path.as_ptr(), libc::S_IFBLK | 0o600, makedev(ma, mi))
+        };
+        if rc == 0 {
+            made += 1;
+        } else {
+            klog(&format!("mknod {name}: {}", std::io::Error::last_os_error()));
+        }
+    }
+    made
+}
+
+/// Storage bring-up as a PID 1 responsibility: load the UFS chain, wait for
+/// the LUN scan, expose the partitions. misc (sda3) becomes writable from a
+/// clean boot — no manual insmod.
+fn bring_up_storage() {
+    let base = Path::new("/lib/modules");
+    let mut ok = 0usize;
+    for name in UFS_MODULES {
+        match load_module(&base.join(name)) {
+            Ok(()) => ok += 1,
+            Err(e) => klog(&format!("storage mod fail {name}: {e}")),
+        }
+    }
+    // The LUN scan follows the ufshcd probe almost immediately (observed
+    // <100 ms) — poll briefly rather than race it.
+    for _ in 0..20 {
+        if partitions_have("sda") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if !partitions_have("sda") {
+        klog(&format!("storage: sda did not appear (mods ok={ok})"));
+        return;
+    }
+    let made = create_block_nodes();
+    klog(&format!("storage up: ufs mods ok={ok}, {made} block nodes"));
 }
 
 fn load_modules_from_list() {
@@ -451,11 +545,13 @@ fn main() {
     let do_modules = flag("/aginxos/load-modules");
     let do_splash = flag("/aginxos/splash");
     let do_full_modules = flag("/aginxos/load-modules-full");
+    let do_storage = flag("/aginxos/storage");
     // Immediate handoff without mounting (cleanest path to Android).
-    let handoff_only = !hold && !do_modules && !do_splash && !do_full_modules;
+    let handoff_only =
+        !hold && !do_modules && !do_splash && !do_full_modules && !do_storage;
 
     klog(&format!(
-        "start v{} pid={} hold={hold} handoff_only={handoff_only} modules={do_modules} splash={do_splash}",
+        "start v{} pid={} hold={hold} handoff_only={handoff_only} modules={do_modules} splash={do_splash} storage={do_storage}",
         env!("CARGO_PKG_VERSION"),
         std::process::id()
     ));
@@ -479,6 +575,12 @@ fn main() {
         load_safe_modules();
     } else {
         klog("skip modules (safe default)");
+    }
+
+    if do_storage {
+        bring_up_storage();
+    } else {
+        klog("skip storage (safe default)");
     }
 
     if do_splash {

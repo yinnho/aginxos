@@ -34,7 +34,8 @@ point (see `docs/HARDWARE.md` "Handoff breakthrough").
 ## Feature flags
 
 Empty files under `/aginxos/` gate behavior at runtime. The trampoline checks
-for them with `exists()`:
+for them with `exists()`; `/aginxos/storage` is checked by `aginxos-init`
+after the PID 1 takeover:
 
 | Flag | Effect |
 |------|--------|
@@ -46,11 +47,12 @@ for them with `exists()`:
 | `/aginxos/load-modules` | load `/aginxos/modules.allow` (small curated list). |
 | `/aginxos/load-modules-loadfile` | load stock `modules.load` but stop at `msm_drm.ko`. |
 | `/aginxos/load-modules-full` | load the entire `modules.load`. Riskier. |
+| `/aginxos/storage` | aginxos-init (as PID 1) loads the UFS chain and mknods the block nodes from `/proc/partitions`. |
 
 `pack-vendor-boot.sh` takes env flags that write these:
 
 ```bash
-HOLD=1 SPLASH=0 USBADB=1 ./boot/pack-vendor-boot.sh
+HOLD=1 SPLASH=0 USBADB=1 STORAGE=1 ./boot/pack-vendor-boot.sh
 # HOLD:       0|1
 # SPLASH:     0|1
 # USBADB:     0|1  — ffs.adb console + /aginxos/modules.usb chain
@@ -58,6 +60,7 @@ HOLD=1 SPLASH=0 USBADB=1 ./boot/pack-vendor-boot.sh
 # USBPROBE:   0|1  — verdict mode (reboot-timing signal)
 # MODULES:    0 | 1 (modules.allow) | drm (modules.load through msm_drm)
 # MODULES_FULL: 0|1
+# STORAGE:    0|1  — aginxos-init brings up UFS after the takeover
 ```
 
 ### USB gadget console (`/aginxos/usb-adb`)
