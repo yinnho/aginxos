@@ -509,3 +509,123 @@ readback channel; manual Power+VolDown recovery needed.
 v27 (next): handoff variant of v26 — child also waitpid-watches adbd and
 kmsgs exit code/signal; bind result + udc-state land in the ring buffer
 and come back via `adb bugreport`.
+
+## v27: P1 localized — adbd aborts before writing ffs descriptors (2026-08-27)
+
+v27 (`USBADB=1` handoff, symlink fixed + `mk`/`wf_log` + adbd waitpid
+logging): ANDROID_OK at 42 s. Bugreport kernel log, child pid 202:
+
+- modules ok=52 at 1.005 s, udc at 1.105 s, extcon2/pdphy `USB=1` at
+  4.106 s (VBUS good), configfs tree built with **zero mkdir/write errors**
+  (symlink accepted — fix confirmed), functionfs instance registered
+- **`adbd KILLED signal=6` at 4.157 s** (~50 ms after exec),
+  ep1 never appeared
+- **`UDC bind FAILED errno=19`** (ENOENT — no function descriptors,
+  because nobody wrote them to ffs ep0)
+- udc-state `not attached` at 7 s and 29 s; child exited code=0; PID 1
+  cleanup + handoff clean
+
+So P1 (no enumeration ever) is fully explained by adbd dying instantly:
+gadget tree, ffs, and controller were all ready. Static checks on the
+extracted vendor ramdisk: all 10 direct NEEDED libs of adbd present in
+/system/lib64, and the full transitive closure is present — not a missing
+.so. SIGABRT is either a bionic linker fatal (symbol/version) or adbd's
+own `fatal()`; its stderr went to PID 1's empty fd 2 and was lost.
+
+v28 (in flight): adbd child's fd 0/1/2 dup2'd to /dev/kmsg (no O_CLOEXEC)
+plus `LD_LIBRARY_PATH=/system/lib64` — bionic/adbd fatal text should land
+in the ring buffer verbatim.
+
+## v28-v30: adbd runs, gadget enumerates (2026-08-27)
+
+v28 (adbd stdio dup2'd to /dev/kmsg): adbd still SIGABRT, but the reason
+landed in the ring buffer — **`getentropy failed: No such file or
+directory`** (pid 273 = adbd). bionic's getentropy() needs /dev/urandom
+and fatal()s on ENOENT. This kernel has **no devtmpfs** (stock mounts
+tmpfs on /dev and lets ueventd mknod; our try_mount failed silently all
+along), so /dev held only the kmsg node the fallback created. Kernel side
+of the failed bind also logged: `udc a600000.dwc3: failed to start g1:
+-19`.
+
+v29 (ensure_fs logs the devtmpfs errno and mknods null/zero/full/random/
+urandom/kmsg — the major-1 char drivers are always registered, only the
+nodes were missing): **adbd runs** — `adbd started`, ep0 opened,
+`read descriptors`/`read strings`, `UsbFfsConnection constructed`,
+`USB event: FUNCTIONFS_BIND`, **`usb gadget BOUND`**, kernel
+`android_work: sent uevent USB_STATE=CONNECTED`, `udc-state: addressed`,
+`current_speed: high-speed`. Within the fixed 25 s observation window the
+host never sent SET_CONFIGURATION (state stayed `addressed`; SPUSB hides
+unconfigured devices, so the host-side monitor saw nothing). Non-fatal
+noise: linker warning (no /linkerconfig/ld.config.txt), `Failed to get
+adbd socket: Operation not permitted`, `uninitialized urandom read`
+(no CRNG seed without hwrng).
+
+v30 (same code + HOLD, i.e. unlimited window, no teardown): **full
+enumeration — `adb devices` shows `aginxredfin unauthorized`.** macOS
+just needed more than 25 s to configure the gadget. adbd is serving; the
+RSA auth wall is the only thing left (no property area → adbd defaults
+ro.adb.secure=true, and there is no UI to accept the dialog).
+
+v31 (same + adb_keys seeding): first flash **bootlooped to fastboot**;
+re-flash of the identical image stayed up (nondeterministic, unexplained —
+the seeding runs in the fork-isolated child and cannot reboot the box).
+Gadget enumerated, adbd serving, but `adb devices` stayed **unauthorized**
+— the seeded keys file was provably ignored (below). One manual
+Power+VolDown recovery needed (unauthorized = no adb control from HOLD).
+
+Offline root-cause of the auth wall (2026-08-27, from the ramdisk binaries):
+- `ro.adb.secure` appears in **no binary of this build** (adbd, lib64/*).
+  Android 14 adbd decides auth via `__android_log_is_debuggable()`
+  (liblog → property `ro.debuggable`); no property area → default "0"
+  → auth forced on. Older docs blame ro.adb.secure — wrong for A14.
+- Disassembly of `/system/lib64/libadbd_auth.so`: the strings
+  `/data/misc/adb/adb_keys` and `/adb_keys` have **zero code references**
+  (dead constants). This build's adbd_auth gets trusted keys only over the
+  framework socket ("received new framework connection"), which never
+  exists in the rdinit env. Seeding the file could never work.
+
+v32 (authorized root adb — goal state reached 2026-08-27): stage a real
+bionic property area in the rdinit env with two same-length value bytes
+patched: `ro.debuggable 0→1` (auth off), `ro.secure 1→0`
+(should_drop_privileges() keeps adbd root).
+- Source of the area: this device's own live `/dev/__properties__/`,
+  pulled while booted normally on stock vendor_boot. **Device is
+  Magisk-rooted** (`su` works, context `u:r:magisk:s0`; boot partition is
+  Magisk-patched — treat `boot/stock-boot.img` as "known-good restore
+  point", its "stock" label unverified). Property files are root-only
+  (dir is `--x`).
+- Transfer trap: `su -c cat` output crosses a pty with ONLCR — every
+  0x0a becomes 0d 0a (+1 byte, wrong md5). `base64` + strip CR/LF is the
+  faithful channel (md5-verified against device).
+- prop_info layout (reverse-engineered, verified): value is 92 bytes
+  before the inline name, 4-byte serial 96 bytes before it, encoded
+  little-endian as `(value_len << 24) | count << 16`. Same-length value
+  swaps need no serial change.
+- Minimal area: 3 files (`properties_serial`, `property_info` = serialized
+  contexts trie, `u:object_r:userdebug_or_eng_prop:s0`). Missing context
+  areas resolve lazily to "not found" (bionic logs "Access denied finding
+  property X" to stderr — harmless, and shows which contexts are absent).
+- Validated against real bionic BEFORE flashing: `unshare -m` +
+  `mount --make-rprivate /` + tmpfs over `/dev/__properties__` on the
+  booted device → `getprop` inside the ns read `debuggable=1 secure=0`.
+  (Root mounts are `shared:` — make-rprivate first or the test mount
+  propagates system-wide.)
+- Flashed `HOLD=1 SPLASH=0 MODULES=0 USBADB=1`. Result: **authorized in
+  10 s** (`adb devices` → `aginxosredfin device`), `adb shell id` →
+  `uid=0(root)`, `getprop ro.debuggable`→1, `ro.secure`→0, `uname` →
+  `Linux (none) 4.19.278-g7b0944645172-ab10812814 aarch64 Toybox`,
+  `ps` shows PID 1 = trampoline and no Android processes, uptime 22 s.
+  kmsg: 52/52 modules, gadget BOUND at 4.2 s, UDC `configured`
+  high-speed at 7.2 s, "staged 3 property area files" + "toybox linked
+  as /system/bin/sh" before adbd came up.
+- Shell: the vendor ramdisk has no `/system/bin/sh` — the device's own
+  `/system/bin/toybox` (deps all present in the ramdisk lib64 set) is
+  copied to `boot/out/toybox` (local only) and linked by the trampoline
+  as sh + applets (id, ls, cat, getprop, dmesg, uname, ps, ...).
+
+Device state (2026-08-27, end of session): **left running the v32 test
+image** (HOLD, authorized root adb console alive). Recovery no longer
+needs button combos: `adb reboot bootloader` → flash
+`boot/stock-vendor_boot.img` (or re-run v32 via
+`USBADB=1 HOLD=1 SPLASH=0 MODULES=0 ./scripts/flash-early-splash.sh`).
+
