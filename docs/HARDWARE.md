@@ -737,3 +737,30 @@ image** (HOLD, aginxos-init v0.3.0 as PID 1, authorized root adb, reboot
 chain live). misc partition restored to original. Recovery:
 `adb shell /aginxos/aginxos-init reboot bootloader` → flash
 `boot/stock-vendor_boot.img`.
+
+## v35: aginxos-init owns storage (2026-08-27)
+
+New `/aginxos/storage` flag (pack env `STORAGE=1`): after the PID 1 takeover,
+aginxos-init loads the 6-module UFS chain itself and mknods every block node
+from /proc/partitions — boot-time storage as an init responsibility, no
+manual insmod.
+
+First flash failed instructively: every module logged
+`storage mod fail ...: Function not implemented` (ENOSYS). Root cause: the
+`load_module()` helper had hardcoded `SYS_finit_module = 313` — the x86_64
+number, not aarch64's 438. The path had never executed on device before
+(the allowlist has been empty since the bootloop era), so the wrong constant
+sat unnoticed through three versions. Fixed to `libc::SYS_finit_module`.
+
+Second flash (v0.4.0, fixed): kmsg
+`aginxos-init: storage up: ufs mods ok=6, 95 block nodes` at t=29.29 s,
+right after the takeover. `/dev/sda3` (8,3), `/dev/sde42` (259,26), `/dev/sdf`
+(8,80) present with correct major:minor pairs from /proc/partitions; misc
+reads back the restored all-zero BCB. PID 1 = aginxos-init v0.4.0
+throughout.
+
+Device state (2026-08-27, end of session): **left running the v35 test
+image** (HOLD, STORAGE=1, aginxos-init v0.4.0 as PID 1 with storage up,
+authorized root adb, software fastboot route). Recovery:
+`adb shell /aginxos/aginxos-init reboot bootloader` → flash
+`boot/stock-vendor_boot.img`.
