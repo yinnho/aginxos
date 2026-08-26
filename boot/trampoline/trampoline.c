@@ -108,6 +108,29 @@ static void ensure_fs(void) {
   }
 }
 
+/* devpts + /dev/ptmx: without them adbd cannot allocate a pty, and `adb
+ * reboot` (and any interactive `adb shell`) fails device-side with
+ * "failed to create pty master: No such file or directory" (2026-08-27).
+ * devtmpfs provides no ptmx of its own; devpts creates the node inside
+ * the mounted instance, /dev/ptmx just points at it. */
+static void ensure_devpts(void) {
+  if (exists("/dev/ptmx"))
+    return;
+  mkdir("/dev/pts", 0755);
+  if (mount("devpts", "/dev/pts", "devpts", 0, "mode=0620") != 0) {
+    char b[96];
+    snprintf(b, sizeof b, "aginxos-trampoline: devpts mount errno=%d\n", errno);
+    kmsg(b);
+    return;
+  }
+  if (symlink("/dev/pts/ptmx", "/dev/ptmx") != 0) {
+    /* /dev is tmpfs here (devtmpfs won't mount on this kernel — ENODEV);
+     * tmpfs permits mknod as root, so fall back to the node itself */
+    mknod("/dev/ptmx", S_IFCHR | 0666, makedev(5, 2));
+  }
+  kmsg("aginxos-trampoline: devpts mounted, /dev/ptmx ready\n");
+}
+
 /* Copy /aginxos/props/ contents (packed property area files pulled from a real
  * Android boot of this unit) into /dev/__properties__/ so bionic resolves
  * properties in the rdinit env. Called before adbd is forked — bionic
@@ -1214,6 +1237,7 @@ static void usb_console(void) {
    * ro.debuggable=1 -> auth off, and ro.secure=0 -> should_drop_privileges()
    * keeps adbd root. */
   stage_property_area();
+  ensure_devpts();
   /* adbd's shell service execs /system/bin/sh -c, but the vendor ramdisk
    * ships no shell (only adbd + libs) — an authorized connection would
    * immediately fail every command. The device's own toybox (pulled from
