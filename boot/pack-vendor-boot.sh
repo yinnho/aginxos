@@ -93,6 +93,7 @@ fi
 # Feature flags (empty files). Safe default: HOLD only, no modules/splash.
 HOLD="${HOLD:-0}"
 SPLASH="${SPLASH:-0}"
+# MODULES: 0 | 1 (small allow-list) | drm (stock modules.load through msm_drm)
 MODULES="${MODULES:-0}"
 MODULES_FULL="${MODULES_FULL:-0}"
 if [[ "${HOLD}" == "1" ]]; then
@@ -101,15 +102,178 @@ if [[ "${HOLD}" == "1" ]]; then
 fi
 if [[ "${SPLASH}" == "1" ]]; then
   : >"${WORK}/aginxos/splash"
-  echo "note: SPLASH=1"
+  echo "note: SPLASH=1 (DRM paint; needs MODULES=drm or MODULES=1)"
 fi
-if [[ "${MODULES}" == "1" ]]; then
+if [[ "${MODULES}" == "drm" || "${MODULES}" == "DRM" ]]; then
+  # Preferred: same order Android first_stage uses, stop at msm_drm.ko
+  : >"${WORK}/aginxos/load-modules-loadfile"
+  echo "note: MODULES=drm → load /lib/modules/modules.load through msm_drm.ko"
+elif [[ "${MODULES}" == "1" ]]; then
   : >"${WORK}/aginxos/load-modules"
-  echo "note: MODULES=1 (safe allow-list only)"
+  cat >"${WORK}/aginxos/modules.allow" <<'EOF'
+# pinctrl / clocks / bus
+pinctrl-msm.ko
+pinctrl-spmi-gpio.ko
+pinctrl-spmi-mpp.ko
+pinctrl-lito.ko
+msm_bus.ko
+clk-qcom.ko
+clk-aop-qmp.ko
+cmd-db.ko
+msm_ipc_logging.ko
+qcom_rpmh.ko
+clk-rpmh.ko
+dispcc-lito.ko
+gcc-lito.ko
+llcc-slice.ko
+llcc-lito.ko
+# memory / iommu / ion / tz
+qtee_shm_bridge.ko
+secure_buffer.ko
+msm_dma_iommu_mapping.ko
+ion-alloc.ko
+msm_bus_rpmh.ko
+iommu-logger.ko
+arm-smmu-debug.ko
+arm-smmu.ko
+# regulators / i2c / panel power
+regmap-spmi.ko
+qcom-spmi-pmic.ko
+qcom-i2c-pmic.ko
+qpnp-amoled-regulator.ko
+rpmh-regulator.ko
+qcom-geni-se.ko
+i2c-qcom-geni.ko
+# display + drm
+fsa4480-i2c.ko
+msm_ext_display.ko
+qseecom.ko
+hdcp_qseecom.ko
+msm_hdcp.ko
+msm_drm.ko
+EOF
+  echo "note: MODULES=1 wrote small display modules.allow"
 fi
 if [[ "${MODULES_FULL}" == "1" ]]; then
   : >"${WORK}/aginxos/load-modules-full"
-  echo "note: MODULES_FULL=1 (RISKY)"
+  echo "note: MODULES_FULL=1 loads entire modules.load (RISKY)"
+fi
+# USBADB=1: ffs.adb gadget console (adbd is in this ramdisk already; see docs/HARDWARE.md)
+# USBDIAG=1: same module chain, but diagnostics instead of gadget — extcon +
+#            deferred-probe dumps, drivers_probe replay kick, then Android
+#            handoff so the full kernel log can be read via adb+root dmesg.
+USBADB="${USBADB:-0}"
+USBDIAG="${USBDIAG:-0}"
+if [[ "${USBADB}" == "1" || "${USBDIAG}" == "1" ]]; then
+  cat >"${WORK}/aginxos/modules.usb" <<'EOF'
+# USB gadget console chain. Raw finit_module in listed order.
+# ROOT CAUSE (found 2026-08-26 via USBDIAG + bugreport kernel log): the chain
+# must be a true modules.dep topological order. Two prior orderings failed:
+#   - eud.ko needs qtee_shm_bridge.ko (exports scm_io_read/write) BEFORE it
+#   - qpnp_pdphy.ko needs usb-dwc3-msm.ko (exports ext_vbus_register_notify)
+#     BEFORE it — dwc3 defers until pdphy's extcon registers, and pdphy's
+#     module load is exactly what replays the deferred probe (stock does the
+#     same: dwc3-msm loads 1.25s, pdphy 1.30s, dwc3 probe completes 1.63s).
+# This order is machine-validated against modules.dep (all edges satisfied).
+# NOTE: rmmod eud panics this kernel — load-only, never unload.
+# Foundation — clocks, power, pinctrl, bus
+msm_ipc_logging.ko
+msm_bus.ko
+pinctrl-msm.ko
+pinctrl-lito.ko
+pinctrl-spmi-gpio.ko
+pinctrl-spmi-mpp.ko
+cmd-db.ko
+smem.ko
+qcom_rpmh.ko
+clk-rpmh.ko
+clk-aop-qmp.ko
+clk-qcom.ko
+gcc-lito.ko
+qcom-pdc.ko
+msm_bus_rpmh.ko
+refgen.ko
+spmi-pmic-arb.ko
+regmap-spmi.ko
+qcom-spmi-pmic.ko
+rpmh-regulator.ko
+fsa4480-i2c.ko
+# qtee + IOMMU/SMMU chain (qtee MUST precede eud: it exports scm_io_*)
+qtee_shm_bridge.ko
+iommu-logger.ko
+secure_buffer.ko
+arm-smmu-debug.ko
+arm-smmu.ko
+msm_dma_iommu_mapping.ko
+# extcon supplier: qpnp-smb5 (charger)
+# DT-level suppliers smb5 probe waits on (dtbo analysis 2026-08-26):
+#   io-channels = pm7250b_vadc ("qcom,spmi-adc5")     -> adc5 + vadc-common
+#   ext-vbus-supply = ext_boost ("regulator-tps")     -> tps-regulator.ko
+# pdphy's connector node also consumes a vadc channel, and pdphy waits on
+# smb5-vbus/vconn (smb5 child regulators) + ext_boost.
+# SOURCE-level supplier (qpnp-smb5.c, verified vs android-msm-redbull-4.19):
+#   smb5_probe() returns -EPROBE_DEFER SILENTLY unless alarmtimer_get_rtcdev()
+#   is non-NULL -> needs rtc-pm8xxx (pm8150_rtc). Confirmed on device
+#   2026-08-26: rtc-pm8xxx load at 21.503s -> "logbuffer: id:smblib
+#   registered" 1.7ms later -> smb5 probe success at 21.522s.
+# pdphy's usbpd_create -517 also unblocks with smb5: it defers on
+# power_supply_get_by_name("usb") and find_votable("USB_ICL"), both created
+# by smb5_probe. Chain: rtc -> smb5 -> pdphy -> ssphy/ssusb -> dwc3 -> UDC.
+# pdphy's usbpd_create also needs the "wireless" power supply (DT has
+# goog,wlc-supported): registered by p9221_charger (Qi RX, i2c 1-003b on
+# geni i2c). Verified on device 2026-08-26: p9221 "id:wireless registered"
+# at 21.4553s -> pdphy usbpd_create OK 2ms later. p9221 probe prints some
+# benign errors (pin group 99, one i2c -107) — stock logs the same.
+# The geni i2c controller devices themselves defer on their GPI DMA
+# supplier (900000.qcom,gpi-dma) — virt-dma + gpi must come first, else
+# the buses (and p9221 on 98c000.i2c) only probe on Android's wave.
+virt-dma.ko
+gpi.ko
+qcom-geni-se.ko
+i2c-qcom-geni.ko
+qcom-vadc-common.ko
+qpnp-revid.ko
+qcom-spmi-adc5.ko
+tps-regulator.ko
+rtc-pm8xxx.ko
+pmic-voter.ko
+logbuffer.ko
+p9221_charger.ko
+qpnp-battery.ko
+of_batterydata.ko
+qpnp-smb5-charger.ko
+# SCM + extcon supplier: msm-eud (load-only; rmmod panics)
+msm_scm.ko
+eud.ko
+# dwc3 controller — loads BEFORE pdphy: pdphy needs its ext_vbus_* exports,
+# and pdphy's later registration is the deferred-probe replay dwc3 waits for
+dwc3.ko
+usb-dwc3-msm.ko
+# PHYs
+phy-generic.ko
+phy-msm-ssusb-qmp.ko
+phy-msm-snps-hs.ko
+# typec + extcon supplier: usb-pdphy (LAST — depends on usb-dwc3-msm)
+roles.ko
+tcpm.ko
+qpnp_pdphy.ko
+EOF
+fi
+if [[ "${USBADB}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-adb"
+  echo "note: USBADB=1 → ffs.adb console (first test with HOLD=1)"
+fi
+if [[ "${USBDIAG}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-diag"
+  echo "note: USBDIAG=1 → module load + extcon/deferred dumps + drivers_probe kick, then handoff"
+fi
+# USBPROBE=1: load modules + check UDC, then HOLD + paint the verdict on
+# screen (green = UDC appeared, red = no UDC). ramoops is dead on this unit,
+# so in HOLD mode the screen is the only observable channel.
+USBPROBE="${USBPROBE:-0}"
+if [[ "${USBPROBE}" == "1" ]]; then
+  : >"${WORK}/aginxos/usb-probe"
+  echo "note: USBPROBE=1 → UDC probe, HOLD + screen verdict (green/red)"
 fi
 
 echo "==> repack vendor ramdisk (lz4 -l)"
