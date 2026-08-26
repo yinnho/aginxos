@@ -10,7 +10,7 @@
 //! Default with only `hold`: mount basics + heartbeat (safest bring-up).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -177,6 +177,91 @@ fn create_block_nodes() -> usize {
     made
 }
 
+/// GPT partition entries of one UFS LUN: (name, first_lba). All six LUNs use
+/// 4096-byte logical blocks (probed 2026-08-27); entries start at LBA2 and are
+/// 128 bytes each, name UTF-16LE at offset 56, first_lba u64 LE at offset 32.
+fn gpt_entries(disk: &str) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    let Ok(mut f) = File::open(format!("/dev/{disk}")) else {
+        return out;
+    };
+    if f.seek(SeekFrom::Start(2 * 4096)).is_err() {
+        return out;
+    }
+    let mut buf = [0u8; 128 * 128];
+    if f.read(&mut buf).unwrap_or(0) != buf.len() {
+        return out;
+    }
+    for chunk in buf.chunks_exact(128) {
+        if chunk[..16].iter().all(|&b| b == 0) {
+            break; // first unused entry ends the array
+        }
+        let mut units = Vec::new();
+        for pair in chunk[56..].chunks_exact(2) {
+            if pair == [0, 0] {
+                break;
+            }
+            units.push(u16::from_le_bytes([pair[0], pair[1]]));
+        }
+        let name = String::from_utf16_lossy(&units);
+        let first_lba = u64::from_le_bytes(chunk[32..40].try_into().unwrap());
+        out.push((name, first_lba));
+    }
+    out
+}
+
+/// Android-style /dev/block/by-name symlinks: GPT name -> /dev/<disk><N>.
+/// A GPT first_lba is in 4096-byte units; /sys .../<part>/start is in
+/// 512-byte units, so part start == first_lba * 8.
+fn create_by_name_links() -> usize {
+    let _ = fs::create_dir_all("/dev/block/by-name");
+    let mut made = 0usize;
+    // whole disks = /proc/partitions names with no digit suffix
+    let disks: Vec<String> = fs::read_to_string("/proc/partitions")
+        .map(|c| {
+            c.lines()
+                .skip(2)
+                .filter_map(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    (f.len() == 4 && !f[3].contains(|c: char| c.is_ascii_digit()))
+                        .then(|| f[3].to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for disk in disks {
+        // map start-sector (512 units) -> partition name, from /sys/block
+        let mut by_start: Vec<(u64, String)> = Vec::new();
+        if let Ok(entries) = fs::read_dir(format!("/sys/block/{disk}")) {
+            for e in entries.flatten() {
+                let part = e.file_name().into_string().unwrap_or_default();
+                if !part.starts_with(&disk) || part.len() <= disk.len() {
+                    continue;
+                }
+                if let Ok(start) =
+                    fs::read_to_string(format!("/sys/block/{disk}/{part}/start"))
+                {
+                    if let Ok(s) = start.trim().parse::<u64>() {
+                        by_start.push((s, part));
+                    }
+                }
+            }
+        }
+        for (name, first_lba) in gpt_entries(&disk) {
+            let Some((_, part)) = by_start.iter().find(|(s, _)| *s == first_lba * 8) else {
+                continue;
+            };
+            let target = format!("/dev/{part}");
+            let link = format!("/dev/block/by-name/{name}");
+            let _ = fs::remove_file(&link);
+            if std::os::unix::fs::symlink(&target, &link).is_ok() {
+                made += 1;
+            }
+        }
+    }
+    made
+}
+
 /// Storage bring-up as a PID 1 responsibility: load the UFS chain, wait for
 /// the LUN scan, expose the partitions. misc (sda3) becomes writable from a
 /// clean boot — no manual insmod.
@@ -202,7 +287,15 @@ fn bring_up_storage() {
         return;
     }
     let made = create_block_nodes();
-    klog(&format!("storage up: ufs mods ok={ok}, {made} block nodes"));
+    let links = create_by_name_links();
+    let misc = if Path::new("/dev/block/by-name/misc").exists() {
+        "by-name ok"
+    } else {
+        "by-name MISSING misc"
+    };
+    klog(&format!(
+        "storage up: ufs mods ok={ok}, {made} block nodes, {links} by-name links ({misc})"
+    ));
 }
 
 fn load_modules_from_list() {
