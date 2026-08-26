@@ -629,3 +629,51 @@ needs button combos: `adb reboot bootloader` → flash
 `boot/stock-vendor_boot.img` (or re-run v32 via
 `USBADB=1 HOLD=1 SPLASH=0 MODULES=0 ./scripts/flash-early-splash.sh`).
 
+
+## v33: aginxos-init is PID 1; reboot-to-fastboot dead ends mapped (2026-08-27)
+
+**ptmx root cause (pre-v33, live on v32):** from the rdinit console,
+`adb reboot bootloader` and interactive `adb shell` fail with
+`error: failed to create pty master: No such file or directory` — the
+error is *device-side*: adbd cannot open `/dev/ptmx`. The rdinit `/dev`
+never had one (tmpfs + mknod'd nodes since v29; devtmpfs won't mount on
+this kernel). Live fix (mkdir `/dev/pts`, mount devpts, mknod ptmx) made
+one-shot `adb shell` still work — the pty was never the blocker for
+those. Permanent fix in v33: `ensure_devpts()` in the trampoline, run
+before adbd; kmsg shows `devpts mounted, /dev/ptmx ready`.
+
+**`adb reboot` is dead in the rdinit env (with ptmx present too):** A14
+adbd reboots by writing `sys.powerctl=reboot,...` through the init
+property service (`libc: Using old property service protocol`); with no
+init running, the write goes nowhere and the adb client just hangs
+(2-min timeout observed). Staging the property *area* (v32) satisfies
+bionic *reads* — there is still no *writer* on the socket side.
+
+**`toybox reboot bootloader` loses the mode string:** the kernel reboots
+but lands in normal boot (observed twice: `FASTBOOT: none`, then
+`ADB-BACK: aginxosredfin device`). Environment facts from this console:
+`/proc/partitions` lists only ram0-15 (no UFS/storage driver → the misc
+partition BCB is unwritable); `/proc/device-tree` is absent; `/lib/modules`
+has no pm8150-pon / qcom,pon / reboot-mode / nvmem-reboot-mode modules;
+`insmod qcom-spmi-sdam.ko` loads and registers
+(`SDAM base=0xb100 size=128 registered successfully`) but a following
+`reboot bootloader` *still* boots normally — no reboot-mode consumer
+binds. **Corrects the v32 closing note: recovery from a HOLD image does
+need button combos — manual Power+VolDown is the only proven fastboot
+entry from this env** (used again this session to flash v33).
+
+**v33 (PID 1 takeover — goal state reached 2026-08-27):** flashed
+`USBADB=1 HOLD=1 SPLASH=0 MODULES=0`. The parent waits out the usb
+console child's setup window, then kmsg:
+`usb child exited code=0` (t=29.2 s) → `HOLD (no handoff)` →
+`exec aginxos-init (PID 1 takeover)` → `aginxos-init: start v0.2.0
+pid=1 hold=true` → `basics ok` → `HOLD — aginxos-init is PID 1` →
+`hold heartbeat 1` (t=39.2 s). `ps`: **PID 1 = aginxos-init** (S),
+adbd (PID 272) reparented to it, its `sh`/`ps` children under adbd,
+**no zombies** (the reaper works — adbd's one-shot shells exit and are
+collected). Console stays authorized root throughout. First real
+AginxOS userspace as init.
+
+Device state (2026-08-27, end of session): **left running the v33 test
+image** (HOLD, aginxos-init as PID 1, authorized root adb console alive).
+Restore needs manual Power+VolDown → flash `boot/stock-vendor_boot.img`.
