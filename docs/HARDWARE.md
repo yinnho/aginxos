@@ -677,3 +677,63 @@ AginxOS userspace as init.
 Device state (2026-08-27, end of session): **left running the v33 test
 image** (HOLD, aginxos-init as PID 1, authorized root adb console alive).
 Restore needs manual Power+VolDown → flash `boot/stock-vendor_boot.img`.
+
+## UFS storage up; software fastboot route found (v34, 2026-08-27)
+
+**Correction to the two entries above (2026-08-27, same day, later):** the
+`toybox reboot` / `toybox reboot bootloader` "lands in normal boot" results
+were **invalid — no reboot ever happened**. The ramdisk toybox build has no
+reboot applet (`toybox: Unknown command reboot`, rc=127) and the earlier
+pipelines swallowed stderr. The 868 s "post-reboot" uptime was the same
+unbroken session. Retracted: "mode string lost", "SDAM doesn't bind" —
+untested at the time. (The sdam module-load observation itself stands.)
+
+**UFS bring-up (live insmod, no flash):** stock ships
+`ufshcd-core/ufshcd-pltfrm/ufs_qcom` plus the whole PHY family. The working
+chain (order from modinfo `depends=`, all rc=0, ~2 s total):
+`phy-qcom-ufs → phy-qcom-ufs-qmp-v4 → phy-qcom-ufs-qmp-v4-lito (lito =
+SM7250) → ufshcd-core → ufshcd-pltfrm → ufs_qcom`. Probe log: QC ICE 3.1.81
+found, PHY gear 3 / 2 lanes / FAST MODE, `SKhynix H9HQ16AFAMMDAR` with 6
+LUNs → sda–sdf. No panic. /dev has no nodes for them (tmpfs + no ueventd) —
+mknod from /proc/partitions (79 nodes).
+
+**Partition map (GPT read from each LUN, pulled + parsed on host):** GPT
+LBA units on sda are **4096-byte** (first_lba × 8 = 512-unit /sys start).
+misc = sda3 (1 MiB). boot_a/b, vendor_boot_a/b, dtbo, modem, klog,
+metadata, vbmeta_system, super, userdata all on sda. sdb/sdc = xbl(+config)
+a/b, sdd = cdt/ddr, sdf = modemst/fsg/fsc, sde = the 42-partition firmware
+LUN (aop/tz/hyp/abl/keymaster/.../devinfo/splash/logfs/uefivarstore).
+
+**BCB route dead:** wrote `bootloader`, then `boot-fastboot` into the
+bootloader_message.command field of misc (sda3) — both boots proceeded
+normally (tested with RESTART2 and with plain RB_AUTOBOOT). This ABL does
+not honor BCB for fastboot entry. misc was restored to its original
+content afterwards (command field zeros; the vendor area at offset 2048
+holding `theme-dark` untouched).
+
+**RESTART2("bootloader") needs msm-poweroff loaded:** with no handler the
+mode string goes nowhere (normal boot, `androidboot.bootreason=reboot`).
+`CONFIG_POWER_RESET_QCOM=m` → `msm-poweroff.ko`, whose stock `depends=`
+chain is: `qcom_hwspinlock` (this is what unblocks smem's *deferred probe
+pending* on its hwlock supplier — without it msm_minidump fails with
+"SMEM is not initialized") → `smem_state` → `msm_minidump` → `watchdog_v2`
+→ `qpnp-power-on` (PON driver, SPMI; registers power-on reason input
+device) → `msm-poweroff` (registers the restart handler;
+`set_restart_msg`). With the chain live:
+**`reboot(2) RESTART2 "bootloader"` → fastboot in ~6 s.**
+
+**v34 (baked in):** modules.usb grew 52 → 58 (hwspinlock inserted *before*
+smem; smem_state/minidump/watchdog/qpnp-power-on/msm-poweroff appended) —
+`modules ok=58 fail=0`, restart handler registered by t=1.02 s. aginxos-init
+v0.3.0 gained `reboot [mode]` (raw SYS_reboot with RESTART2 mode string).
+Verified from a clean v34 boot: `/aginxos/aginxos-init reboot bootloader`
+→ fastboot in 6 s, serial confirmed. PID 1 takeover unchanged (v0.3.0 as
+PID 1, takeover at t=29.3 s after the usb child's window). **This
+supersedes every earlier "manual Power+VolDown only" note: recovery is
+now one adb command from any HOLD image.**
+
+Device state (2026-08-27, end of session): **left running the v34 test
+image** (HOLD, aginxos-init v0.3.0 as PID 1, authorized root adb, reboot
+chain live). misc partition restored to original. Recovery:
+`adb shell /aginxos/aginxos-init reboot bootloader` → flash
+`boot/stock-vendor_boot.img`.
