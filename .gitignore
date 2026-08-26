@@ -30,3 +30,10 @@ boot/initramfs/aginxos-probe
 boot/initramfs/busybox
 boot/initramfs/trampoline
 boot/initramfs/first_stage_init
+boot/initramfs/aginxos-splash
+
+# Local factory image for flash-all recovery — never commit or redistribute
+.factory/
+
+# Scratch build output
+out/
