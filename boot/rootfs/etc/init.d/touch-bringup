@@ -38,9 +38,20 @@ echo /vendor_a/firmware > /sys/module/firmware_class/parameters/path 2>/dev/null
 # without them dsi_display defers forever and sec_ts dies at parse dt.
 for m in spi-geni-qcom rpmsg_core qrtr qrtr-smd ion-alloc qseecom \
          hdcp_qseecom msm_hdcp msm_ext_display llcc-slice dispcc-lito \
-         qpnp-amoled-regulator msm_drm; do
+         qpnp-amoled-regulator; do
   insmod "$R/$m.ko" 2>/dev/null && echo "insmod $m (ramdisk half) ok"
 done
+
+# msm_drm with the panel variant the bootloader detected (dvt): the
+# cmdline param (msm_drm.dsi_display0=...dvt..._cmd:) never matches a DT
+# node — driver falls back to the PLAIN s6e3hc2 node, which lacks the
+# google,mdss-dsi-te2-* TE2 config the dvt panel needs → panel never
+# asserts TE (TE_GPIO irq count stays 0) → ESD check kills it at the first
+# mode set (PANEL_DEAD, 2026-08-27). Pass the node with an explicit config
+# index at insmod so the dvt node binds.
+insmod "$R/msm_drm.ko" \
+  dsi_display0=qcom,mdss_dsi_s6e3hc2_dvt_dsc_1080p_cmd:0 2>/dev/null \
+  && echo "insmod msm_drm (ramdisk half, dvt panel) ok"
 
 for m in qmi_helpers touch_offload heatmap touchscreen_tbn; do
   insmod "$M/$m.ko" 2>/dev/null
@@ -73,10 +84,21 @@ while [ $n -lt 120 ]; do
     mdev -s
     echo "touchscreen registered + nodes created (t+$((n*2))s) $(date)"
     grep -A1 sec_touchscreen /proc/bus/input/devices
+    # Green panel = userspace alive + touch up. Nothing else ever draws, so
+    # without this the panel is black once the bootloader's logo dies (the
+    # connector sits at enabled=disabled until this mode set — observed
+    # 2026-08-27; the logo is cont-splash scanout, not KMS).
+    # MUST stay resident (hold): when the painter exits it drops DRM master
+    # and dsi_backlight's early/late-dpms hooks turn the panel right back
+    # off — the 02:29 boot showed a green flash then black. A daemon
+    # holding the fd keeps the mode set alive.
+    nohup /bin/splash 0000ff00 hold >/dev/null 2>&1 &
+    echo "splash daemon started (green, holding DRM master) $(date)"
     echo "=== done $(date) ==="
     exit 0
   fi
   sleep 2
 done
 echo "touchscreen never registered $(date)"
+/bin/splash 00ff0000  # red = alive but touch failed
 dmesg | grep -E "sec_ts|sec_input" | tail -8

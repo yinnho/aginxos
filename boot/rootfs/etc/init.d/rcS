@@ -23,9 +23,23 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null
 hostname aginxos
 ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null
 
+# Cross-boot forensics: the kernel has no pstore, so a death (PMIC power cut
+# vs kernel hang) leaves evidence only if something was already writing it
+# to the ext4 /var. The 2026-08-27 morning deaths were diagnosed as UVLO
+# power cuts exactly because a kmsg follower was running (last line:
+# "PMIC input: code=116"). Heartbeat stamps uptime every 5s — where it
+# stops vs when USB died discriminates hang-vs-power on the next death.
+(cat /dev/kmsg > /var/kmsg-follow.log 2>/dev/null) &
+(while :; do
+  echo "$(date +%H%M%S) up=$(cut -d. -f1 /proc/uptime)" >> /var/heartbeat.log
+  sleep 5
+done) &
+
 echo "aginxos: rcS done, rootfs up on userdata" > /dev/kmsg
 date > /etc/.rcs-ran
 
 # Touch bring-up (M3) — backgrounded: it waits out the ~60s panel
-# registration, and the console must not block on it.
+# registration, and the console must not block on it. On success it paints
+# the panel green (userspace alive — without a paint the panel stays black:
+# nothing udevs, nothing draws).
 /etc/init.d/touch-bringup &

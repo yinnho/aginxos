@@ -1067,3 +1067,57 @@ touch verified two boots in a row). Root adb as `aginxosredfin`. Recovery
 unchanged: `adb shell /aginxos/aginxos-init reboot bootloader` →
 `scripts/restore-vendor-boot.sh`; full Android restore = flash-all from
 `.factory/`.
+
+## M3b: panel painting — green splash persistent on screen (2026-08-27)
+
+The screen now lights green (white-bordered) at boot and stays. Full chain
+of what was wrong, each step observed:
+
+- **Black screen ≠ dead system.** The panel showed the bootloader's Google
+  logo via *cont-splash scanout* — independent of KMS — then went black
+  when that stopped, while the OS kept running (adb, touch, backlight all
+  alive). Nobody had ever done a KMS mode set: `card0-DSI-1` sat at
+  `status=connected, enabled=disabled`, with valid modes present
+  (`1080x2340x60x60948cmd`, `90x94812cmd` — command-mode DSI).
+- **v1 painter failed on two counts** (boot/rootfs/src/splash2.c v1):
+  (a) GETRESOURCES rejects a second call when count_fbs/encoders are
+  nonzero with null pointers — zero the counts; (b) it searched CRTCs for
+  `mode_valid` (never true here) and fell back to a *synthetic* video-mode
+  timing that a cmd-mode panel refuses. v2 probes connectors with the
+  encoder-list pointer set (without it the kernel reports enc=0) and takes
+  the connector's real mode; skip the Virtual connector (type 15, garbage
+  modes) — the panel is conn 29 (type 16 DSI) / enc 28 / crtc 105.
+- **Wrong panel variant = dead panel.** The bootloader detects the panel
+  and appends `msm_drm.dsi_display0=qcom,mdss_dsi_s6e3hc2_dvt_dsc_1080p_cmd:`
+  to the cmdline — but the driver's bind fell back to the PLAIN
+  `s6e3hc2_dsc_1080p_cmd` DT node (no match on the cmdline string; param
+  format is `<node>:<configX>`). The DT diff between the nodes is exactly
+  two properties: `google,mdss-dsi-te2-info` and
+  `google,mdss-dsi-te2-lp-threshold` — only dvt has them. With the plain
+  node bound, the first mode set died at post-enable: `TE check failed →
+  esd ... PANEL_DEAD` and `wait_for_idle: -110` (sticky — connector torn
+  down, no re-bind possible: the driver suppresses bind attrs; debugfs is
+  not compiled in). `/proc/interrupts` showed the `TE_GPIO` (msmgpio 10)
+  registered with count 0 — the panel never asserted TE.
+  Fix: insmod msm_drm with the variant explicitly:
+  `insmod msm_drm.ko dsi_display0=qcom,mdss_dsi_s6e3hc2_dvt_dsc_1080p_cmd:0`
+  → bind message shows dvt, `cont_splash enabled in 1 of 1 display(s)`
+  appears (new), and the mode set goes through clean.
+- **The painter must stay resident.** With dvt bound, SETCRTC rc=0 and the
+  green really hit glass (user saw it) — but the painter exiting drops DRM
+  master, and dsi_backlight's early/late-dpms hooks turned the panel right
+  back off (`dsi_backlight_early_dpms ... state:0x0` 28 ms after SETCRTC):
+  green flash, then black. Fix: run `/bin/splash <color> hold` as a daemon
+  (`nohup ... &` from touch-bringup) — it sleeps forever holding the fd.
+  Result: `enabled/On`, splash pid alive, user-confirmed persistent green.
+- TE count is still 0, yet no ESD/PANEL_DEAD with dvt bound (minutes
+  stable) — the dvt node's ESD path evidently doesn't depend on that TE
+  line. Watch it; if the panel ever dies in service, ESD is the suspect.
+
+Recipe: `boot/rootfs/src/splash2.c` (zig cc → /bin/splash at image build),
+touch-bringup launches the green daemon after touch registers; rcS runs a
+kmsg follower (`/var/kmsg-follow.log`) and a 5 s heartbeat
+(`/var/heartbeat.log`) so the next full-device loss discriminates
+power-cut vs hang (the afternoon losses had neither running — battery
+theory stands from the morning PMIC code=116 forensics, unconfirmed for
+the afternoon ones).

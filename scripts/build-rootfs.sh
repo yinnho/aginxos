@@ -54,6 +54,17 @@ for m in ${MODULES}; do
   cp "${RAMDISK}/lib/modules/${m}.ko" "${TREE}/lib/modules/"
 done
 
+# DRM splash painter — the panel stays black without an explicit mode set
+# (the bootloader logo is cont-splash scanout, not KMS; connector sits at
+# enabled=disabled). touch-bringup paints green when touch is up. Built with
+# the same zig toolchain as the trampoline.
+ZIG="$(command -v zig || true)"
+test -z "${ZIG}" && ZIG=/opt/homebrew/bin/zig
+test -x "${ZIG}" || { echo "zig not found (needed for splash2)" >&2; exit 1; }
+mkdir -p "${TREE}/bin"
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/splash" "${RECIPE}/src/splash2.c"
+
 # Our pieces.
 mkdir -p "${TREE}/bin" "${TREE}/sbin" "${TREE}/aginxos"
 cp "${RECIPE}/busybox" "${TREE}/bin/busybox"
