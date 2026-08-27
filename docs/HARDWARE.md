@@ -930,3 +930,122 @@ is our ext4 — Android userdata is gone). Root adb authorized, serial string
 `aginxosredfin`. Recovery: `adb shell /aginxos/aginxos-init reboot bootloader`
 → `scripts/restore-vendor-boot.sh` (back to stock vendor_boot, still our
 userdata); full Android restore = flash-all from `.factory/`.
+
+## M3: touch input proven on device (2026-08-27)
+
+Touch works. The full chain — SPI controller, qrtr, display stack through
+msm_drm, panel registration, then the vendor-side touch modules — was loaded
+live from an adb shell in the AginxOS rootfs, the Samsung controller
+registered as `sec_touchscreen`, and a physical swipe/drag produced 400
+input events captured to `/dev/input/event2` and decoded host-side (4 touch
+downs, BTN_TOUCH edges, MT slots with tracking ids, X 967–2036 in the 2×
+precision space of the 1080-wide panel, Y 26–1001 native, pressure values,
+SYN_REPORT framing). Every claim below is from probe output, kmsg, or the
+captured events.
+
+**The hardware (DT + kmsg, not datasheets):** the touchscreen is a Samsung
+S6SY79X on **SPI** (`spi@880000`, address spi0.0) — not i2c. DT node has
+`compatible = "sec,sec_ts"`, `sec,firmware_name = s6sy79x.bin`, gpios on the
+TLMM phandle 0x19 (irq 9, reset 8, switch 35), `avdd-supply` from
+rpmh-regulator-ldoa17, and — decisive for bring-up order — `sec,panel_map`
+pointing at the three DSI panel nodes (s6e3hc2 dvt/evt/gamma): sec_ts probe
+defers (-517) until msm_drm registers a panel. Kernel 4.19.278;
+`CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_v27=y` is a red herring (no synaptics node
+exists) — the real driver is the vendor module `sec_touch.ko`.
+
+**Module geography (probed):** the vendor ramdisk's `/lib/modules` (218
+modules) holds the display and qrtr stacks; the *late* modules —
+`sec_touch.ko`, `touch_offload.ko`, `heatmap.ko`, `touchscreen_tbn.ko`,
+`qmi_helpers.ko`, plus the WLAN pair (`wlan.ko`, `google_wlan_mac.ko`) and
+firmware — live in `/vendor_a` (`/vendor_a/lib/modules`,
+`/vendor_a/firmware`). redfin has **no vendor_dlkm** in the super metadata;
+the rootfs world reaches these via the super mounts from v0.6.0.
+
+**Validated load order** (insmod from the rootfs shell, this exact sequence
+registered the touchscreen):
+
+    spi-geni-qcom rpmsg_core qrtr qrtr-smd ion-alloc qseecom hdcp_qseecom
+    msm_hdcp msm_ext_display llcc-slice dispcc-lito qpnp-amoled-regulator
+    msm_drm   →   (~60 s: dsi_prop fw fallback = panel registration)
+    qmi_helpers touch_offload heatmap touchscreen_tbn sec_touch
+
+Lessons paid for along that order:
+
+- **qrtr before sec_touch is mandatory.** With qrtr absent, `qmi_handle_init`
+  returns -97 and sec_ts then *dereferences the ERR_PTR* → kernel OOPS
+  (paging request ffffffffffffffbf). After the OOPS the device was half-dead:
+  sysfs `unbind` of spi0.0 wedged forever; only a reboot clears it.
+- **qpnp-amoled-regulator + dispcc-lito before msm_drm** (panel rails +
+  clocks). Without them dsi_display defers forever, no panel ever registers,
+  and sec_ts dies at DT parse.
+- **Deferred probe is our friend:** insmodding sec_touch *before* panel
+  registration just defers (-517) and the kernel retries it on its own when
+  the provider appears — no blind sleeps needed.
+- **dsi_prop:** msm_drm requests `dsi_prop` firmware that exists nowhere on
+  this unit (absent on stock Android too); the request waits out the 60 s
+  sysfs fallback, and *that timeout is what releases panel registration*.
+  Benign — budget for it.
+
+**Firmware loading:** the direct kernel path never fires on this kernel even
+with `/sys/module/firmware_class/parameters/path` pointed at
+`/vendor_a/firmware` — requests land in the sysfs fallback
+(`/sys/class/firmware/<name>/`). The feeder that works: poll for the sysfs
+dir, then `echo 1 > loading; cat fw > data; echo 0 > loading`. `s6sy79x.bin`
+must be fed this way or sec_ts's post-probe fw update times out.
+
+**/dev/input:** nothing udevs in our world — the input tree only exists
+after `mdev -s` runs *after* the touchscreen registers (rcS runs one early
+pass; the touch script runs another post-registration). Symptom when
+forgotten: `dd`/reads on `/dev/input/event2` fail with silent ENOENT (the
+directory itself is missing).
+
+**Why the battery dies on the Mac cable (observed, not yet fixed):** the
+64-module usb base already loads the full charging chain (pmic-voter,
+p9221, qpnp-battery, of_batterydata, qpnp-smb5-charger, tcpm, qpnp_pdphy,
+fsa4480) — and during the M3 session kmsg shows it alive and working:
+`SMB5 status - usb:present=1 type=6 batt:present=1 health=1 charge=3`,
+`QPNP SMB5 probed successfully`, usbpd + tcpm registered. type=6 is a
+BC1.2-classified port (CDP), i.e. 5 V ≤1.5 A ≈ 7.5 W in. What is NOT
+loaded is the Google policy layer (`google_charger.ko`, `google-battery.ko`
+sit in the ramdisk unused). Net effect observed twice: plugged into the Mac
+with the splash backlight at max and the SoC busy, the pack still drains to
+the PMIC UVLO cut. Practical rule until quantified: charge the device
+powered off from a real PD charger (PMIC charges autonomously, no OS
+needed); a Mac port trickle-charges a powered-off unit but cannot keep the
+OS running. Unmeasured: actual `current_now` in vs out — worth a
+power_supply readout in rcS when the device is back.
+
+**Reboot escape (re-confirmed):** only `/aginxos/aginxos-init reboot` works
+reliably; `adb reboot` hangs on the ptmx gap and busybox `reboot`/`reboot -f`
+are no-ops in the rootfs world.
+
+**Battery-death forensics:** two mid-session black screens were the battery,
+not the kernel — kmsg ends with `PMIC input: code=116 ... os=1` (PMIC
+power-cut on discharge, UVLO) with no panic anywhere. A dark phone right
+after a flash is *not* evidence of a bad image; check whether USB shows the
+device at all before bisecting.
+
+**MODULES_FULL does not boot (observed):** packing the trampoline with
+`MODULES_FULL=1` (entire modules.load, 218 entries) produced a boot that
+never reached the adb console and dropped the device to fastboot with the
+slot retry counter burned — real resets, not a hang. Not bisected module by
+module; instead abandoned: msm_drm sits at line 211/218, so the stock
+"through msm_drm" loadfile mode is nearly the same list and just as risky.
+The shipping design is the 64-module USB/storage base in the trampoline
+(modules.usb) plus the touch chain loaded from the rootfs world — the exact
+path proven live above.
+
+**Integration state (not yet observed):** `scripts/build-rootfs.sh` now
+stages the 13 ramdisk-half modules into `/lib/modules` in the image and
+`/etc/init.d/touch-bringup` (backgrounded from rcS) loads the full chain
+with the firmware feeder and post-registration `mdev -s`. First boot of that
+image was flashed 2026-08-27 but **not observed** — the device showed
+nothing on USB 65 s after `fastboot reboot` (no adb, no fastboot fallback;
+consistent with the battery deaths observed the same day, unverified) and is
+on the charger. Verification pending: boot, then `/var/touch.log` should
+show the chain completing with zero manual steps.
+
+Device state (2026-08-27, mid-experiment): vendor_boot_a = test image
+(HOLD+SPLASH+USBADB+ROOTFS, no modules flag), userdata = rootfs with the
+touch chain staged, slot a active, device powered off/charging — boot of
+this image unverified.
