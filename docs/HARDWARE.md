@@ -1038,14 +1038,32 @@ path proven live above.
 **Integration state (not yet observed):** `scripts/build-rootfs.sh` now
 stages the 13 ramdisk-half modules into `/lib/modules` in the image and
 `/etc/init.d/touch-bringup` (backgrounded from rcS) loads the full chain
-with the firmware feeder and post-registration `mdev -s`. First boot of that
-image was flashed 2026-08-27 but **not observed** — the device showed
-nothing on USB 65 s after `fastboot reboot` (no adb, no fastboot fallback;
-consistent with the battery deaths observed the same day, unverified) and is
-on the charger. Verification pending: boot, then `/var/touch.log` should
-show the chain completing with zero manual steps.
+with the firmware feeder and post-registration `mdev -s`.
 
-Device state (2026-08-27, mid-experiment): vendor_boot_a = test image
-(HOLD+SPLASH+USBADB+ROOTFS, no modules flag), userdata = rootfs with the
-touch chain staged, slot a active, device powered off/charging — boot of
-this image unverified.
+**Integration observed (2026-08-27, two consecutive boots):** after charge
+recovery, the image booted and `/var/touch.log` shows the whole chain
+completing with zero manual steps — all 13 ramdisk-half insmods ok, feeder
+fed `s6sy79x.bin` at try 63 (the dsi_prop 60 s timeout releases panel
+registration, then sec_ts's deferred probe fires), `sec_touchscreen`
+registered at **t+64 s** from rcS, nodes created via `mdev -s`. A physical
+swipe captured from `/dev/input/event2` right after boot decoded as a clean
+single-finger drag (BTN_TOUCH, slot #0, smooth position trace, pressure
+36–45, **200 Hz report rate**). The earlier "nothing on USB" scare after
+this flash was the battery again, not the image.
+
+Two follow-ups noticed, not yet addressed: the panel keeps showing the
+bootloader's Google logo — msm_drm now loads in the rootfs phase, *after*
+the trampoline's splash sequence ran with no DRM available, so nothing ever
+paints (backlight is on, `card0-DSI-1` registered; painting needs a
+userspace DRM client in the rootfs). And the pack still drained to the PMIC
+cut while on the Mac despite `usb` psy reporting 5.17 V / current_max 3 A —
+no `battery` psy exists (that's `google-battery.ko`, not loaded), so net
+flow is unmeasurable from userspace as built.
+
+Device state (2026-08-27, end of session): **running the AginxOS rootfs
+with boot-integrated touch** (vendor_boot_a = HOLD+SPLASH+USBADB+ROOTFS, no
+modules flag; userdata = rootfs with the touch chain staged; slot a active,
+touch verified two boots in a row). Root adb as `aginxosredfin`. Recovery
+unchanged: `adb shell /aginxos/aginxos-init reboot bootloader` →
+`scripts/restore-vendor-boot.sh`; full Android restore = flash-all from
+`.factory/`.

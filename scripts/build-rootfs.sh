@@ -40,6 +40,20 @@ for f in default.prop prop.default *_contexts; do
   cp "${RAMDISK}"/${f} "${TREE}/" 2>/dev/null || true
 done
 
+# Kernel modules for the touch/display chain (M3) — the ramdisk half. The
+# vendor_boot base loads only the 64-module USB/storage set (modules.usb);
+# the full modules.load load panics this kernel (observed 2026-08-27, retry
+# counter burned), so the touch chain is loaded from the rootfs world by
+# /etc/init.d/touch-bringup, in the order proven live. Same 13 .ko files as
+# the ramdisk holds — copied from the local unpack (never committed, §7).
+MODULES="spi-geni-qcom rpmsg_core qrtr qrtr-smd ion-alloc qseecom \
+hdcp_qseecom msm_hdcp msm_ext_display llcc-slice dispcc-lito \
+qpnp-amoled-regulator msm_drm"
+mkdir -p "${TREE}/lib/modules"
+for m in ${MODULES}; do
+  cp "${RAMDISK}/lib/modules/${m}.ko" "${TREE}/lib/modules/"
+done
+
 # Our pieces.
 mkdir -p "${TREE}/bin" "${TREE}/sbin" "${TREE}/aginxos"
 cp "${RECIPE}/busybox" "${TREE}/bin/busybox"

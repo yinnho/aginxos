@@ -580,7 +580,10 @@ fn map_and_mount(
 
 /// Parse super and expose its big _a sub-partitions as dm-linear + ext4 ro
 /// mounts at /system_a, /vendor_a, /product_a (live-proven 2026-08-27 with
-/// the same recipe via a scratch C tool — see HARDWARE.md).
+/// the same recipe via a scratch C tool — see HARDWARE.md). The vendor_a
+/// mount matters most now: redfin keeps its late kernel modules
+/// (sec_touch.ko, wlan.ko) in the vendor partition, not a vendor_dlkm —
+/// probed: vendor_dlkm_a does not exist in the super metadata.
 fn bring_up_super() {
     const ALLOW: &[&str] = &["system", "vendor", "product", "system_ext"];
     let Some(super_dev) = fs::read_link("/dev/block/by-name/super")
@@ -1300,8 +1303,11 @@ fn main() {
     let do_modules = flag("/aginxos/load-modules");
     let do_splash = flag("/aginxos/splash");
     let do_full_modules = flag("/aginxos/load-modules-full");
-    let do_super = flag("/aginxos/super");
     let do_rootfs = flag("/aginxos/rootfs");
+    // The rootfs world needs vendor_a from super (sec_touch.ko, wlan.ko live
+    // there), so rootfs implies super. Probed 2026-08-27: M3's touch chain
+    // loads its vendor-side modules from the carried-over /vendor_a mount.
+    let do_super = flag("/aginxos/super") || do_rootfs;
     let do_storage = flag("/aginxos/storage") || do_super || do_rootfs;
     // Immediate handoff without mounting (cleanest path to Android).
     let handoff_only =

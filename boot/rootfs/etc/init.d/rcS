@@ -2,8 +2,11 @@
 # AginxOS rcS - one-shot setup, runs before the respawns in inittab.
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/system/bin
 
-# Fill in the full applet set (image ships only a curated symlink list).
+# Fill in the full applet set (image ships only a curated symlink list),
+# then populate /dev from sysfs — nothing udevs in our world, so input event
+# nodes and friends only exist after mdev runs.
 /bin/busybox --install -s /bin 2>/dev/null
+mdev -s 2>/dev/null
 
 # Host mke2fs -d stored the macOS build user (uid 501) as owner - the
 # filesystem is rw, so the first boot normalizes it for good.
@@ -22,3 +25,7 @@ ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null
 
 echo "aginxos: rcS done, rootfs up on userdata" > /dev/kmsg
 date > /etc/.rcs-ran
+
+# Touch bring-up (M3) — backgrounded: it waits out the ~60s panel
+# registration, and the console must not block on it.
+/etc/init.d/touch-bringup &
