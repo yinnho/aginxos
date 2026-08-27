@@ -1121,3 +1121,65 @@ kmsg follower (`/var/kmsg-follow.log`) and a 5 s heartbeat
 power-cut vs hang (the afternoon losses had neither running — battery
 theory stands from the morning PMIC code=116 forensics, unconfirmed for
 the afternoon ones).
+
+## M3c: battery gauge + charge policy proven on device (2026-08-27)
+
+Goal: 电量识别 — a readable battery percentage, plus the Google charging
+policy layer so the device actually charges while in AginxOS.
+
+Observed result (live session, then 2 integrated boots):
+
+- `/sys/class/power_supply/battery/capacity` = **100**, `status`
+  Charging, `voltage_now` ~4.32–4.33 V, `current_now` +0.9–1.1 A while on
+  the Mac's USB-C port, `temp` 33.x, `health` Good,
+  `charge_counter` 4187000.
+- Charging from the Mac port now measures ~1 A in — this **supersedes**
+  the earlier M3 note reading "net discharge off the Mac port": with the
+  full Google policy stack up, the input side negotiates properly.
+- Boot-integrated: rcS backgrounds `/etc/init.d/battery-bringup`, all 7
+  modules load, `battery` psy appears at t+2 s (kmsg: `eeprom ID=
+  82300172012, len=10, defer_cnt=0` → `QG Battery-profile loaded` →
+  `using SHUTDOWN_SOC @ PON ocv_uv=4422000uV soc=100`). Verified on two
+  consecutive reboots, same boot as the green touch splash.
+
+The chain (all 7 .ko from the vendor_boot ramdisk unpack, staged into
+/lib/modules by build-rootfs.sh):
+
+    google-bms → at24 → qpnp-qgauge → sm7250_bms →
+    google-battery → google_charger (→ qti_qmi_sensor, needs qmi_helpers)
+
+Two non-obvious findings, both observed:
+
+1. **qpnp-qgauge silently defers forever without the EEPROM driver.**
+   Its probe's first real call is `gbms_storage_read("batt_eeprom")`
+   (found by disassembling qpnp-qgauge.ko: the -517 site is the printk
+   right after that call — no inner error line ever prints). The
+   batt_eeprom storage entry is registered by **at24.ko** — Google's
+   at24 driver calls gbms_storage_register when it binds the physical
+   m24c08@50 EEPROM on i2c 98c000 (bus already up in the modules.usb
+   base; p9221 shares it). Without at24, dmesg shows only
+   `QG-K: qpnp_qg_probe: Failed to get battery type, rc=-517` retried a
+   few times, then silence — the deferred-probe list stops getting
+   kicked and the device sits unbound (`...:qpnp,qg` with no driver
+   symlink; the driver dir does have bind/unbind attrs, unlike
+   msm-dsi-display). With at24 loaded first, defer_cnt=0: qg probes on
+   its first attempt.
+2. **The name wiring in DT is literal.** `/soc/google,battery` says
+   `google,fg-psy-name = "bms"` — google_battery retries
+   `failed to get "bms" power supply` every ~270 ms until a psy with
+   exactly that name exists. qpnp-qgauge registers it. Meanwhile the
+   BMS node's own `google,psy-name = "sm7250_bms"` is what
+   sm7250_bms.ko registers (`resistance_id=9971`, `status=Charging` —
+   a working psy in its own right, but no `capacity`).
+
+Side notes from the debug: the pm7250b ADC5 (iio:device1) registers all
+21 DT channels — the therm/batt-id ones appear as `in_temp_*_raw`
+(`in_temp_bat_id_raw` = 2622 at the time), an `in_voltage` grep hides
+them. /sys/class/power_supply after bring-up: battery, bms, dc, main,
+pc_port, sm7250_bms, tcpm-source-psy-usbpd0, usb, wireless.
+
+Recipe: `boot/rootfs/etc/init.d/battery-bringup` (insmod order above,
+then a 60×2 s wait for the battery psy, logging one reading to
+/var/battery.log). The logged first reading can be empty — the psy node
+exists before google_battery's first poll populates it; the live sysfs
+reads are the real check.
