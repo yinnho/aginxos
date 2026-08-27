@@ -43,3 +43,7 @@ date > /etc/.rcs-ran
 # the panel green (userspace alive — without a paint the panel stays black:
 # nothing udevs, nothing draws).
 /etc/init.d/touch-bringup &
+
+# Battery bring-up (M3c) — backgrounded: google-battery keeps retrying
+# until the psy appears, so this script just feeds modules and waits.
+/etc/init.d/battery-bringup &

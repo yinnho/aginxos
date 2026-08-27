@@ -44,11 +44,18 @@ done
 # vendor_boot base loads only the 64-module USB/storage set (modules.usb);
 # the full modules.load load panics this kernel (observed 2026-08-27, retry
 # counter burned), so the touch chain is loaded from the rootfs world by
-# /etc/init.d/touch-bringup, in the order proven live. Same 13 .ko files as
+# /etc/init.d/touch-bringup, in the order proven live. Same .ko files as
 # the ramdisk holds — copied from the local unpack (never committed, §7).
 MODULES="spi-geni-qcom rpmsg_core qrtr qrtr-smd ion-alloc qseecom \
 hdcp_qseecom msm_hdcp msm_ext_display llcc-slice dispcc-lito \
 qpnp-amoled-regulator msm_drm"
+# Battery chain (M3c) — loaded by /etc/init.d/battery-bringup. Order
+# matters: google-bms provides gbms_storage, at24 registers the
+# batt_eeprom entry qpnp-qgauge's probe reads, qpnp-qgauge registers the
+# "bms" psy google-battery waits on. qti_qmi_sensor rides along last
+# (charge mitigation; needs qmi_helpers from the vendor half).
+MODULES="${MODULES} google-bms at24 qpnp-qgauge sm7250_bms google-battery \
+google_charger qti_qmi_sensor"
 mkdir -p "${TREE}/lib/modules"
 for m in ${MODULES}; do
   cp "${RAMDISK}/lib/modules/${m}.ko" "${TREE}/lib/modules/"
