@@ -1761,3 +1761,52 @@ Current failure mode with the legacy bind is purely network-side:
 START_NET → err 0x46 + call end reason 4 = **GENERIC_FADE**; NAS: reg 2
 (searching), cs/ps 2 (detached). `m7-leg2` racer deployed (legacy bind + APN
 ctlte + radio cycle every ~8 min = the m7-race2 window recipe).
+
+## M7 root cause found: modem latched in DMS operating_mode 5 SHUTTING_DOWN (2026-08-29 evening)
+
+The whole "WDS flavor" mystery of the afternoon has one root cause, found by
+querying DMS GET_OPERATING_MODE (0x2D, svc 2) on the stuck modem:
+TLV 0x01 = **05 = SHUTTING_DOWN** — the modem has believed the platform is
+powering off since boot Y's spontaneous crash (~20:05). That single state
+explains every refusal observed since: WDS BIND_MUX_DATA_PORT 0xA2, WDA
+SET_DATA_FORMAT, DMS SET_OPERATING_MODE 0x2E (u8 AND u32 forms), and PDC
+REGISTER all return err 0x0001 MALFORMED, while reads (NAS 0x24, UIM, DMS
+0x2D), the legacy WDS bind 0x2F and DPM 0x20/0x22 keep working. Boot Y
+(19:54, call up, 0xA2 + 0x2E accepted) was the last mode-0 modem.
+
+Correction of the "network-side flapping" theory above: the ~1 s CT
+registration windows were **self-made by the 0x2E LOW_POWER↔ONLINE cycles**
+(m7-race2's recipe). With 0x2E refused (mode 5), reg stays 02 (searching)
+forever — the m7-leg4 racer polled for 88 min without a single reg=01.
+
+Levers proven this session:
+
+- **Modem power-cycle without rebooting the AP** (new capability):
+  `echo 0 > /sys/kernel/boot_cdsp/boot` = graceful subsystem_put shutdown;
+  boot again by holding `/dev/subsys_modem` open
+  (`setsid sleep 86400 < /dev/subsys_modem &` — the open is the
+  subsystem_get that PIL-boots it). The echo-0 put is a NO-OP while
+  pm-service/pm-proxy hold votes: kill them first, or state stays ONLINE.
+  Holding fd open survives the adb shell that started it.
+- Mode 5 **survives** (falsified as the store): subsystem power cycle +
+  fresh PIL (state OFFLINE→ONLINE, WDS re-registers), pm-service/pm-proxy
+  killed before the fresh boot, a full AP crash→fastboot→reboot cycle, and
+  **a modemst1+modemst2 wipe + EFS rebuild from fsg** (rmt_storage served
+  modem_fs2; whole qrtr layout shifted: WDS@68, DMS@82, UIM@67). Backups of
+  the pre-wipe modemst1/2 in `.local/modemst-backup-20260829/` (md5
+  14f2b92c…, a7eaad0f…), copies on device at /data/modemst*.pre-wipe.img.
+  SIM still detected after the rebuild (UIM answers).
+- qrtr port layouts alternate between boots (WDS 62 vs 63 vs 68) — they are
+  registration-order jitter, NOT a flavor fingerprint; the 21:49 fresh boot
+  came up in the "62" layout with mode still 5.
+
+Second spontaneous crash: ~23:22 the device dropped to fastboot (slot retry
+drained again; recovered with `fastboot set_active a` + reboot). The racer
+was idle-cycling at that moment and reg had been 02 for 88 min — this crash
+is NOT correlated with call attempts. pstore empty (no ramoops console), so
+likely a hard SoC reset rather than a kernel panic. Unexplained so far.
+
+Next: boot stock Android once (stock boot.img + stock vendor_boot) and check
+whether its RIL stack registers / clears the mode — separates
+our-environment from device-persistent state (SMEM/PMIC/PDC/protect stores,
+which no lever above reaches).
