@@ -1610,3 +1610,44 @@ Session-end device state: **full stock Android** (factory flash-all complete,
 bootloader unlocked, slot a, fresh Android userdata — the AginxOS rootfs that
 was on userdata is gone, rebuild with `scripts/build-rootfs.sh`; our test
 vendor_boot must be re-packed/flashed to return to AginxOS). adb authorized.
+
+### M6/M7 continued (2026-08-29): 5G already enabled; NR-only gives no service
+
+Back on the AginxOS boot (rootfs rebuilt, test vendor_boot flashed, slot a, adb
+`aginxosredfin`; netmgrd killed, modem driven by `/bin/qmi-req` only).
+
+Race v1 (`/bin/m7-race`, fired on ps-flip while reg=02): the netmgrd-style setup
+burst fails structurally — bind-mux 0x00A2, ip-family 0x004D, ind-register
+0x0003, event-report 0x00AF all → QMI err **0x47** even on an idle modem, and
+event-report 0x0001 → 0x11; START_NET 0x0020 during the blip → **0x0F**. The
+0x47s need rild/DPM context and are unrelated to the data call (kernel side
+verified fine: ipa3 loaded, `rmnet_ipa0` exists, dmesg `QMI_IPA_INIT_MODEV_
+DRIVER_REQ` handshake OK).
+
+Attach dynamics: ps attach blips (02→01→02, 1–2 s) roughly every ~40 s; reg
+never reaches 01. LOW_POWER(2 s)→ONLINE radio cycle re-triggers attach attempts.
+NAS GET_SYSTEM_INFO 0x40: only TLV 0x10 len 1 val 09 — with libqmi
+QmiNasRadioInterface (verified via gh from linux-mobile-broadband/libqmi)
+**09 = TD-SCDMA** (correction: an earlier session read this as "CDMA domain");
+no LTE or NR serving TLV at all.
+
+GET_SYSTEM_SELECTION_PREFERENCE 0x34 (295-byte response): **mode preference
+TLV 0x11 = 0x005F — all RATs including 5GNR (0x40)**; disabled-modes TLV 0x22 =
+0x0000; NR5G SA band mask (TLV 0x2C, 64 B) and NR5G NSA band mask (TLV 0x2D,
+64 B) both populated; band pref 0x7FFF_FFFF_FFFF_FFFF; LTE band pref
+0x01E7_FFDF_3FFF; network selection automatic; service domain = 2 (PS-only).
+So the modem was never "stuck on LTE" — 5G is enabled by default config.
+
+NR-only experiment (test "just use 5G, skip LTE"): SET 0x33 mode-pref 0x0040
+accepted (res=0), radio-cycled, watched 90 s — serving-system radio-interface
+TLV 0x11 = **0x00 NONE**, the PLMN TLV 0x12 (present whenever LTE cells were
+visible before) is **absent**, reg stays 02; 0x40 unchanged. No CT NR cell is
+even campable for this device/SIM, and NSA NR needs an LTE anchor — the exact
+step CT kicks. Mode pref restored to 0x005F (readback verified `1102005f00`).
+
+Conclusion unchanged and now triply confirmed (stock control + QMI observation
++ NR-only test): CT network-side policy toward this device is the blocker, not
+RAT selection or our stack. `m7-race2` (reg=01-gated START_NET, APN ctlte,
+480 s auto radio-cycle) left running in background; decisive next step remains
+an alternate SIM (CM/CU).
+
