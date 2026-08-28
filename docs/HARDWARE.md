@@ -1424,3 +1424,69 @@ f8:6f:b0:c3:4a:02  ch=6    -91.00 dBm  2401
   netdevs → real RF scan with sane RSSI. Not yet attempted:
   association/authentication (needs a wpa_supplicant-class userland or
   raw nl80211 AUTH/ASSOC), IP provisioning.
+
+## M4: Wi-Fi association + WPA2-PSK 4-way handshake + DHCP (2026-08-28)
+
+`boot/rootfs/src/wifi-join.c`: self-contained WPA2-PSK supplicant (no
+libnl, no wpa_supplicant). DISCONNECT → CONNECT (fw does auth+assoc) →
+EAPOL M1..M4 over an AF_PACKET socket → PTK/GTK NEW_KEY installs. Crypto
+embedded (SHA-1/HMAC/PBKDF2/AES-128/RFC 3394 unwrap). Against "Legrand
+AP" (44:d1:fa:de:16:b9, WPA2-mixed: **TKIP group / CCMP pairwise**,
+EAPOL version 1):
+
+```
+connected (CONNECT event, status 0)
+M2 sent #1 (rc 135)
+eapol: ver 1 type 3 len 175 desc 2 ki 13ca kl 16   ← M3
+M3 MIC verified — passphrase correct
+GTK kde idx 1 len 32                                ← TKIP group key
+M4 sent
+udhcpc: lease of 192.168.0.166 obtained from 192.168.0.1
+ping 192.168.0.1  → 3/3, 0% loss, ~1.6–4 ms
+ping 223.5.5.5     → 3/3, 0% loss, ~5 ms            ← internet reachable
+```
+
+Driver facts observed getting there:
+
+- **CONNECT attrs must mirror the AP's group cipher.** This AP is
+  WPA2-mixed (group TKIP, pairwise {TKIP,CCMP}); advertising group CCMP
+  in NL80211_CMD_CONNECT makes the qcacld SME scan-cache filter reject
+  the entry — CONNECT then never emits an event. Mirroring
+  `grp000fac02` fixes it. Same mirror is applied to the GTK NEW_KEY
+  cipher (32-byte key for TKIP group).
+- **TRIGGER_SCAN must carry an IE** (we send our 22-byte RSNE): HDD
+  stores it as scan_add_ie → roam_profile->nAddIEScanLength, and
+  csr_scan_for_ssid's `qdf_mem_malloc(nAddIEScanLength)` is a
+  **malloc(0) → NULL → NOMEM** without one — the join path aborts
+  before the SME filter ever runs (dmesg `csr_scan_for_ssid:1395`).
+- **EAPOL socket must bind ETH_P_PAE, not ETH_P_ALL.** HDD's
+  `hdd_is_tx_allowed()` exempts EAPOL from the pre-keys CONN peer state
+  only by checking skb->protocol (stamped from sll_protocol); with
+  ETH_P_ALL every TX is dropped (tx_packets == tx_dropped). With
+  ETH_P_PAE dmesg shows `EAPOL-2 TX … status: succ`.
+- **Re-CONNECT while associated returns -EALREADY** (114); the tool now
+  sends DISCONNECT and waits for the event first.
+- udhcpc wins a lease but applies nothing without its event hook —
+  added `usr/share/udhcpc/default.script` (addr/route/resolv.conf) to
+  the rootfs; verified it auto-configures after join.
+
+Three bugs in our own crypto/protocol produced the identical on-air
+signature — AP retransmits M1 4× then **deauth reason 15**
+(WLAN_REASON_4WAY_HANDSHAKE_TIMEOUT), on every AP/passphrase tried.
+Recording them because each maps to a hostapd check (source-read of
+wpa_auth.c, not a device observation): Key Information bits are
+**B7=ACK, B8=MIC** (M1 ki 0x008a is standard; an M2 with 0x008a is
+dropped as "Key Ack set"), the EAPOL-Key MIC covers the **full EAPOL
+PDU from the version byte** (wpa_verify_key_mic hashes the
+ieee802_1x_hdr onward), and the PTK PRF input is
+`label‖0x00‖data‖counter` (wpa hashes strlen(label)+1). An AP that
+retransmits-M1-and-deauths-15 with a spec-correct M2 = wrong MIC = PMK
+mismatch; everything else (RSNE compare, state machine) deauths
+immediately with a different reason code.
+
+Session-end device state: AginxOS test boot, slot a, our test
+vendor_boot (not stock), rootfs **rebuilt and flashed to userdata** —
+the run above is from that clean image (not live-pushed binaries).
+wlan0 associated to "Legrand AP" with lease 192.168.0.166; association
+is per-boot manual (`/bin/wifi-join`), not persisted. Stock restore
+path unchanged.
