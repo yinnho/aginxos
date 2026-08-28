@@ -1651,3 +1651,69 @@ RAT selection or our stack. `m7-race2` (reg=01-gated START_NET, APN ctlte,
 480 s auto radio-cycle) left running in background; decisive next step remains
 an alternate SIM (CM/CU).
 
+### netmgrd-on-AginxOS tooling parked; raw QMI stays the control path (2026-08-28/29)
+
+Second route attempted beside raw QMI: run the vendor data stack itself.
+With fake-sm answering netmgrd's getService("netd"), a 4-byte Status::ok
+reply gave it a wild sp<> → SIGSEGV in NetmgrNetdClientInit (observed
+2026-08-28); after the null-binder fix netmgrd runs but its WDS setup
+still returns 0x47s without the full rild/DPM context. Tooling built for
+that route: sock-trace (socket-call tracer), netd-stub (HIDL netd
+stub), crash-tracer + coredump-on (crash visibility without
+tombstoned/core dumps), dsi-call (direct libdsi_netctrl client,
+started, parked; its Qualcomm headers stay local per DECISIONS §7
+spirit). All committed as experiment sources; the control path for M7
+remains `/bin/qmi-req`.
+
+### M6/M7 continued (2026-08-29): PDC carrier-config inventory — no CN config; START_NET 0x0F = CALL_FAILED
+
+Correction first: PDC (QMI svc 0x24) lives at QRTR **0:28**, not port 76 — 76
+is DSD (0x2A), and the "ctlte"/"sos" strings seen there earlier are the modem's
+own APN-name table reported via DSD, not PDC config names.
+
+With reporting registered (0x20, TLV 0x10=1) PDC answers asynchronously: a bare
+ack, then a QMI **indication** (flags=04) carrying the token. `qmi-req` gained
+`QR_DRAIN=<ms>` to keep reading after the response. This pinned the wire format
+for all services: 7-byte header (flags u8, txn u8, msg id **big-endian** u16,
+zero pad u8, TLV length **little-endian** u16), TLVs from byte 7, each TLV
+`type u8 + len u16 LE` (14 = 7+7 response, 149 = 7+142 indication check out).
+
+LIST_CONFIGS 0x24 (type=software) → 25 configs; GET_CONFIG_INFO 0x28 on each
+(token-mapped from the indication):
+
+| # | name | size B | # | name | size B |
+|---|------|--------|---|------|--------|
+| 1 | **WildCard (ACTIVE)** | 16324 | 14 | Singtel_Commercial | 54104 |
+| 2 | SW_DEFAULT | 160168 | 15 | FarEastOne_Taiwan_Commercial | 57188 |
+| 3 | WildCard_IMS | 48324 | 16 | ChunghwaTel_Taiwan_Commercial | 56580 |
+| 4 | Ubigi | 17564 | 17 | PTCRB | 51604 |
+| 5 | Global | 34788 | 18 | Xfinity | 100872 |
+| 6 | TestSIM_IMS | 45416 | 19 | Visible | 122872 |
+| 7 | TestSIM | 19816 | 20 | VoLTE_Videotron | 62588 |
+| 8 | EIOTTestSIM_MTV | 61200 | 21 | hVoLTE-Verizon | 100788 |
+| 9 | EIOTTestSIM | 51912 | 22 | Commercial-USCC-FI | 59460 |
+| 10 | WildCard_APT (SEA) | 53336 | 23 | Commercial-USCC | 59312 |
+| 11 | TStar_Taiwan_Commercial | 46800 | 24 | PublicMobile | 74044 |
+| 12 | TaiwanMobile_Commercial | 60092 | 25 | Telus_Lab | 64524 |
+| 13 | StarHub_Singapore_Commercial | 57180 | | | |
+
+Active id (GET_SELECTED 0x22) = `54375ac9e15de4f582a033cc00082a35b628e715`
+(entry 1). Every entry's TLV 0x15 carries its source path under
+`/readonly/vendor/mbn/mcfg_sw/generic/Pixel/…`. **No China carrier config of
+any kind is present** (generic + SEA + NA profiles = US-market firmware load),
+so "activate the telecom MBN" has no target; the only move left on this lever
+would be PDC LOAD 0x26 of an external CN mcfg_sw.mbn — and stock Android, with
+the same WildCard active plus the full rild/IMS/CarrierConfig stack, was kicked
+by CT as well, so a CN MBN is unlikely to change the outcome.
+
+`m7-race2` overnight (2 h, radio cycle every 480 s): every cycle reopens a
+registration window — reg=01 ps=01 for **~1 s** — and all three same-second
+START_NET attempts return err 0x000F before reg drops to 02. Correction to the
+earlier reading: **0x000F is QMI_PROTOCOL_ERROR_CALL_FAILED (15)** —
+NETWORK_NOT_READY is 17/0x11, the error the netmgrd burst got. So the modem
+does attempt the PDN inside the window and the network refuses it, then
+detaches. While searching the modem reports current PLMN 460-11 "CT".
+
+Session-end device state: AginxOS test boot, slot a, adb `aginxosredfin`,
+m7-race2 self-expired, modem on CT limited service (reg=02, ps=01). No boot
+image changes this session; stock restore points untouched.
