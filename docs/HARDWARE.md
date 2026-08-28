@@ -1717,3 +1717,47 @@ detaches. While searching the modem reports current PLMN 460-11 "CT".
 Session-end device state: AginxOS test boot, slot a, adb `aginxosredfin`,
 m7-race2 self-expired, modem on CT limited service (reg=02, ps=01). No boot
 image changes this session; stock restore points untouched.
+
+### M7 WDS bind mystery solved: legacy 0x2F vs mux 0xA2 instances (2026-08-29)
+
+The all-day "BIND_MUX_DATA_PORT refused MALFORMED" on fresh boots was **not**
+DPM state, timing, or instance numbering — the WDS instance that boot simply
+only implements the legacy bind:
+
+- boot 19:54 (yesterday, call UP, 10.148.224.59): WDS instance accepted
+  `0xA2 BIND_MUX_DATA_PORT` (bound at 0:62 that boot).
+- boots after (0:63 instances): `0xA2` → MALFORMED 0x01 on every attempt —
+  including seconds after a sock-traced netmgrd run whose DPM OPEN_PORT got an
+  err-0 ack. **`0x2F BIND_DATA_PORT` (empty TLVs) → err 0 + handle TLV 0x01**
+  on the same server. The DPM open is necessary-but-not-sufficient for 0xA2;
+  0x2F needs nothing beyond a live WDS server.
+
+Correction of the 08-29 dual-instance note: qrtr-lookup(svc 1, inst 0 =
+wildcard) shows exactly ONE WDS server per boot. The "inst0@81" reading was a
+misdecode — port 81 carries service **0x49**, not a second WDS. Similarly the
+"netmgrd looks up inst0" claim: its lookup is svc 1 inst 0 (wildcard).
+
+netmgrd traced end-to-end under the shim stack (rc=1): DPM GET_CAPABILITIES
+0x22 → OPEN_PORT 0x20 (TLV 0x11: count 1, {4,1,2,16}) err-0 ack → rtnetlink
+RTM_NEWLINK creates rmnet_data0 (mux 1, kind rmnet) → WDS wildcard lookup →
+**exits before sending any WDS bind** this boot (on earlier boots it died at
+the bind send). Only its DPM open matters to us; its WDS client never comes
+up under the shims either way.
+
+Two rootfs traps hit and fixed:
+
+- `/run` is persistent ext4 (survives reboots) but the modem's DPM open dies
+  with each modem boot — a `/run/m7-dpm.done` guard made cell-bringup skip
+  netmgrd on a later boot and bind was refused all boot. Guard removed.
+- sock-trace printed `q[2],q[3]` as node/port; sockaddr_qrtr is
+  {family, node, port} = q[0],q[1],q[2] — earlier "qrtr node 60" lines were
+  the port. Fixed.
+
+DMS SET_OPERATING_MODE 0x2E takes a **u8** value TLV (`01 01 00 0X`); a u32
+TLV is MALFORMED. (m7-race2's LOW_POWER↔ONLINE cycle bytes were right all
+along.)
+
+Current failure mode with the legacy bind is purely network-side:
+START_NET → err 0x46 + call end reason 4 = **GENERIC_FADE**; NAS: reg 2
+(searching), cs/ps 2 (detached). `m7-leg2` racer deployed (legacy bind + APN
+ctlte + radio cycle every ~8 min = the m7-race2 window recipe).
