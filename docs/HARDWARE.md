@@ -1183,3 +1183,124 @@ then a 60×2 s wait for the battery psy, logging one reading to
 /var/battery.log). The logged first reading can be empty — the psy node
 exists before google_battery's first poll populates it; the live sysfs
 reads are the real check.
+
+## M3d: Wi-Fi blocker — modem DOG stall root-caused to user-PD firmware fetch, read-only evidence (2026-08-27)
+
+Standing symptom (observed earlier, unchanged): modem root PD PIL-boots,
+registers QRTR services (svc 43/0x1202 locator, svc 66/0xB401
+servreg-notif, SSCTL), answers nothing, then `dog_hal_common.c:180
+[tmr_slave3] DOG detects stalled initialization` kills it every 65.6 s
+(SSR loop). WLAN MSA stays all zeros, WLFW (svc 0x45) never registers,
+`wlan.ko` says "FW is in bad state 0x4180". This window was read-only
+research (no flashing, no new daemons); everything below is observed
+from the device or from pulled stock images.
+
+Observed — device tree (the stock contract):
+
+- `qcom,icnss@18800000` has `qcom,wlan-msa-fixed-region` = phandle 0x9a
+  → `pil_wlan_fw_region@8ba00000` (reg 0x8ba00000, size 0x2000000 = 32
+  MiB). That region **is** the MSA icnss advertises to WLFW.
+- `qcom,mss@4080000` `memory-region` = phandle 0x74 →
+  `modem_wlan_region@8c000000` (size 0x1180000 = 17.5 MiB), **nested
+  inside** pil_wlan_fw_region — the wlan user PD runs in that carve-out.
+- Full reserved-memory map captured (hyp 0x80000000, smem 0x80900000,
+  pil_adsp 0x89200000, pil_cdsp 0x87400000, … nothing at 0xb0000000 —
+  that address space belongs to the WLAN processor's own bus view, not
+  an AP carve-out).
+
+Observed — where modem firmware actually lives:
+
+- `/vendor` is the real partition (dm-1 → /vendor_a, ext4 ro). It has
+  **no modem.mdt at all**. Stock fstab.sm7250 mounts
+  `/dev/block/bootdevice/by-name/modem` (vfat, flashed by `fastboot
+  flash radio`) at `/vendor/firmware_mnt` — empty mountpoint in our env.
+- In our env the modem partition is mounted at `/mnt/modem` (image/
+  holds modem.mdt + b00…b23), firmware_class path =
+  `/vendor_a/firmware`, and copies live in `/lib/firmware` — that is why
+  PIL boots the root PD fine.
+
+Observed — the servreg database (all five jsn in /vendor/firmware read:
+adspr/adsps/adspua/cdspr/modemuw):
+
+- modemuw.jsn: domain `msm/modem/wlan_pd`, qmi_instance_id **180 (0xB4)**,
+  services `kernel/elf_loader`, `tms/servreg`, `wlan/fw`. Instance 180
+  matches the observed root-PD servreg-notif registration 66/0xB401
+  (180<<8|1) exactly.
+- Linaro pd-mapper source (fetched): pd-mapper **is the AP-side
+  servreg-locator server** — publishes (svc 64, version 257,
+  **instance 0**) and answers GET_DOMAIN_LIST from the jsn maps.
+  Qualcomm's /vendor/bin/pd-mapper (strings) plays the same role
+  ("Servloc server", handles locator indication-register) and reads jsn
+  from both `/vendor/firmware` and `/vendor/firmware_mnt/image`.
+
+Observed — the modem image itself names the fetch mechanism (pulled
+modem.b22, 10 MB; strings):
+
+```
+… saipan_xml … msm/modem/wlan_pd . wlan_process . wlanmdsp.mbn .
+  /readonly/firmware/image/wlanmdsp.mbn .
+  /readonly/vendor/firmware_mnt/image/wlanmdsp.mbn .
+  /readonly/vendor/firmware/wlanmdsp.mbn .        ← exists in our env
+  /readonly/vendor/firmware/wlanmdsp.otaupdate.m…
+msm/modem/test_pd . test_process . testpd.mbn . …
+```
+
+and the same segment carries the RFS/TFTP client source names
+(`rfs_tftp.c`, `tftp_client.c`, `tftp_protocol.c`,
+`tftp_socket_ipcr_modem.c`). modem.b23 (25.8 MB) contains
+"elf_loader" (the same servreg DB baked into the big segment).
+
+Observed — wlanmdsp.mbn ELF32 phdrs (local parse):
+
+```
+ph1 0xb0823000 (hash, fl 0x2200000), ph2 0xb0000000 filesz 0x2e0e7c,
+ph3 0xb0300000 memsz 0x501e14, ph5 0xb0802000 — span ≈ 8.2 MiB
+```
+
+Observed — AP side cannot be the loader:
+
+- No kernel module registers a QMI server (only qmi_helpers exports
+  `qmi_add_server`; msm_icnss/service-locator/service-notifier are
+  clients, `add_lookup` only). PIL loads exactly `modem.mdt` + `%s.b%02d`
+  (peripheral-loader.c:1021). The WLFW QMI catalog
+  (wlan_firmware_service_v01.h) has **no** image-download message.
+  ⇒ the only channel for wlanmdsp.mbn into the modem is the modem's
+  own TFTP/RFS fetch over QRTR (stock: rmt_storage + tftp_server).
+
+Observed — stock daemon inventory (init.sm7250.rc + init.redfin.rc):
+qrtr-ns -f, pd-mapper, pm-service, pm-proxy, cnss-daemon -n -l,
+modem_svc -q, rmt_storage, tftp_server, subsystem_ramdump, ssr_setup,
+netmgrd, mdm_helper; mpssrfs.rc pre-creates /data/vendor/rfs/mpss
+(rmt_storage's serving tree — absent in our env, /data not mounted).
+
+Observed — kernel side is ready and waiting: dmesg at t=8034 s shows
+`qcom_smd_qrtr_probe` (modem SSR edge re-appearing) then
+`service-notifier: Connection established between QMI handle and 180
+service` — icnss's PDR listener re-attaches to the wlan_pd notification
+instance every cycle. The stall is entirely modem-side.
+
+Correction to an earlier negative: the qrtr-probe experiment covered
+(64, 257) and (4096, 1–12). 257 is pd-mapper's **version**, not its
+instance (it publishes instance 0), and the rmtfs/tftp instance space
+per domain is not 1–12. "Modem sent zero lookups" is therefore **not**
+evidence about the fetch path — the probe never occupied the slots the
+modem would use.
+
+Working model (labelled model, not yet device-proven): root-PD TMS
+spawns user PDs from its baked saipan_xml; the wlan_pd spawn blocks
+fetching wlanmdsp.mbn via the QRTR TFTP/RFS file service (svc 4096);
+with no fetch path the root PD's init never completes and DOG kills it
+at 65.6 s. Our env has the file at a path the modem searches, but the
+QRTR service stack (qrtr-ns + pd-mapper + rmt_storage/tftp_server) was
+never up before the modem's first boot, and it is untested whether
+late-started daemons can be discovered by an already-booted modem
+(AP→modem NEW_SERVER announcement path unverified).
+
+Planned single experiment (NOT run yet, per no-test directive): boot
+once with ordering fixed instead of adding daemons later — load base
+modules except subsys-pil-tz/peripheral-loader, bring up qrtr-ns,
+pd-mapper, rmt_storage, tftp_server (with rfs dirs and
+/vendor/firmware_mnt mounted from by-name/modem), *then* load
+subsys-pil-tz so the modem first-boots into a fully provisioned AP.
+Success criteria: DOG silent >5 min, MSA non-zero, WLFW svc 0x45
+appears, then cnss-daemon BDF download, then wlan0.
