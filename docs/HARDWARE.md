@@ -1304,3 +1304,123 @@ pd-mapper, rmt_storage, tftp_server (with rfs dirs and
 subsys-pil-tz so the modem first-boots into a fully provisioned AP.
 Success criteria: DOG silent >5 min, MSA non-zero, WLFW svc 0x45
 appears, then cnss-daemon BDF download, then wlan0.
+
+## M3e: t=0 daemon ordering works — WLFW handshake, FW_READY, wlan0 (2026-08-28)
+
+M3d's planned experiment, run. Result: the success criteria were met and
+overtaken — wlan0 exists. Two root causes beyond daemon ordering had to
+be fixed on the way; both are now standing fixes in
+`boot/rootfs/etc/init.d/radio-bringup` and `boot/rootfs/src/fake-props.c`.
+
+Observed — daemon ordering (boot 1 of the day):
+
+- `radio-bringup` starts binderfs (binder-init), fake-servicemanager
+  (fake-sm over /dev/hwbinder), qrtr-ns, pd-mapper, pm-service,
+  rmt_storage, tftp_server *before* `subsys-pil-tz` is insmod'd, then
+  cnss-daemon with `LD_PRELOAD="trace_open.so fake-props.so"`.
+- Modem boots clean: no DOG, no SSR. wlan_pd spawns — `wlan_pd Up`
+  indication at t≈61 s, WLFW QMI service (0x45) connects, icnss state
+  0x980. MSA programming proceeds.
+- pm-service's QMI registration is **not** what gates the spawn (task
+  #46): the spawn completed identically with pm-service merely holding
+  its service table fake — the modem needs the *lookup* path
+  (pd-mapper + qrtr-ns), not pm-service's power calls, to get through
+  user-PD init.
+
+Observed — first blocker, BDF filename (cnss-daemon log):
+
+- With no property service, cnss-daemon's `property_get("ro.hardware",
+  …, "default")` falls back to "default" → tries
+  `bdwlan-…-default…bin` down to `bdwlan-default.bin`, all miss:
+  `Failed to read BDF file`. Fix: fake-props now serves
+  `ro.hardware=redfin`, `ro.boot.hardware=redfin`,
+  `ro.boot.hardware.radio.subtype=2`.
+- After the fix (same boot, daemon restart):
+  `Using BDF file: /vendor/firmware/bdwlan-redfin.bin`,
+  `bdf type 0,result 0, error 0`, then
+  `[  69.604414] icnss: WLAN FW is ready: 0xd87` — 8.5 s after WLFW
+  connect, same timing as stock.
+
+Observed — second blocker, qcacld probe `-EFAULT` (silent):
+
+- Symptom: `icnss: Driver probe failed: -14, state: 0x40d87` at probe
+  time, with **zero** `wlan:` lines in dmesg (qdf print control is not
+  registered that early — probe failures before HDD attach print
+  nothing, so this failure mode is invisible by default).
+- Root cause (source: qcacld + ipa3 on this 4.19):
+  `cds_smmu_mem_map_setup()` returns failure → `-EFAULT` when
+  `wlan_smmu_enabled != ipa_smmu_enabled`. The icnss iommu domain is a
+  translation domain (SMMU on) but `ipa_get_smmu_params(WLAN_CLIENT)`
+  reported bypass, because ipa3's real init (SMMU attach, GSI, uC PIL,
+  QMI) runs in a work item queued **only** by a write to the `/dev/ipa`
+  char dev — stock does `write /dev/ipa 1` in vendor init.rc:212.
+  Without ueventd, /dev/ipa never existed and the write never happened.
+- Fix in radio-bringup: `grep -w ipa /proc/devices` → mknod `/dev/ipa c
+  <maj> 0` → `printf 1 > /dev/ipa`. Observed effect within 20 ms:
+  `IPA FW loaded successfully`, GSI enable, QMI IPA init. (Parse with
+  `set -- $(grep …)`, **not** awk — this busybox's awk applet
+  segfaults, which silently ate the parse once and reproduced the
+  -EFAULT boot.)
+- `s1_bypass_arr[]` starts all-true in ipa.c and is only corrected by
+  `ipa_smmu_wlan_cb_probe` inside that deferred work — the mismatch is
+  structural without the write, not a race.
+
+Observed — after both fixes (boot 3, the milestone):
+
+```
+[ 54.756] IPA FW loaded successfully
+[ 69.604] icnss: WLAN FW is ready: 0xd87
+[ 69.717] wlan: hdd_update_tgt_cfg: hw_mac is zero
+[ 69.737] wlan: hdd_platform_wlan_mac: provisioned MAC [0]f8:1a:2b:35:c2:ae
+[ 69.737] wlan: hdd_initialize_mac_address: using MAC from platform driver
+[ 70.012] IPv6: ADDRCONF(NETDEV_UP): wlan0: link is not ready
+```
+
+- qcacld probe **passes** (no `Driver probe failed`). qdf logging comes
+  alive from here on (`wlan: [pid:X:HDD]` lines appear).
+- MAC: DMS get-MAC over QMI fails (error 16) — **non-gating**;
+  google_wlan_mac platform driver supplies the provisioned MAC
+  f8:1a:2b:35:c2:ae (same as stock reports).
+- Netdevs: `wlan0 wlan1 p2p0 wifi-aware0` (+ `rmnet_ipa0` from IPA).
+  `ip link set wlan0 up` succeeds; NO-CARRIER pre-association is
+  expected.
+- firmware_class sysfs fallback server (fwfallback loop in
+  radio-bringup, serving /sys/class/firmware/* from /vendor/firmware)
+  logged **zero** requests — attach completed without it; the
+  WCNSS_qcom_cfg.ini request either never goes through the fallback
+  path or succeeded via the direct fw path. Left running, harmless.
+
+Session-end device state: AginxOS test boot on slot a (retries reset to
+3), vendor_boot-test flashed, rootfs on userdata with the fixed
+radio-bringup/fake-props.so live-pushed, `/bin/nlscan` pushed (M3f).
+Stock restore path unchanged (`scripts/restore-vendor-boot.sh`).
+
+## M3f: nlscan — first RF scan on AginxOS, 15 BSS observed (2026-08-28)
+
+To prove the radio actually receives (not just that a netdev exists),
+wrote `boot/rootfs/src/nlscan.c` — a static musl nl80211 client
+(trigger scan + dump results), since busybox has no wireless tools and
+we ship no libnl. Two generic-netlink gotchas on the way, both now
+comments in the source: nlmsg_len must include GENL_HDRLEN or attrs
+overwrite the genlmsghdr (kernel answers -EINVAL / -EOPNOTSUPP), and
+scan triggers need NLM_F_ACK or success is silent (client blocks).
+
+Observed on device (`/bin/nlscan wlan0`, family id 21, ifindex 9):
+
+```
+scan triggered, waiting…
+44:d1:fa:de:11:70  ch=4    -39.00 dBm  Legrand AP
+74:39:89:07:a7:43  ch=?    -43.00 dBm  <hidden>/2602
+76:39:89:07:a7:44  ch=55   -64.00 dBm  2602_5G
+74:39:89:07:a0:a7  ch=?    -77.00 dBm  2602
+f8:6f:b0:c3:4a:02  ch=6    -91.00 dBm  2401
+… 15 BSS total, RSSI range -39…-91 dBm, 2.4+5 GHz
+```
+
+- genl family dump confirms `nl80211` (21) and `cld80211` (27)
+  registered.
+- `/proc/net/wireless` lists wlan0/wlan1/p2p0/wifi-aware0.
+- M3 Wi-Fi bring-up is **done**: modem → WLFW → FW_READY → qcacld →
+  netdevs → real RF scan with sane RSSI. Not yet attempted:
+  association/authentication (needs a wpa_supplicant-class userland or
+  raw nl80211 AUTH/ASSOC), IP provisioning.
