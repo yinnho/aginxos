@@ -111,6 +111,18 @@ echo "built preload helpers (trace_open.so, fake-props.so)"
 # and we ship no libnl. Our WLAN operability check (M3f).
 "${ZIG}" cc -target aarch64-linux-musl -static -O2 \
   -o "${TREE}/bin/nlscan" "${RECIPE}/src/nlscan.c"
+# Wi-Fi join (M4): self-contained WPA2-PSK supplicant — CONNECT, EAPOL 4-way
+# handshake over an AF_PACKET socket, NEW_KEY installs; then udhcpc owns IP
+# provisioning. wifi-trace flips QCA vendor dp-trace levels for TX/RX logs.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/wifi-join" "${RECIPE}/src/wifi-join.c"
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/wifi-trace" "${RECIPE}/src/wifi-trace.c"
+# udhcpc event hook (compiled-in default path) — without it udhcpc wins a
+# lease but nothing applies it to the interface.
+mkdir -p "${TREE}/usr/share/udhcpc"
+cp "${RECIPE}/usr/share/udhcpc/default.script" "${TREE}/usr/share/udhcpc/"
+chmod 755 "${TREE}/usr/share/udhcpc/default.script"
 
 # Radio bring-up payload (M3d). libnl.so is the bionic build cnss-daemon
 # dlopens (LD_LIBRARY_PATH=/lib/...); rmt_storage is the PATCHED stock
