@@ -1490,3 +1490,62 @@ the run above is from that clean image (not live-pushed binaries).
 wlan0 associated to "Legrand AP" with lease 192.168.0.166; association
 is per-boot manual (`/bin/wifi-join`), not persisted. Stock restore
 path unchanged.
+
+## M5: boot card on panel + automatic Wi-Fi + internet check (2026-08-28)
+
+Goal: cold boot ends with a branded on-screen card proving every bring-up
+stage, Wi-Fi joined automatically, and a real HTTP fetch through baidu —
+recordable on video, no adb involved.
+
+New pieces (all on the flashed image, observed cold-booting):
+- `/bin/bootcard` — DRM boot-status renderer. Holds DRM master for its
+  whole life (it replaces the M3 green splash; bring-up scripts now report
+  `key ok|fail|run [detail]` lines into `/run/boot.state` instead of
+  painting). Polls the file every 150 ms, re-renders on change. Layout:
+  power emblem + "AginxOS" wordmark + 10-row checklist (KERNEL ROOTFS
+  DISPLAY TOUCH BATTERY MODEM WLAN WIFI DHCP INTERNET) + BOOT COMPLETE
+  banner. 5x8 string-art font embedded in the source; host-side layout
+  verified via `bootcard --ppm` renders.
+- `/bin/httpget` — minimal HTTP/1.0 fetcher (getaddrinfo → TCP → GET).
+  Needed because **this busybox's wget applet segfaults** (observed
+  2026-08-28: any URL, raw-IP included; DNS via nslookup is fine — same
+  broken-applet family as its awk).
+- `/etc/init.d/net-bringup` — waits for wlan0, reads `/etc/wifi.conf`
+  (KEY=VALUE; real file lives on the device only, repo ships
+  `wifi.conf.example`), joins with wifi-join, DHCP with udhcpc, then
+  fetches `http://www.baidu.com/`. Join+DHCP retried once as a pair
+  (a real boot lost DHCP to a busy AP for udhcpc's whole 30 s window —
+  observed mid-session).
+
+Panel facts learned today:
+- **The scanout latches fb contents at SETCRTC time.** splash2 always
+  painted *then* mode-set, so it never mattered; bootcard's first version
+  mode-set an empty buffer and painted afterwards — panel stayed black
+  with the backlight on while every ioctl succeeded. Render-before-
+  SETCRTC is now structural in bootcard (`drm_prepare`/`drm_modeset`
+  split).
+- **A previous DRM master's exit unbinds the connector's encoder**
+  (GETCONNECTOR returns encoder_id=0 with the compatible-encoder list
+  still populated — splash2's bound-encoder-only filter then finds
+  nothing: "no enabled-path connector" at t+2142 s). bootcard falls back
+  to the first compatible encoder and rebinds via SETCRTC.
+- **DRM_IOCTL_MODE_PAGE_FLIP is refused (ENOENT)** on this driver in the
+  legacy SETCRTC configuration; bootcard falls back to re-SETCRTC every
+  ~2 s to latch new frames. Good enough for the boot card; real flips
+  need the atomic API.
+
+Observed (cold boot, recorded on video 2026-08-28): logo ~60 s (panel
+registration), then the card appears; rows flip green as
+touch/battery 100%/modem/wlan0 report; wifi-join completes the 4-way
+handshake unattended (`wifi ok Legrand AP`), udhcpc applies
+192.168.0.166, httpget returns `HTTP 200 696249 bytes` off
+www.baidu.com — `done ok`, BOOT COMPLETE banner on panel. Total
+boot-to-internet ≈ 2 min. One earlier take lost DHCP (AP busy) and one
+reboot landed in fastboot (slot retry counter — we never mark the slot
+boot-successful, so every reboot burns one; `fastboot set_active a`
+recovers. After ~7 reboots expect a fastboot stop).
+
+Session-end device state: AginxOS M5 image on userdata (built from this
+tree + live-pushed net-bringup retry patch, identical content), slot a
+(set_active re-armed), our test vendor_boot (not stock), Wi-Fi config
+present, card showing BOOT COMPLETE. Stock restore path unchanged.
