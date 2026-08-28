@@ -137,11 +137,22 @@ int main(int argc, char **argv)
 				}
 			}
 			if (pending_reply && !(last_td.flags & 0x01)) { /* not oneway */
-				static int32_t okreply = 0; /* Status::ok */
+				/* Status::ok, then a NULL flat_binder_object (type 0).
+				 * The null object is the difference between "ok" and
+				 * "ok, and the @nullable IBinder you asked for does
+				 * not exist": getService() callers (netmgrd waiting
+				 * on Android's netd) parse the reply parcel with
+				 * readStrongBinder() — a 4-byte reply leaves them a
+				 * wild sp<> and they SIGSEGV on first use (observed
+				 * 2026-08-28, netmgrd NetmgrNetdClientInit). With
+				 * the null object they take the clean not-found path.
+				 * Callers that expect no binder (addService, ping)
+				 * ignore the trailing bytes. */
+				static int32_t okreply[7]; /* Status::ok + 24 B object */
 				struct btd rb; memset(&rb, 0, sizeof rb);
 				rb.code = 0; rb.flags = 0x10; /* TF_ACCEPTS_FDS */
-				rb.dsize = 4; rb.osize = 0;
-				rb.data.p.buf = (uint64_t)(uintptr_t)&okreply;
+				rb.dsize = sizeof okreply; rb.osize = 0;
+				rb.data.p.buf = (uint64_t)(uintptr_t)okreply;
 				rb.data.p.ofs = 0;
 				woff = wpush_u32(BC_REPLY, woff);
 				woff = wpush_mem(&rb, sizeof rb, woff);

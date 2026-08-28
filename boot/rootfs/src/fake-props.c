@@ -33,6 +33,9 @@ static const struct {
 	{"ro.hardware", "redfin"},
 	{"ro.boot.hardware", "redfin"},
 	{"ro.boot.hardware.radio.subtype", "2"},
+	/* vendor data-stack log mask (libdsutils msg module) — full verbosity
+	 * for netmgrd/dsi bring-up debugging (M7). */
+	{"persist.vendor.net.logmask", "0xffffffff"},
 };
 #define FK_N (sizeof(FK) / sizeof(FK[0]))
 
