@@ -40,3 +40,12 @@ out/
 
 # Local experiment backups (partition dumps) — never commit
 .local/
+
+# Vendored Qualcomm headers for the parked DSI experiment (dsi-call.c);
+# re-copy from a factory image if needed — vendor material stays local
+# (DECISIONS §7 spirit).
+boot/rootfs/src/dsi_netctrl.h
+boot/rootfs/src/dsi_netctrl_qos.h
+boot/rootfs/src/common_v01.h
+boot/rootfs/src/qmi_idl_lib.h
+boot/rootfs/src/wireless_data_service_v01.h
