@@ -1549,3 +1549,64 @@ Session-end device state: AginxOS M5 image on userdata (built from this
 tree + live-pushed net-bringup retry patch, identical content), slot a
 (set_active re-armed), our test vendor_boot (not stock), Wi-Fi config
 present, card showing BOOT COMPLETE. Stock restore path unchanged.
+
+## M6/M7: SIM proven over raw QMI; registration blocker is network-side; offline-mode wedge recovered via factory restore (2026-08-28)
+
+All modem work driven by our own `/bin/qmi-req` (qmi-req.c: multi-message
+single-client mode, `raw:` vendor-frame replay, `QR_SLEEP`, new `QR_TIMEOUT`,
+1024-byte hex dump) on the AginxOS boot (ipacm + fake-sm per rcS, netmgrd
+deliberately killed).
+
+Modem = qrtr node 0. Service ports this boot: NAS 0:58, DPM 0:60, UIM 0:62,
+WDS 0:63, WDA 0:65, DMS 0:77.
+
+M6 — SIM detection (UIM GET_CARD_STATUS 0x2F): card PRESENT; apps CSIM +
+USIM(type 2, READY) + ISIM; PIN1 DISABLED (not a PIN-lock problem); CT ICCID
+89861114900206766670.
+
+M6 — NAS state (Get Serving System 0x24 / Get System Info 0x4D): home network
+460-11 "CT"; camping LTE band 3 (EARFCN 1850), TAC 0x4035, RSRP -106 → -98 dBm
+after repositioning; **registration never completes**: reg state flaps 0/2
+(NOT_REGISTERED / SEARCHING — correction: an earlier "REGISTERED_HOME" reading
+was a misdecode of enum 2), cs/ps attach DETACHED, service status
+LIMITED/LIMITED_REGIONAL. Network Register (automatic and manual 460-11)
+accepted but ineffective; PS Attach → NO_EFFECT; no reject info TLV recorded.
+
+M7 — WDS START_NET (bind mux + ip-family + APN ctnet, one client): CALL_FAILED,
+verbose 0x07D1 = `WDS_VCER_CM_NO_SRV_V01` — consistent with no registration.
+
+Self-inflicted offline wedge: DMS SET_OPERATING_MODE (0x2E) OFFLINE(3)
+succeeded; afterwards ONLINE(0), LOW_POWER(1) and OFFLINE→SHUTTING_DOWN(5)→
+ONLINE were all rejected with QMI_ERR_INVALID_TRANSITION (0x3C = 60). RESET(4)
+is acked but no SSR happens (ports unchanged, mode still 3;
+/sys/class/remoteproc is empty, so no host-side SSR either). GET_OPERATING_MODE
+carries no offline_reason TLV. The wedge survived a full phone reboot. dmesg:
+rmt_storage writes whole 2.5 MB modem_fs1/modem_fs2 (modemst) images every
+~5 min — the offline state appears persisted in modem EFS. `adb reboot
+bootloader` and on-device `reboot bootloader` from our rootfs both failed to
+reach fastboot (a manual "bootloader" string written to misc + adb reboot also
+did not); manual Power+VolDown worked.
+
+Stock control experiment — factory flash-all (up1a.231105.001.b2 from
+`.factory/`): bootloader/radio/boot/dtbo/vbmeta/vendor_boot flashed clean; the
+2.7 GB product transfer dropped twice mid-stream with USB `e00002ed` (host
+side; replug fixed — a 149 MB `fastboot stage` then ran in 4 s); `fastboot -w
+update` re-run to completion. SIM LOADED, baseband g7250-00264-230619-B, LTE
+band 3 PCI 250 TAC 16437, RSRP -98 dBm level 4, 中国电信, EHPLMN 46011/46003.
+**Stock shows the same registration failure**: PS registration flips
+IN_SERVICE (CHN-CT, with a complete data call at least once — rmnet_data2
+10.146.156.235/29, DNS 218.2.2.2/218.4.4.4, default route, APN ctlte) to
+OUT_OF_SERVICE within seconds (LOST_CONNECTION), then NOT_REG_SEARCHING;
+emergency-only service; CS never registers (CT has no CS); IMS never attempts
+registration (ImsRegistration null); rejectCause 0 throughout; airplane-mode
+cycle reproduces it.
+
+Conclusion so far: the M7 blocker is not AginxOS userspace — the network
+admits attach then detaches this SIM/device. Next: verify the SIM's
+subscription state (activation/plan) and test with an alternate SIM (CM/CU) to
+separate SIM-account issues from CT policy toward this device.
+
+Session-end device state: **full stock Android** (factory flash-all complete,
+bootloader unlocked, slot a, fresh Android userdata — the AginxOS rootfs that
+was on userdata is gone, rebuild with `scripts/build-rootfs.sh`; our test
+vendor_boot must be re-packed/flashed to return to AginxOS). adb authorized.
