@@ -37,3 +37,6 @@ boot/initramfs/aginxos-splash
 
 # Scratch build output
 out/
+
+# Local experiment backups (partition dumps) — never commit
+.local/

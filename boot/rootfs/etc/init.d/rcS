@@ -47,3 +47,9 @@ date > /etc/.rcs-ran
 # Battery bring-up (M3c) — backgrounded: google-battery keeps retrying
 # until the psy appears, so this script just feeds modules and waits.
 /etc/init.d/battery-bringup &
+
+# Radio bring-up (M3d) — backgrounded: stands up the QRTR service stack,
+# boots the modem (its own watchdog kills it in 65 s without the services)
+# and loads the WLAN driver. Ordering vs touch-bringup is race-tolerant:
+# both chains re-insmod with 2>/dev/null.
+/etc/init.d/radio-bringup &
