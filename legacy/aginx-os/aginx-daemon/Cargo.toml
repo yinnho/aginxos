@@ -1,0 +1,15 @@
+[package]
+name = "aginx-daemon"
+version = "0.1.0"
+edition = "2021"
+authors = ["Aginx Team"]
+license = "MIT"
+description = "Aginx OS daemon — Linux userspace agent runtime"
+
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"

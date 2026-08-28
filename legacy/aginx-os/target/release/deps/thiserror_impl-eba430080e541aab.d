@@ -1,0 +1,17 @@
+/Users/sophiehe/Documents/aginxos/legacy/aginx-os/target/release/deps/thiserror_impl-eba430080e541aab.d: /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/lib.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/ast.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/attr.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/expand.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/fallback.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/fmt.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/generics.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/prop.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/scan_expr.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/unraw.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/valid.rs
+
+/Users/sophiehe/Documents/aginxos/legacy/aginx-os/target/release/deps/libthiserror_impl-eba430080e541aab.dylib: /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/lib.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/ast.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/attr.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/expand.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/fallback.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/fmt.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/generics.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/prop.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/scan_expr.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/unraw.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/valid.rs
+
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/lib.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/ast.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/attr.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/expand.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/fallback.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/fmt.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/generics.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/prop.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/scan_expr.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/unraw.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-impl-2.0.18/src/valid.rs:
+
+# env-dep:CARGO_PKG_VERSION_PATCH=18

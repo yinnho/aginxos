@@ -1,0 +1,68 @@
+一、纯 Rust 操作系统（无 Linux）开源项目
+
+1. Redox OS（最成熟、通用、微内核）
+
+• 官网：https://www.redox-os.org/
+
+• GitLab 主站：https://gitlab.redox-os.org/redox-os/redox
+
+• GitHub：https://github.com/redox-os
+
+2. Asterinas（星绽，服务器/机密计算方向）
+
+• 官网：https://asterinas.github.io/
+
+• GitHub：https://github.com/asterinas
+
+3. 其他 ARM64 / 裸机 Rust OS 参考
+
+• https://github.com/rust-embedded/rust-raspberrypi-OS-tutorials（树莓派裸机教程）
+
+• https://github.com/ivandu/arm64-rust-os（ARM64 极简 Rust OS）
+二、你现在的 FB（Fastboot）地址问题（Pixel 常见）
+
+Pixel 刷机常报：
+
+• remote: Invalid address
+
+• remote: Failed to write (bad address)
+
+• remote: Partition table offset invalid
+
+常见原因（Pixel 5 / 9）
+
+1. 地址写错（少 0x、大小写、非法字符）
+
+2. 刷错分区名（Pixel 是 A/B 分区，必须带 _a / _b）
+# 错误
+fastboot flash boot boot.img
+# 正确
+fastboot flash boot_a boot.img
+3. 用了旧版 fastboot（不支持动态分区）
+
+◦ 必须用最新 Android SDK Platform Tools
+
+4. 地址超出分区范围 / 镜像不匹配
+
+5. FB 模式不对：要进 fastboot（不是 fastbootd）
+
+快速修复步骤
+
+1. 用最新 platform-tools：
+https://developer.android.com/studio/releases/platform-tools
+
+2. 确认设备：
+fastboot devices
+3. 查看分区表（找正确地址/名称）：
+fastboot getvar all
+fastboot oem partition list
+4. 刷官方镜像必须带 _a：
+fastboot flash boot_a boot.img
+fastboot flash system_a system.img
+fastboot flash vendor_a vendor.img
+5. 地址必须加 0x：
+# 错误
+fastboot flash 80000000 boot.img
+# 正确
+fastboot flash boot_a boot.img
+要不要我直接给你 Pixel 5 / 9 可用的 纯 Rust OS 刷机脚本 + 分区地址表？

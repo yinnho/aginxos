@@ -1,0 +1,7 @@
+[package]
+name = "aginx-syscall"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bitflags.workspace = true

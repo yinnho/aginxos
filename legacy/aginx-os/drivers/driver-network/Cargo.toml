@@ -1,0 +1,9 @@
+[package]
+name = "driver-network"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aginx-scheme = { path = "../../libs/aginx-scheme" }
+aginx-syscall = { path = "../../libs/aginx-syscall" }
+log.workspace = true

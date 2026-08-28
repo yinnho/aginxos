@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+]
+exclude = [
+    "libs",
+    "schemes",
+    "drivers",
+    "aginx-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Aginx Team"]
+license = "MIT"
+
+[profile.release]
+opt-level = 3
+lto = true

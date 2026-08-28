@@ -1,0 +1,59 @@
+#!/usr/bin/env expect
+
+set timeout 60
+
+# QEMU with port forwarding: host 9090 -> guest 9090
+spawn qemu-system-aarch64 -machine virt,gic-version=2,highmem=off -cpu cortex-a76 -m 512M \
+  -kernel target/aarch64-unknown-none/release/aginx-kernel \
+  -drive file=disk.img,if=virtio,format=raw \
+  -device qemu-xhci,id=xhci \
+  -netdev user,id=net0,hostfwd=tcp::9090-:9090 \
+  -device usb-net,netdev=net0,bus=xhci.0 \
+  -nographic -serial mon:stdio -monitor none
+
+set qemu_spawn $spawn_id
+
+# Wait for shell prompt
+expect {
+    timeout { puts "FAIL: no shell prompt"; exit 1 }
+    "# "
+}
+puts "Result: kernel booted"
+
+# Send listen command
+send "listen 9090\r"
+
+# Wait for kernel to start listening
+expect {
+    timeout { puts "FAIL: listen didn't start"; exit 1 }
+    "TCP listening"
+}
+puts "Result: kernel listening"
+
+# Give it a second to settle
+sleep 2
+
+# Connect from host via nc
+spawn nc -w 5 localhost 9090
+set nc_spawn $spawn_id
+
+# Send data to the kernel
+sleep 1
+send "Hello Aginx!\r\n"
+sleep 3
+
+# Close nc
+close
+wait -nowait
+
+# Switch back to QEMU
+set spawn_id $qemu_spawn
+
+# Wait for kernel to show received data and return to prompt
+expect {
+    timeout { puts "WARN: timeout waiting for kernel"; exit 1 }
+    "# " { puts "Result: TCP listen test completed" }
+}
+
+send "halt\r"
+expect eof

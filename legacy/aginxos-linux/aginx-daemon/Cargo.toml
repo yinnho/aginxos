@@ -1,0 +1,10 @@
+[package]
+name = "aginx-daemon"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Aginx OS daemon — Linux userspace agent runtime"
+
+[dependencies]
+libc = "0.2"

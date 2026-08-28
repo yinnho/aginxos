@@ -1,0 +1,16 @@
+[package]
+name = "ath11kd"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ath11kd"
+path = "src/main.rs"
+
+[dependencies]
+aginx-scheme = { path = "../../libs/aginx-scheme" }
+aginx-syscall = { path = "../../libs/aginx-syscall" }
+aginx-event = { path = "../../libs/aginx-event" }
+driver-network = { path = "../driver-network" }
+log.workspace = true
+bitflags.workspace = true

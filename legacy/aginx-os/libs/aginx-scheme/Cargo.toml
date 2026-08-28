@@ -1,0 +1,8 @@
+[package]
+name = "aginx-scheme"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aginx-syscall = { path = "../aginx-syscall" }
+log.workspace = true

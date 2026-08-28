@@ -1,0 +1,43 @@
+#!/usr/bin/env expect
+
+set timeout 90
+
+spawn qemu-system-aarch64 -machine virt,gic-version=2,highmem=off -cpu cortex-a76 -m 512M \
+  -kernel target/aarch64-unknown-none/release/aginx-kernel \
+  -drive file=disk.img,if=virtio,format=raw \
+  -device qemu-xhci,id=xhci \
+  -netdev user,id=net0 \
+  -device usb-net,netdev=net0,bus=xhci.0 \
+  -nographic -serial mon:stdio -monitor none
+
+# Wait for shell prompt
+expect {
+    timeout { puts "FAIL: no shell prompt"; exit 1 }
+    "# "
+}
+
+# Test HTTP GET
+send "httpget example.com /\r"
+
+# Expect HTTP response headers
+expect {
+    timeout { puts "FAIL: no HTTP response"; exit 1 }
+    "HTTP/1."
+}
+puts "Result: got HTTP response"
+
+# Wait for completion
+expect {
+    timeout { puts "FAIL: no completion"; exit 1 }
+    "bytes received"
+}
+puts "Result: HTTP GET complete"
+
+# Wait for prompt
+expect {
+    timeout {}
+    "# " {}
+}
+
+send "halt\r"
+expect eof

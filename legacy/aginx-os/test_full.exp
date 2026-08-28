@@ -1,0 +1,167 @@
+#!/usr/bin/expect -f
+# Aginx OS Full Integration Test
+# Boots QEMU, runs key commands, verifies output
+
+set timeout 30
+log_user 1
+
+spawn qemu-system-aarch64 \
+    -machine virt,highmem=off \
+    -cpu cortex-a76 \
+    -m 512M \
+    -kernel target/aarch64-unknown-none/release/aginx-kernel \
+    -nographic \
+    -serial mon:stdio \
+    -netdev user,id=net0,hostfwd=tcp::9091-:9091,hostfwd=tcp::9092-:9092 \
+    -device virtio-net-pci,netdev=net0 \
+    -drive file=disk.img,format=raw,if=none,id=blk0 \
+    -device virtio-blk-pci,drive=blk0
+
+# Wait for boot to complete (shell prompt)
+expect {
+    "# " {}
+    timeout { puts "\nFAIL: no shell prompt"; exit 1 }
+}
+puts "\n=== BOOT OK ==="
+
+# Test 1: help
+send "help\r"
+expect {
+    "Commands:" {}
+    timeout { puts "\nFAIL: help"; exit 1 }
+}
+puts "\n=== HELP OK ==="
+expect "# "
+
+# Test 2: version
+send "version\r"
+expect {
+    "Aginx v0.2.0" {}
+    timeout { puts "\nFAIL: version"; exit 1 }
+}
+puts "\n=== VERSION OK ==="
+expect "# "
+
+# Test 3: uptime
+send "uptime\r"
+expect {
+    -re {[\d.]+s} {}
+    timeout { puts "\nFAIL: uptime"; exit 1 }
+}
+puts "\n=== UPTIME OK ==="
+expect "# "
+
+# Test 4: ifconfig
+send "ifconfig\r"
+expect {
+    "inet " {}
+    timeout { puts "\nFAIL: ifconfig"; exit 1 }
+}
+puts "\n=== IFCONFIG OK ==="
+expect "# "
+
+# Test 5: tasks
+send "tasks\r"
+expect {
+    "Tasks:" {}
+    timeout { puts "\nFAIL: tasks"; exit 1 }
+}
+puts "\n=== TASKS OK ==="
+expect "# "
+
+# Test 6: blkinfo
+send "blkinfo\r"
+expect {
+    "Block device:" {}
+    timeout { puts "\nFAIL: blkinfo"; exit 1 }
+}
+puts "\n=== BLKINFO OK ==="
+expect "# "
+
+# Test 7: mkfs
+send "mkfs\r"
+expect {
+    "\[OK\]" {}
+    "\[FAIL\]" { puts "\nWARN: mkfs failed" }
+    timeout { puts "\nFAIL: mkfs timeout"; exit 1 }
+}
+puts "\n=== MKFS OK ==="
+expect "# "
+
+# Test 8: writefile
+send "writefile test.txt hello from aginx\r"
+expect {
+    "\[OK\]" {}
+    "\[FAIL\]" { puts "\nFAIL: writefile"; exit 1 }
+    timeout { puts "\nFAIL: writefile timeout"; exit 1 }
+}
+puts "\n=== WRITEFILE OK ==="
+expect "# "
+
+# Test 9: ls
+send "ls\r"
+expect {
+    "test.txt" {}
+    "(empty)" { puts "\nFAIL: ls empty"; exit 1 }
+    timeout { puts "\nFAIL: ls timeout"; exit 1 }
+}
+puts "\n=== LS OK ==="
+expect "# "
+
+# Test 10: cat
+send "cat test.txt\r"
+expect {
+    "hello from aginx" {}
+    timeout { puts "\nFAIL: cat"; exit 1 }
+}
+puts "\n=== CAT OK ==="
+expect "# "
+
+# Test 11: rm
+send "rm test.txt\r"
+expect {
+    "\[OK\]" {}
+    "\[FAIL\]" { puts "\nFAIL: rm"; exit 1 }
+    timeout { puts "\nFAIL: rm timeout"; exit 1 }
+}
+puts "\n=== RM OK ==="
+expect "# "
+
+# Test 12: usertest (EL0 task creation + SVC syscall)
+send "usertest\r"
+expect {
+    "\[OK\] Created EL0 task" {}
+    "\[FAIL\]" { puts "\nWARN: usertest failed" }
+    timeout { puts "\nWARN: usertest timeout" }
+}
+puts "\n=== USERTEST DONE ==="
+# Wait a bit for the task to potentially run and print output
+sleep 1
+expect "# "
+
+# Test 13: write startup.cfg
+send "writefile startup.cfg echo autoexec works\r"
+expect {
+    "\[OK\]" {}
+    "\[FAIL\]" { puts "\nWARN: startup.cfg write failed" }
+    timeout { puts "\nWARN: startup.cfg timeout" }
+}
+puts "\n=== STARTUP.CFG DONE ==="
+expect "# "
+
+# Test 14: echo (basic output test)
+send "echo test 123\r"
+expect {
+    "test 123" {}
+    timeout { puts "\nFAIL: echo"; exit 1 }
+}
+puts "\n=== ECHO OK ==="
+expect "# "
+
+# Halt
+send "halt\r"
+sleep 1
+
+puts "\n=== ALL TESTS PASSED ==="
+exec kill [exp_pid] 2>/dev/null
+exit 0

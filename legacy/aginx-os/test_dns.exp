@@ -1,0 +1,23 @@
+#!/usr/bin/env expect
+set timeout 60
+spawn qemu-system-aarch64 -machine virt,gic-version=2,highmem=off -cpu cortex-a76 -m 512M \
+  -kernel target/aarch64-unknown-none/release/aginx-kernel \
+  -drive file=disk.img,if=virtio,format=raw \
+  -device qemu-xhci,id=xhci \
+  -netdev user,id=net0 \
+  -device usb-net,netdev=net0,bus=xhci.0 \
+  -nographic -serial mon:stdio -monitor none
+
+expect {
+    timeout 120
+    "# "
+}
+send "nslookup example.com\r"
+
+expect {
+    timeout 30
+    -re "# "
+}
+EOF
+chmod +x /Users/mac8684/Documents/agentos/aginx-os/test_dns.exp
+/Users/mac8684/Documents/agentos/aginx-os/test_dns.exp 2>&1 | tail -40

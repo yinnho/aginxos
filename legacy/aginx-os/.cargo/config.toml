@@ -1,0 +1,18 @@
+[build]
+target = "aarch64-unknown-none"
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tkernel/linker.ld",
+    "-C", "relocation-model=static",
+]
+
+[target.aarch64-redfin]
+rustflags = [
+    "-C", "link-arg=-Tkernel/linker-redfin.ld",
+    "-C", "relocation-model=static",
+]
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]

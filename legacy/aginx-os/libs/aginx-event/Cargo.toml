@@ -1,0 +1,6 @@
+[package]
+name = "aginx-event"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

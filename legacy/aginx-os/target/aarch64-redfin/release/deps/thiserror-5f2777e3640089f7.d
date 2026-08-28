@@ -1,0 +1,14 @@
+/Users/sophiehe/Documents/aginxos/legacy/aginx-os/target/aarch64-redfin/release/deps/thiserror-5f2777e3640089f7.d: /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/lib.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/aserror.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/display.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/var.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/private.rs /Users/sophiehe/Documents/aginxos/legacy/aginx-os/target/aarch64-redfin/release/build/thiserror-15458fbda0bdca4d/out/private.rs
+
+/Users/sophiehe/Documents/aginxos/legacy/aginx-os/target/aarch64-redfin/release/deps/libthiserror-5f2777e3640089f7.rlib: /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/lib.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/aserror.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/display.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/var.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/private.rs /Users/sophiehe/Documents/aginxos/legacy/aginx-os/target/aarch64-redfin/release/build/thiserror-15458fbda0bdca4d/out/private.rs
+
+/Users/sophiehe/Documents/aginxos/legacy/aginx-os/target/aarch64-redfin/release/deps/libthiserror-5f2777e3640089f7.rmeta: /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/lib.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/aserror.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/display.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/var.rs /Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/private.rs /Users/sophiehe/Documents/aginxos/legacy/aginx-os/target/aarch64-redfin/release/build/thiserror-15458fbda0bdca4d/out/private.rs
+
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/lib.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/aserror.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/display.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/var.rs:
+/Users/sophiehe/.cargo/registry/src/rsproxy.cn-e3de039b2554c837/thiserror-2.0.18/src/private.rs:
+/Users/sophiehe/Documents/aginxos/legacy/aginx-os/target/aarch64-redfin/release/build/thiserror-15458fbda0bdca4d/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/sophiehe/Documents/aginxos/legacy/aginx-os/target/aarch64-redfin/release/build/thiserror-15458fbda0bdca4d/out

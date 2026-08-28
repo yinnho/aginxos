@@ -1,0 +1,45 @@
+#!/usr/bin/expect -f
+# Quick usertest debug
+set timeout 20
+log_user 1
+
+spawn qemu-system-aarch64 \
+    -machine virt,highmem=off \
+    -cpu cortex-a76 \
+    -m 512M \
+    -kernel target/aarch64-unknown-none/release/aginx-kernel \
+    -nographic \
+    -serial mon:stdio \
+    -netdev user,id=net0 \
+    -device virtio-net-pci,netdev=net0 \
+    -drive file=disk.img,format=raw,if=none,id=blk0 \
+    -device virtio-blk-pci,drive=blk0
+
+# Wait for shell prompt
+expect {
+    "# " {}
+    timeout { puts "\nFAIL: no prompt"; exit 1 }
+}
+
+# Run usertest
+send "usertest\r"
+expect {
+    "# " {}
+    timeout { puts "\nFAIL: no prompt after usertest"; exit 1 }
+}
+
+# Wait a bit for task to be scheduled
+sleep 2
+
+# Check tasks
+send "tasks\r"
+expect {
+    "# " {}
+    timeout { puts "\nFAIL: no prompt after tasks"; exit 1 }
+}
+sleep 1
+
+send "halt\r"
+sleep 1
+exec kill [exp_pid] 2>/dev/null
+exit 0

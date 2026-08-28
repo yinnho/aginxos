@@ -1,0 +1,15 @@
+[package]
+name = "aginx-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "aginx-kernel"
+path = "src/main.rs"
+
+[dependencies]
+virtio-drivers = { version = "0.13.0", default-features = false, features = ["alloc"] }
+
+[features]
+default = []
+board-redfin = []  # Pixel 5
