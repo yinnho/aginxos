@@ -40,14 +40,24 @@ while [ $n -lt 60 ]; do
   n=$((n+1))
   if [ -r /sys/class/power_supply/battery/capacity ]; then
     echo "battery psy up (t+$((n*2))s) $(date)"
+    # capacity can read empty on the very first poll after the psy appears
+    # (observed on the 2026-08-28 M5 cold boot: card showed "battery ok %")
+    CAP=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)
+    m=0
+    while [ -z "$CAP" ] && [ $m -lt 10 ]; do
+      sleep 1; m=$((m+1))
+      CAP=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null)
+    done
     for p in capacity status voltage_now current_now temp health charge_counter; do
       printf '%s=%s ' "$p" "$(cat /sys/class/power_supply/battery/$p 2>/dev/null)"
     done
     echo
+    echo "battery ok ${CAP}%" >>/run/boot.state   # boot card row (M5)
     echo "=== done $(date) ==="
     exit 0
   fi
   sleep 2
 done
 echo "battery psy never appeared $(date)"
+echo "battery fail" >>/run/boot.state
 dmesg | grep -E "QG-K|google_battery" | tail -8

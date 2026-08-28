@@ -38,10 +38,20 @@ done) &
 echo "aginxos: rcS done, rootfs up on userdata" > /dev/kmsg
 date > /etc/.rcs-ran
 
+# Boot card (M5) — the panel UI: AginxOS wordmark + a live checklist of
+# every bring-up stage, fed by /run/boot.state. Starts FIRST because it
+# must own DRM master as soon as the panel registers (it retries until
+# then — msm_drm + panel take ~60 s, loaded by touch-bringup below). It
+# replaces the M3 green splash: bring-up scripts report into the state
+# file instead of painting, and bootcard never exits (dropping master
+# would let dsi_backlight's dpms hooks blank the panel).
+mkdir -p /run 2>/dev/null
+: > /run/boot.state
+( exec /bin/bootcard /run/boot.state ) >/var/bootcard.log 2>&1 &
+
 # Touch bring-up (M3) — backgrounded: it waits out the ~60s panel
-# registration, and the console must not block on it. On success it paints
-# the panel green (userspace alive — without a paint the panel stays black:
-# nothing udevs, nothing draws).
+# registration, and the console must not block on it. Loads the display
+# chain and reports touch ok/fail into /run/boot.state.
 /etc/init.d/touch-bringup &
 
 # Battery bring-up (M3c) — backgrounded: google-battery keeps retrying
@@ -53,3 +63,8 @@ date > /etc/.rcs-ran
 # and loads the WLAN driver. Ordering vs touch-bringup is race-tolerant:
 # both chains re-insmod with 2>/dev/null.
 /etc/init.d/radio-bringup &
+
+# Network bring-up (M5) — backgrounded: waits for wlan0 from radio-bringup,
+# joins /etc/wifi.conf, DHCP, then fetches http://www.baidu.com; every step
+# lands in /run/boot.state and the card flips to the BOOT COMPLETE banner.
+/etc/init.d/net-bringup &

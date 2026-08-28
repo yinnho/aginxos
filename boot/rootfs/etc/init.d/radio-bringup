@@ -390,6 +390,11 @@ while [ "$(modem_state)" != "ONLINE" ] && [ $n -lt 60 ]; do
   sleep 1; n=$((n+1))
 done
 echo "modem state $(modem_state) after ${n}s $(date)"
+if [ "$(modem_state)" = "ONLINE" ]; then
+  echo "modem ok" >>/run/boot.state    # boot card row (M5)
+else
+  echo "modem fail" >>/run/boot.state
+fi
 
 # --- wait for the driver to finish: wlan_pd → FW_READY → wlan0 -----------
 n=0
@@ -402,9 +407,11 @@ done
 if [ -e /sys/class/net/wlan0 ]; then
   ip link set wlan0 up 2>/dev/null
   echo "wlan0 UP $(date)"
+  echo "wlan ok wlan0" >>/run/boot.state   # boot card row (M5)
   ip addr show wlan0 2>/dev/null | head -4
 else
   echo "wlan0 never appeared $(date)"
+  echo "wlan fail" >>/run/boot.state
   dmesg | grep -a "icnss" | tail -10
 fi
 echo "=== done $(date) ==="

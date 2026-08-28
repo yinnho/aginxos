@@ -84,21 +84,15 @@ while [ $n -lt 120 ]; do
     mdev -s
     echo "touchscreen registered + nodes created (t+$((n*2))s) $(date)"
     grep -A1 sec_touchscreen /proc/bus/input/devices
-    # Green panel = userspace alive + touch up. Nothing else ever draws, so
-    # without this the panel is black once the bootloader's logo dies (the
-    # connector sits at enabled=disabled until this mode set — observed
-    # 2026-08-27; the logo is cont-splash scanout, not KMS).
-    # MUST stay resident (hold): when the painter exits it drops DRM master
-    # and dsi_backlight's early/late-dpms hooks turn the panel right back
-    # off — the 02:29 boot showed a green flash then black. A daemon
-    # holding the fd keeps the mode set alive.
-    nohup /bin/splash 0000ff00 hold >/dev/null 2>&1 &
-    echo "splash daemon started (green, holding DRM master) $(date)"
+    # Report to the boot card (M5) — bootcard owns the panel now; the M3
+    # green splash is gone. It paints from /run/boot.state, so touch just
+    # becomes a row that flips to ok.
+    echo "touch ok" >>/run/boot.state
     echo "=== done $(date) ==="
     exit 0
   fi
   sleep 2
 done
 echo "touchscreen never registered $(date)"
-/bin/splash 00ff0000  # red = alive but touch failed
+echo "touch fail" >>/run/boot.state
 dmesg | grep -E "sec_ts|sec_input" | tail -8

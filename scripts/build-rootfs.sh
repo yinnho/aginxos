@@ -118,6 +118,16 @@ echo "built preload helpers (trace_open.so, fake-props.so)"
   -o "${TREE}/bin/wifi-join" "${RECIPE}/src/wifi-join.c"
 "${ZIG}" cc -target aarch64-linux-musl -static -O2 \
   -o "${TREE}/bin/wifi-trace" "${RECIPE}/src/wifi-trace.c"
+# Boot card (M5): DRM boot-status renderer — polls /run/boot.state and
+# paints the AginxOS bring-up checklist on the panel. Holds DRM master
+# for its whole life (it replaces the M3 green splash). Same zig static
+# build; host-side layout check via `bootcard --ppm out.ppm [state]`.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/bootcard" "${RECIPE}/src/bootcard.c"
+# httpget: minimal HTTP fetch for the boot internet check — busybox's wget
+# applet segfaults in this build (2026-08-28), so net-bringup uses ours.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/httpget" "${RECIPE}/src/httpget.c"
 # udhcpc event hook (compiled-in default path) — without it udhcpc wins a
 # lease but nothing applies it to the interface.
 mkdir -p "${TREE}/usr/share/udhcpc"
@@ -154,7 +164,9 @@ cp "${RECIPE}/busybox" "${TREE}/bin/busybox"
 cp -R "${RECIPE}/etc/." "${TREE}/etc/"
 chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/touch-bringup" "${TREE}/etc/init.d/battery-bringup" \
-  "${TREE}/etc/init.d/radio-bringup"
+  "${TREE}/etc/init.d/radio-bringup" "${TREE}/etc/init.d/net-bringup"
+# NB: wifi.conf.example rides along in ${RECIPE}/etc — the real
+# /etc/wifi.conf (with the passphrase) is pushed by hand, never committed.
 cp "${TARGET}/aginxos-init" "${TARGET}/aginxos-agent" "${TREE}/aginxos/"
 
 # Curated applet symlinks — enough for init and debugging; rcS runs
