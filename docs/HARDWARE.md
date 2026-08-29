@@ -1900,3 +1900,179 @@ Continuation of the mode-5 hunt. All results observed on device:
 Device state: AginxOS (vendor_boot HOLD+USBADB+ROOTFS, userdata rootfs with
 radio-bringup), modem wedged at DMS mode 5, Wi-Fi + internet up. fsg /
 modemst1/2 / fsc currently zeroed (host backups in .local/).
+
+### M6/M7 (2026-08-29 evening): qmi-req hexv bug voided a day of "refused" results; mode 5 is just the boot default; CN config path opened
+
+**The "unkillable mode-5 latch" never existed.** `qmi-req`'s `hexv()` had an
+inverted range check (`c>='0'&&c>='9'`) that mapped every hex digit 0-8 to
+-1, so every hex TLV arg went out as `ff` bytes and the modem answered
+MALFORMED 0x0001. Every qmi-req write since the tool gained hex args was
+corrupted — DMS mode-sets, WDS 0xA2 binds, PDC register/select — and the
+"mode 5 refuses all writes" conclusion (plus the modemst/fsg/fsc-wipe and
+flash-all falsifications built on it) was chasing our own tool bug. Reads
+(empty TLV) were unaffected, which is why mode 5 *readings* were real.
+Fixed in f07ea11. pdc-load (raw byte path) was never affected.
+
+With a correct parser, observed on device:
+
+- DMS 0x2E SET ONLINE/LOW_POWER **accepted**; mode 5 (SHUTTING_DOWN) is the
+  modem's boot default, not a latch. Mode holds 0 (ONLINE) once set.
+- PDC LOAD 0x26 works under any operating mode. Duplicate config id →
+  err 0x29 (INVALID_ID). A Xiaomi-signed mbn (Redmi K30 5G/picasso CT
+  config) was **accepted cross-OEM** — PDC LOAD verifies hashes, tolerates
+  foreign signature chains.
+- PDC SET_SELECTED 0x23 / ACTIVATE 0x27 accepted; selection survives
+  reboot; activation applies across the next modem SSR.
+
+**Xiaomi CT config crash-loops redfin's modem.** With the picasso CT
+Commercial VoLTE config selected+activated: `Fatal error on modem!` x5,
+each at RAT bring-up after DMS ONLINE, each followed by an SSR. Root cause
+(config diff via sbaresearch/mbn-mcfg-tools): the CT config is built for
+China Telecom's **CDMA** legacy — policy rat_capability `C H L 5G`,
+ue_mode 1X_CSFB_PREF, ~60 CDMA/1x/HDR/TDS NV items and EFS files —
+but redfin's US modem build has the CDMA/EV-DO stacks removed, so the
+config commands bring-up of absent protocol stacks → err_fatal. Rolled
+back to WildCard (crash loop stopped immediately). Also observed: the
+Pixel's own WildCard has **zero 460-xx policy rules, no APN profiles at
+all, and rat caps at G W L (no 5G)** — CT has nothing to attach with.
+
+**modemst1/2 + fsg + fsc restore.** The 08-29 zeroing had left the modem
+on blank NV (flash-all does not touch these partitions). Restored all four
+from .local/ backups (md5-verified after dd). Immediately afterwards the
+modem registered on CT again: reg=01 windows of ~12-19 s with PS attach,
+PLMN 460-11 "CT" visible — the first full registrations since boot Y.
+SW_DEFAULT (160168 B generic) selected+activated instead gave steady
+LIMITED service, no windows — worse than WildCard; reverted.
+
+**Patched WildCard+CT config (no crash, profiles live, PDN still
+refused).** Built `out/mcfg/patched-wildcard-ct.mbn` (17140 B, sha1
+1990e8b0…98bab): WildCard base + CT policy rule (serving/IMSI 460-03,
+460-11, MCC 460 → rat_capability G W L 5G, ue_mode NORMAL) + CT data
+profiles from the Xiaomi config (Profile0/1 ctnet, Profile3 ctwap), zero
+CDMA-stack items. Loaded/selected/activated cleanly, **no fatals**. WDS
+GET_PROFILE_SETTINGS idx 0 now returns APN `ctnet` — the profile is live
+in the modem. Registration windows still occur (one opened within seconds
+of DMS ONLINE), but WDS START_NET inside the window is refused with
+err 0x46 (+ call_end_reason TLV 0) for **all** variants tried: 3GPP
+profile-index TLV 0x31, bare no-APN, APN ctnet, APN ctlte. Windows last
+~12-19 s then reg drops to 02.
+
+Working hypothesis for the refusal: the network rejects the *attach*
+itself (EMM cause unknown — being captured via NAS serving-system
+indications during the next window drop), so the transient reg=01 is a
+registration that never fully settles; the PDN refusal is downstream of
+that. Boot Y (same WildCard, pre-wipe) proves CT *does* occasionally
+accept this device and complete a data call, so acceptance is
+stochastic/network-side, not a hard block.
+
+Session-end device state: AginxOS boot, slot a, adb aginxosredfin;
+modemst1/2+fsg+fsc restored from backup; PDC selected = patched
+WildCard+CT (rollback = SET_SELECTED 54375ac9…e715 WildCard); DMS ONLINE
+set manually after each boot/SSR (no auto-set wired yet); m7-v4 racer +
+NAS indication watcher running on device; Wi-Fi unaffected. qmi-req
+binary in the rootfs tree refreshed with the hexv fix.
+
+### M6/M7 (2026-08-29 night): attach PDN was dangling → ctlte profile written; PS attach is *steady*; drop is CS-only; stock parity reached
+
+TLV decode session against libqmi service jsons (`/tmp/nas-real.json`,
+`/tmp/wds.json`, `/tmp/qmi-enums-wds.h` — ikto-art GitHub mirror):
+
+- NAS Get System Info (0x4D) TLV 0x19 LTE System Info v2 while camped on
+  CT: domain=PS, capability=PS, **roaming=home, forbidden=0, reject-info
+  NOT valid**, PLMN 460-11, TAC 0x4035. So no EMM reject is being reported
+  most of the time.
+- **Attach PDN list was dangling**: WDS Get LTE Attach PDN List (0x94)
+  showed current list = [profile 1], but 3GPP profile 1 did not exist
+  (the patched mbn had written ctnet to *3GPP2* profile 0, not 3GPP 1).
+  Wrote 3GPP profile 1 = APN `ctlte`, PDP IPv4v6 via WDS Modify Profile
+  0x28 (verified via Get Profile Settings 0x2B TLV `01 02 00 00 01`).
+  Get LTE Attach Parameters (0x85) afterwards: **attach now runs with
+  APN `ctlte`** — profile/attach wiring matches stock Android's call
+  (boot Y used APN ctlte).
+- NAS Network Reject indication (0x68, enabled via Indication Register
+  0x03 TLV `21 02 00 01 00`) fired exactly once in ~1 h of cycling:
+  **radio=LTE, domain=CS, cause 0x12 (EMM #18 "CS domain not
+  available")** — CT rejects the combined attach's CS leg. Set NAS
+  0x33 service-domain=PS-only + usage=data-centric (verified via 0x34
+  readback: TLV 0x18 = 1). No more rejects since.
+- **PS attach is steady, not flapping**: 90 s of 2 s-interval NAS 0x24
+  polls show `ps=1` continuously. What cycles is the *CS* registration
+  (`reg=2 searching`) and the QMI LTE service-status byte (01 limited ↔
+  02 available for ~4 s). The earlier "network drops us every 75 s"
+  reading conflated CS search with PS detach.
+- START_NET (0x20) still returns **err 0x46 = INVALID_OPERATION**
+  (libqmi qmi-errors.h enum) with call_end_reason 0, for bare/APN/
+  profile-index/IP-family variants, with legacy bind 0x2F succeeding
+  first on the same client. Bind Mux Data Port 0xA2 (ep embedded iface 0
+  mux 1) → err 0x03 INTERNAL; WDA Set/Get Data Format (0x20/0x21 at
+  svc 0x11) → err 0x10 NOT_PROVISIONED (unused on this platform).
+  Kernel side: rmnet mux channels unsupported (`ip link add type rmnet`
+  → RTNETLINK Not supported); rmnet_ipa0 exists (operstate down).
+
+**Interpretation.** AginxOS QMI state now matches what stock Android had
+when its call succeeded (ctlte attach PDN, PS attached, home PLMN, no
+reject). The stock control experiment already recorded the same
+admit-then-drop behavior with a complete data call occurring at least
+once — so the remaining blocker is network/SIM-side admission
+probability, not our stack. `m7-v5` racer on device retries
+START_NET(APN=ctlte, IPv4) every 20 s indefinitely and configures
+rmnet_ipa0 + route + resolv.conf + `cell ok` in /run/boot.state if a
+call lands. Open questions for the user: CT SIM subscription/data-plan
+state, whether this SIM gets stable data in another phone, and whether a
+CMCC/CU SIM is available for the control test.
+
+Session-end device state: AginxOS boot, slot a, adb aginxosredfin; PDC
+selected = patched WildCard+CT; attach PDN list = [1] (ctlte, no auth);
+NAS service-domain PS-only (permanent); DMS ONLINE; m7-v5 racer +
+sysinfo poller + network-reject watcher running; Wi-Fi unaffected.
+
+### M6/M7 (2026-08-29 late night): official CT OpenMkt mbn active; NR still absent; START_NET 0x46 unchanged
+
+User confirmed the same SIM registers 5G on a Huawei phone (China
+Telecom, same location), so SIM/plan/coverage are fine. Tested whether
+the Pixel 5 side is a carrier-config problem:
+
+- **Switched PDC active config to the official `China_CT_Commercial_OpenMkt.mbn`**
+  (sha1 `9f3f896773baff333a5981cc608a3e6ed4871cd8`, already in the
+  device PDC store) via Set Selected 0x23 + Activate 0x27, verified
+  active after reboot. This replaces our patched wildcard — the exact
+  config stock CT devices ship.
+- Under the official CT config: mode pref 0x5F, DMS online, LTE camps on
+  460-11 TAC 0x4035. Same as patched wildcard.
+- **Network scan under CT config: 3 PLMNs (460-11 CT, 460-00 CMCC,
+  460-01 UNICOM), all RAT 0x08 LTE — zero NR cells**, identical to the
+  wildcard result. Scan type 0x10 (5GNR) and 0x14 (LTE+NR) both rejected
+  with err 0x30 InvalidArgument — this firmware's Network Scan 0x21
+  does not accept the NR bit at all.
+- **NR-only retry under CT config**: mode pref 0x40 applied (readback
+  confirmed), radio cycled, 90 s of polls all reg=02 no-service; NAS
+  0x4D NR5G svc status TLV 0x4A = `04 00 00`. Restored 0x5F.
+- NAS 0x34 NR5G SA/NSA band masks (TLV 0x2C/0x2D) contain n78 under
+  both configs — the config side is *not* filtering out CT's band.
+- PS-only service domain (TLV 0x18 = 2, set last night) **persists
+  across reboot**.
+- START_NET (ctlte) under the official CT config: still **err 0x46
+  INVALID_OPERATION**, call_end_reason 0 — unchanged.
+- After every boot the modem comes up in DMS operating mode 05
+  (low power) under the CT config; DMS 0x2E online is required
+  manually. Registration afterwards: PS attach steady, CS searching
+  (expected, PS-only set).
+- m7-v7 racer running on device (START_NET ctlte every ~32 s forever,
+  auto rmnet_ipa0 + route + resolv.conf + `cell ok` on success).
+  WDS 0:62 NAS 0:57 DMS 0:77 this boot.
+
+**Conclusion.** Pixel 5 hardware supports CT 5G (n78 in band masks,
+public specs) and neither the wildcard nor the official CT mbn exposes
+any NR cell here, while a Huawei (a CT-certified/入库 device) gets 5G at
+the same spot. Together with the stock-Android control showing the same
+admit-then-drop LTE behavior, this points to network-side admission
+(CT 5G SA terminal whitelist), not to any config file we can change.
+No further mbn/policyman edit is indicated; remaining lever for data is
+catching a stochastic LTE admission window (racer running), or a
+CMCC/CU SIM control (user has only CT).
+
+Session-end device state: AginxOS boot, slot a, adb aginxosredfin; PDC
+selected = official China_CT_Commercial_OpenMkt (`9f3f8967…1cd8`,
+rollback = SET_SELECTED `54375ac9…e715` WildCard); mode pref 0x5F;
+service-domain PS-only; DMS set ONLINE this boot; m7-v7 racer running;
+Wi-Fi unaffected.
