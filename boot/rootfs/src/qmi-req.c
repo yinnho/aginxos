@@ -17,7 +17,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 struct sockaddr_qrtr { unsigned short fam; unsigned int node, port; };
-static int hexv(int c){ if(c>='0'&&c>='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1; }
+static int hexv(int c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1; }
 /* WDS GET_CURRENT_SETTINGS (0x2D) carries the bearer's addressing as
  * little-endian u32 TLVs — flip for the dotted quad (M7: the modem hands
  * 0a 94 e0 3b for 10.148.224.59). Printing a cooked SETTINGS line here
