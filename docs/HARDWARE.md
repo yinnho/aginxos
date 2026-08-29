@@ -1810,3 +1810,55 @@ Next: boot stock Android once (stock boot.img + stock vendor_boot) and check
 whether its RIL stack registers / clears the mode — separates
 our-environment from device-persistent state (SMEM/PMIC/PDC/protect stores,
 which no lever above reaches).
+
+## Stock-boot test: mode 5 survives factory wipe + cold power-off; HOLD-flag regression found and fixed (2026-08-29 morning)
+
+Follow-up to the mode-5 latch. Sequence and observed results:
+
+- **Stock boot loop recovered by `fastboot -w`.** Stock boot_a +
+  stock vendor_boot_a (both md5-verified byte-identical to
+  `boot/stock-*.img`) fell into the recovery rescue loop ("无法加载安卓系统")
+  with slot-retry-count:a draining. `fastboot -w` (erase userdata + metadata)
+  + `set_active a` fixed it on the first try — the blocker was persistent
+  userdata/metadata state (rescue-party counters), NOT the firmware images.
+  Side effect: the wipe destroyed the on-device backups
+  `/data/aginx-test-*.img` (the only device-local copies of the 08-29
+  vendor_boot; rebuild from tree works, so no loss) and our userdata rootfs
+  (rebuilt from `scripts/build-rootfs.sh`).
+- **Stock Android also fails to register.** After the wipe, stock booted
+  clean (boot_completed=1, SIM LOADED) but telephony stays
+  OUT_OF_SERVICE: modem camps CHN-CT LTE band 5 (earfcn 1850, full
+  CellIdentity, emergency-capable) yet regState stays
+  NOT_REG_MT_SEARCHING_OP_EM with rejectCause=0 — the network is not
+  rejecting; the modem never completes attach. NitzStateMachine's latest
+  network time is frozen at 08-28 23:20:54 (the second spontaneous crash):
+  no successful registration since. This matches our-mode-5 behavior
+  exactly, so the latch is not cleared by a full stock RIL boot.
+- **Cold power-off does NOT clear it either.** `reboot -p` (full PMIC
+  power cut, device confirmed off USB), user power-on, stock boot: same
+  OUT_OF_SERVICE on the same cell. Mode 5 (or the equivalent registration
+  block) therefore lives outside RAM/SMEM/PMIC-volatile state — remaining
+  stores: modem flash config or network-side.
+- Shell-level radio control is sealed on stock user builds: AF_QIPCRTR
+  socket() from shell is SELinux-denied, airplane-mode broadcast and
+  `cmd connectivity airplane-mode` do not reach RIL (no RADIO_POWER
+  transitions in logcat).
+- **Root cause of this morning's AginxOS bootloop: missing HOLD flag.**
+  The trampoline execs aginxos-init (PID 1 takeover) only inside
+  `if (exists("/aginxos/hold"))` — without HOLD it falls through to the
+  Android handoff, and first_stage panics on our ext4 userdata → bootloop
+  (retry drain, adb flapping in the ~t4-10 s trampoline window,
+  /proc/1/comm=trampoline, no /var/kmsg-follow.log because rcS never ran).
+  The documented M2 recipe (HOLD+SPLASH+USBADB+ROOTFS) had HOLD for a
+  reason; vendor-boot.md's "safe default" wording understates it — ROOTFS
+  boots REQUIRE HOLD=1. Fixed by repacking `HOLD=1 USBADB=1 ROOTFS=1
+  KEEPADBD=1`: clean switch_root (kmsg "rootfs: exec /sbin/init"), stable
+  past the 65 s modem-DOG window (uptime 190+ s at time of writing).
+- Battery eliminated as a crash factor: fastboot battery-voltage 4447 mV,
+  soc-ok yes, device on USB throughout.
+
+Device state at this entry: running our stack — stock boot_a (identical to
+`boot/stock-boot.img`) + vendor_boot-test (HOLD/USBADB/ROOTFS/KEEPADBD) +
+userdata rootfs with radio-bringup enabled. Stock vendor_boot NOT currently
+flashed. Next: query DMS operating mode from our OS (raw QMI available
+there), then M7.
