@@ -1,0 +1,34 @@
+#!/bin/sh
+# First-boot provisioning + per-boot self-heal (M10, docs/SYSTEM.md §9.3).
+#
+# Waits for net-bringup to prove internet (its boot.state verdict), then:
+# every manifest entry whose installed sha256 differs gets re-downloaded and
+# atomically installed. That single path is both first-boot install and
+# self-heal — a corrupt/missing binary recovers on the next boot with
+# network. No network / no active manifest entries = quiet no-op; failures
+# here never block the boot.
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/var/bin
+
+STATE=/run/boot.state
+say() { echo "$@" >>"$STATE"; }
+
+[ -f /etc/agpkg.manifest ] || exit 0
+grep -qE '^[a-z]' /etc/agpkg.manifest || exit 0   # all entries commented
+
+# net-bringup writes "internet ok|fail ..." and finally "done ok|fail".
+# Give it up to 6 minutes (radio + join + dhcp on a cold boot), then bail.
+n=0
+while [ $n -lt 180 ]; do
+  grep -q '^internet ok' "$STATE" 2>/dev/null && break
+  grep -q '^done fail' "$STATE" 2>/dev/null && exit 0
+  sleep 2; n=$((n+1))
+done
+grep -q '^internet ok' "$STATE" || exit 0
+
+say pkg run
+if agpkg sync; then
+  say pkg ok
+else
+  say pkg fail "see /var/tmp/agpkg"
+fi
+exit 0

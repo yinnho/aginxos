@@ -1,0 +1,16 @@
+# agpkg manifest — required-tier software (docs/SYSTEM.md §6.1, M10).
+# Format per line: <name> <url> <sha256>   ('#' comments, blank lines ok)
+#
+# The sha256 pins content, so transport honesty is not load-bearing — but
+# the canonical source is GitHub releases. On networks where GitHub stalls,
+# prefix the URL with https://gh-proxy.com/ (sha256 still verified).
+#
+# The entries below stay commented until each repo's release pipeline ships
+# the musl asset (aginx/aginxbrowser on GitHub; aginx-carrier has no public
+# release source yet). Until then, first-boot provisioning installs via
+# adb + `agpkg install`, and a device-local manifest can override this one
+# (agpkg sync /path/to/manifest, or AGPKG_MANIFEST).
+#
+# aginx         https://github.com/yinnho/aginx/releases/download/v0.3.1/aginx-aarch64-unknown-linux-musl <sha256>
+# aginxbrowser  https://github.com/yinnho/aginxbrowser/releases/download/v0.2.4/aginxbrowser-v0.2.4-aarch64-unknown-linux-musl <sha256>
+# aginx-carrier <no public release source yet> <sha256>

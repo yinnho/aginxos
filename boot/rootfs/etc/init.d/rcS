@@ -69,6 +69,12 @@ mkdir -p /run 2>/dev/null
 # lands in /run/boot.state and the card flips to the BOOT COMPLETE banner.
 /etc/init.d/net-bringup &
 
+# First-boot provisioning (M10) — waits for net-bringup's internet verdict,
+# then agpkg-syncs the required-tier manifest. Also the self-heal path: a
+# missing/corrupt /var/bin binary is re-downloaded on the next networked
+# boot. Backgrounded; a no-op when the manifest has no active entries.
+/etc/init.d/provision &
+
 # aginx stack (M8) — gateway + carrier from /var/bin, if installed (agpkg).
 # The gateway's relay client reconnects until Wi-Fi lands, so no ordering
 # dependency on net-bringup. Quiet no-op before first provisioning (M10).

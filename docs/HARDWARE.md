@@ -2161,3 +2161,48 @@ gateway + carrier restarted after reboot (relay ESTABLISHED); aginxbrowser
 (pid, port 8089) running; /var/bin now holds aginx, aginx-carrier, agpkg,
 aginxbrowser; Wi-Fi "Legrand AP" 192.168.0.166; clock ntpd-synced after
 boot (gateway's relay loop needs the clock BEFORE TLS validates).
+
+## M10: first-boot provisioning pipeline — agdl + agpkg sync + ntpd in init (2026-08-30)
+
+Acceptance (partial — everything except the full userdata-wipe restore,
+which waits on the release pipelines; see end):
+
+- `agdl` (new Rust crate, ureq+rustls, 2 MB static): TLS download on device
+  verified — 6.9 MB from GitHub releases via gh-proxy.com. Streams to
+  `.part` + rename, so a killed download never leaves a truncated target.
+  This is now the phone's only working HTTPS fetcher.
+- `agpkg sync [manifest]`: manifest lines `<name> <url> <sha256>`; per entry
+  compares installed sha256, downloads on missing/stale, verifies, atomically
+  installs (reuses the v0 install path, keeps `.prev`). Device tests:
+  missing → installed; corrupted → restored to pinned sha (self-heal);
+  clean → "up to date" no-op. Repo manifest `/etc/agpkg.manifest` ships with
+  all entries commented until the musl release assets exist.
+- `/etc/init.d/provision`: waits for net-bringup's `internet ok` in
+  /run/boot.state (≤6 min), then `agpkg sync`; reports `pkg run|ok|fail`
+  to the boot card. Ran clean on device (rc=0, state lines present).
+- net-bringup now ntpd's (`ntpd -q -n -p ntp.aliyun.com`) right after the
+  internet check, reporting `time run|ok|fail`. Verified across a reboot:
+  boot.state shows `time ok 2026-08-29`; `date` agrees. This closes the
+  "1970 clock breaks TLS" class for good.
+- **Push-workflow trap**: `adb push` over an existing init.d script lands
+  0644 — the second aginx-services push silently broke boot autostart
+  (rcS got "Permission denied", zero services came up). build-rootfs.sh
+  chmods correctly; on-device pushes of scripts must `chmod 755` after.
+  (Also: `adb reboot` hangs with our initless rcS — use fastboot or
+  sysrq-trigger. Two unplanned hard reboots this session drained the slot-a
+  retry counter into "no valid slot to boot"; `fastboot set_active a`
+  recovered, as before.)
+- Full-boot chain after `fastboot set_active a` + reboot: touch/battery/
+  modem/wlan/wifi/dhcp/internet/time/done all ok, then aginx+carrier+
+  aginxbrowser up (relay ESTABLISHED, :8089 LISTEN) — after the chmod fix.
+
+**Not done**: `userdata 清空 → 自动恢复到完整节点` needs the release
+pipelines to publish musl assets (aginx, aginxbrowser on GitHub) and a
+public source for aginx-carrier. Until then a wiped device reinstalls via
+adb + `agpkg install` (the v0 path), which is exactly what we did for
+M8/M9.
+
+Session-end device state: AginxOS boot, slot a (retry counter refreshed),
+adb aginxosredfin; /etc/init.d/{provision,net-bringup,aginx-services} and
+/usr/bin/{agpkg,agdl} at their M10 versions (0755); all three services
+running; Wi-Fi "Legrand AP" 192.168.0.166; clock ntpd-synced at boot.

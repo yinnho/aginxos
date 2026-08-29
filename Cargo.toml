@@ -4,6 +4,7 @@ members = [
     "crates/aginxos-probe",
     "crates/aginxos-agent",
     "crates/aginxos-init",
+    "crates/agdl",
 ]
 default-members = ["crates/aginxos-probe"]
 

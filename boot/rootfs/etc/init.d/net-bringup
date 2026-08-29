@@ -107,6 +107,18 @@ if HTTP=$(/bin/httpget http://www.baidu.com/ /tmp/baidu.html 2>&1); then
   BYTES=$3
   echo "baidu fetch ok ($HTTP) $(date)"
   say internet ok "www.baidu.com ${BYTES}B"
+  # Clock sync (M10) — TLS certificate validation needs a roughly-correct
+  # clock, and this kernel boots at the build epoch (observed 1970/2029
+  # drift). busybox date -s misparses GNU formats, so ntpd is the only
+  # trusted path. Best-effort: a failed sync must not fail the boot.
+  say time run
+  if ntpd -q -n -p ntp.aliyun.com >/dev/null 2>&1; then
+    say time ok "$(date +%Y-%m-%d)"
+    echo "clock synced: $(date)"
+  else
+    say time fail "ntpd"
+    echo "ntpd failed — TLS validation may break until the clock is fixed"
+  fi
   say done ok
   echo "=== net up: $IP via $SSID $(date) ==="
   exit 0

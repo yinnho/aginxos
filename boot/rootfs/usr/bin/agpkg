@@ -12,6 +12,8 @@
 #
 # usage:
 #   agpkg install <name> <src-file> <sha256>
+#   agpkg sync [manifest]   — download + install every manifest entry whose
+#                             installed sha256 differs (M10 self-heal)
 #   agpkg rollback <name>
 #   agpkg list
 set -eu
@@ -19,6 +21,8 @@ PATH=/sbin:/bin:/usr/sbin:/usr/bin:/var/bin
 
 BINDIR=/var/bin
 APPDIR=/var/apps
+MANIFEST=${AGPKG_MANIFEST:-/etc/agpkg.manifest}
+DL=/var/tmp/agpkg
 
 cmd=${1:-}
 name=${2:-}
@@ -48,6 +52,37 @@ rollback)
   mv "$BINDIR/.$name.prev" "$BINDIR/$name"
   echo "agpkg: rolled back $name"
   ;;
+sync)
+  mf=${2:-$MANIFEST}
+  [ -f "$mf" ] || { echo "agpkg: no manifest $mf — nothing to sync"; exit 0; }
+  mkdir -p "$DL"
+  rc=0
+  # manifest lines: <name> <url> <sha256>   ('#' comments, blank lines ok)
+  while read -r pname purl psum rest; do
+    case "$pname" in ''|\#*) continue;; esac
+    [ -n "$purl" ] && [ -n "$psum" ] || { echo "agpkg: bad manifest line: $pname" >&2; rc=1; continue; }
+    cur=
+    [ -f "$BINDIR/$pname" ] && cur=$(sha256sum "$BINDIR/$pname" | cut -d' ' -f1)
+    if [ "$cur" = "$psum" ]; then
+      echo "agpkg: $pname up to date"
+      continue
+    fi
+    if [ -n "$cur" ]; then
+      echo "agpkg: $pname stale — downloading"
+    else
+      echo "agpkg: $pname missing — downloading"
+    fi
+    f="$DL/$pname"
+    rm -f "$f"
+    if agdl "$purl" "$f" && "$0" install "$pname" "$f" "$psum"; then
+      rm -f "$f"
+    else
+      echo "agpkg: $pname sync FAILED (kept previous)" >&2
+      rc=1
+    fi
+  done < "$mf"
+  exit $rc
+  ;;
 list)
   for f in "$BINDIR"/*; do
     [ -f "$f" ] || continue
@@ -56,7 +91,7 @@ list)
   done
   ;;
 *)
-  echo "usage: agpkg install <name> <src> <sha256> | rollback <name> | list" >&2
+  echo "usage: agpkg install <name> <src> <sha256> | sync [manifest] | rollback <name> | list" >&2
   exit 2
   ;;
 esac

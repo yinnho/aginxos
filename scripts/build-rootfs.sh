@@ -164,10 +164,14 @@ cp "${RECIPE}/busybox" "${TREE}/bin/busybox"
 cp -R "${RECIPE}/etc/." "${TREE}/etc/"
 mkdir -p "${TREE}/usr/bin"
 cp -R "${RECIPE}/usr/bin/." "${TREE}/usr/bin/"
+# agdl (M10) — the only working HTTPS fetcher on the phone; agpkg sync and
+# the first-boot provisioner download required-tier software with it.
+cp "${TARGET}/agdl" "${TREE}/usr/bin/agdl"
 chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/touch-bringup" "${TREE}/etc/init.d/battery-bringup" \
   "${TREE}/etc/init.d/radio-bringup" "${TREE}/etc/init.d/net-bringup" \
-  "${TREE}/etc/init.d/aginx-services" "${TREE}/usr/bin/agpkg"
+  "${TREE}/etc/init.d/aginx-services" "${TREE}/etc/init.d/provision" \
+  "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdl"
 # NB: wifi.conf.example rides along in ${RECIPE}/etc — the real
 # /etc/wifi.conf (with the passphrase) is pushed by hand, never committed.
 cp "${TARGET}/aginxos-init" "${TARGET}/aginxos-agent" "${TREE}/aginxos/"

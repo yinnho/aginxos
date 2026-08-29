@@ -34,10 +34,11 @@ build_musl() {
 
 pkgs=()
 case "${CRATE}" in
-  all) pkgs=(aginxos-probe aginxos-agent aginxos-init) ;;
+  all) pkgs=(aginxos-probe aginxos-agent aginxos-init agdl) ;;
   probe|aginxos-probe) pkgs=(aginxos-probe) ;;
   agent|aginxos-agent) pkgs=(aginxos-agent) ;;
   init|aginxos-init) pkgs=(aginxos-init) ;;
+  agdl) pkgs=(agdl) ;;
   *) echo "unknown crate: ${CRATE}" >&2; exit 1 ;;
 esac
 
