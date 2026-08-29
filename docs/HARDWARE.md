@@ -1862,3 +1862,41 @@ Device state at this entry: running our stack — stock boot_a (identical to
 userdata rootfs with radio-bringup enabled. Stock vendor_boot NOT currently
 flashed. Next: query DMS operating mode from our OS (raw QMI available
 there), then M7.
+
+## flash-all + full modem-storage wipe: mode 5 still latched; Wi-Fi restored (2026-08-29 afternoon)
+
+Continuation of the mode-5 hunt. All results observed on device:
+
+- **SIM ruled out**: the CT SIM registers and works normally in a second
+  phone (Huawei). Carrier/account/network are fine; the fault is in this
+  device.
+- **fsc wiped** (128 KiB, sdf5; backup `.local/fsc-backup-20260829.img`,
+  md5 8c117e83…): modem power-cycled (boot_cdsp/boot 0 + /dev/subsys_modem
+  holder), fresh PIL — DMS 0x2D still returns mode **5**.
+- **radio (modem firmware) reflashed** from factory image
+  (radio-redfin-g7250-00264-230619-b-10346159.img): still mode 5.
+- **Full modem-storage factory reset**: fsg + modemst1 + modemst2 + fsc ALL
+  zeroed (fsg backup `.local/fsg-backup-20260829.img`, md5 e2a61af1…,
+  2,621,440 B), fresh PIL: EFS rebuilt from firmware defaults — still
+  mode 5. fsg differs from the pre-wipe modemst at ~2.61M/2.62M byte
+  positions (no poison sync from the wedged EFS into fsg).
+- **Full factory flash-all** (bootloader r3-0.6 + radio + UP1A.231105.001.b2
+  images + -w): stock boots to the setup wizard, SIM LOADED, but telephony
+  remains OUT_OF_SERVICE. flash-all does not clear the latch either.
+- Conclusion: the registration block survives zeroing every modem-writable
+  partition we can reach, a full firmware reflash, and cold power-off. No
+  remaining AP-side software store can hold it; either the block is
+  computed at modem boot from a condition we cannot observe, or it is
+  modem-internal state. Open question for the next phase: whether loading a
+  CN-carrier mcfg (PDC LOAD) changes modem behavior — but PDC writes are
+  refused while mode 5 holds.
+- **Wi-Fi restored** (M5 regression fixed): the userdata wipes had deleted
+  the device-only `/etc/wifi.conf`, and the recreated copy had the SSID
+  misspelled — the real SSID is "Legrand AP" (ch 5). With the corrected
+  config written on device: join ok, DHCP 192.168.0.166, baidu.com HTTP
+  200. Boot card shows `done ok`. Reminder: wifi.conf must be recreated on
+  device after any userdata wipe.
+
+Device state: AginxOS (vendor_boot HOLD+USBADB+ROOTFS, userdata rootfs with
+radio-bringup), modem wedged at DMS mode 5, Wi-Fi + internet up. fsg /
+modemst1/2 / fsc currently zeroed (host backups in .local/).
