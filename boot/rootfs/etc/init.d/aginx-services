@@ -32,3 +32,12 @@ if [ -x /var/bin/aginx-carrier ]; then
 else
   say carrier absent
 fi
+
+# aginxbrowser (M9) — local browser engine, HTTP API on :8089. Required tier,
+# but the phone stays fully usable without it, so absence is not an error.
+if [ -x /var/bin/aginxbrowser ]; then
+  say aginxbrowser run
+  ( exec /var/bin/aginxbrowser ) >/var/log/aginxbrowser.log 2>&1 &
+else
+  say aginxbrowser absent
+fi

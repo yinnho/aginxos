@@ -2119,3 +2119,45 @@ Session-end device state: AginxOS boot, slot a, adb aginxosredfin;
 gateway + carrier running under setsid, logs /var/log/aginx{,-carrier}.log;
 /etc/init.d/aginx-services + rcS hook pushed (autostart next boot);
 m7-v7 racer still running; Wi-Fi on "Legrand AP" (192.168.0.166).
+
+## M9: aginxbrowser runs on device — v8 (150.4) renders JS on musl (2026-08-29)
+
+Acceptance: the full server-side browser engine, static musl, serving its
+HTTP API on the phone. Observed:
+
+- aginxbrowser repo did the port (their main @ 8a52027): deno_core 0.350 →
+  0.411 (v8 137 → 150.4 — first with official
+  `librusty_v8_simdutf_release_aarch64-unknown-linux-musl.a.gz` prebuilt),
+  deno_error unified to 0.7. stealth/screenshot stayed opt-in, off.
+- Build: `cargo zigbuild --release --target aarch64-unknown-linux-musl` →
+  61 MB static stripped ELF. **Build-host gotcha**: `RUSTY_V8_ARCHIVE`
+  applies to BOTH the target build and the host-side snapshot build script
+  (build-dependencies deno_core), so pointing it at the musl .a breaks the
+  host link ("archive member not a mach-o file"). Working recipe: serve a
+  local mirror dir structured `<base>/v150.4.0/{librusty_v8_*.a.gz,
+  src_binding_*.rs}` (bindings .rs files are downloaded too!) and set
+  `RUSTY_V8_MIRROR=http://127.0.0.1:18742`. GitHub-release downloads of the
+  37 MB archives stall on this network; gh-proxy.com mirror sustained
+  ~800 KB/s.
+- Installed via agpkg (sha256 7fe02343…d000). `--help` starts the server
+  instead of printing help — there is no help text; default bind
+  0.0.0.0:8089 (AGINXBROWSER_BIND overrides).
+- On-device API results (via adb forward):
+  - `/health`: ok, engine diting, capabilities screenshot:false
+    stealth:false (as designed)
+  - `/fetch https://example.com` (tier http): title + markdown body
+  - `/fetch https://quotes.toscrape.com/js/ render_tier=obscura`: **v8
+    executed page JS on musl** — quote list present (absent without JS)
+  - `/search` (field is `q`, not `query`): bing+sogou aggregated, 69 hits
+  - `/session/create` → s_1, `/session/s_1/eval document.title` →
+    "Example Domain" (live multi-step session)
+  - `/mcp` responds (streamable-HTTP handshake requires session id —
+    endpoint alive)
+- Boot wiring: aginxbrowser added to /etc/init.d/aginx-services (optional
+  start, logs /var/log/aginxbrowser.log).
+
+Session-end device state: AginxOS boot, slot a, adb aginxosredfin; aginx
+gateway + carrier restarted after reboot (relay ESTABLISHED); aginxbrowser
+(pid, port 8089) running; /var/bin now holds aginx, aginx-carrier, agpkg,
+aginxbrowser; Wi-Fi "Legrand AP" 192.168.0.166; clock ntpd-synced after
+boot (gateway's relay loop needs the clock BEFORE TLS validates).
