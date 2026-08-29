@@ -1,0 +1,62 @@
+#!/bin/sh
+# agpkg v0 — AginxOS package installer (docs/SYSTEM.md §6.1).
+#
+# A package is a static musl binary + this convention:
+#   /var/bin/<name>        installed binary
+#   /var/bin/.<name>.prev  previous version (rollback)
+#   /var/apps/<name>/      data dir
+#
+# v0 is adb-fed: SRC is a local file already on the device. Network download
+# arrives with M10 — this busybox's wget segfaults and httpget is HTTP-only
+# (see src/httpget.c), so an HTTPS fetcher is an M10 deliverable.
+#
+# usage:
+#   agpkg install <name> <src-file> <sha256>
+#   agpkg rollback <name>
+#   agpkg list
+set -eu
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/var/bin
+
+BINDIR=/var/bin
+APPDIR=/var/apps
+
+cmd=${1:-}
+name=${2:-}
+
+case "$cmd" in
+install)
+  src=${3:-}; sum=${4:-}
+  [ -n "$src" ] && [ -n "$sum" ] || { echo "usage: agpkg install <name> <src> <sha256>" >&2; exit 2; }
+  [ -f "$src" ] || { echo "agpkg: no such file: $src" >&2; exit 1; }
+  got=$(sha256sum "$src" | cut -d' ' -f1)
+  if [ "$got" != "$sum" ]; then
+    echo "agpkg: sha256 mismatch for $name: got $got want $sum" >&2
+    exit 1
+  fi
+  mkdir -p "$BINDIR" "$APPDIR/$name"
+  if [ -f "$BINDIR/$name" ]; then
+    cp "$BINDIR/$name" "$BINDIR/.$name.prev"
+  fi
+  # atomic place: same-fs rename
+  cp "$src" "$BINDIR/.$name.new"
+  chmod 755 "$BINDIR/.$name.new"
+  mv "$BINDIR/.$name.new" "$BINDIR/$name"
+  echo "agpkg: installed $name ($sum)"
+  ;;
+rollback)
+  [ -f "$BINDIR/.$name.prev" ] || { echo "agpkg: no previous version of $name" >&2; exit 1; }
+  mv "$BINDIR/.$name.prev" "$BINDIR/$name"
+  echo "agpkg: rolled back $name"
+  ;;
+list)
+  for f in "$BINDIR"/*; do
+    [ -f "$f" ] || continue
+    case "$f" in */.*) continue;; esac
+    echo "${f##*/}"
+  done
+  ;;
+*)
+  echo "usage: agpkg install <name> <src> <sha256> | rollback <name> | list" >&2
+  exit 2
+  ;;
+esac

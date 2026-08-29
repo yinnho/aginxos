@@ -68,3 +68,8 @@ mkdir -p /run 2>/dev/null
 # joins /etc/wifi.conf, DHCP, then fetches http://www.baidu.com; every step
 # lands in /run/boot.state and the card flips to the BOOT COMPLETE banner.
 /etc/init.d/net-bringup &
+
+# aginx stack (M8) — gateway + carrier from /var/bin, if installed (agpkg).
+# The gateway's relay client reconnects until Wi-Fi lands, so no ordering
+# dependency on net-bringup. Quiet no-op before first provisioning (M10).
+/etc/init.d/aginx-services &

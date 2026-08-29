@@ -2076,3 +2076,46 @@ selected = official China_CT_Commercial_OpenMkt (`9f3f8967…1cd8`,
 rollback = SET_SELECTED `54375ac9…e715` WildCard); mode pref 0x5F;
 service-domain PS-only; DMS set ONLINE this boot; m7-v7 racer running;
 Wi-Fi unaffected.
+
+## M8: phone joins the aginx network — full relay round-trip to the on-device clone (2026-08-29)
+
+Acceptance: from the Mac, `agc agent://cf49973e.relay.aginx.net/clone-creator
+"只回：ok"` over the public relay, answered by the clone running on the
+phone. Observed:
+
+- aginx gateway + aginx-carrier cross-built `aarch64-unknown-linux-musl`
+  (cargo-zigbuild), fully static: aginx 4.8 MB, aginx-carrier 29 MB.
+- **rustls port required**: gateway used native-tls (OpenSSL, musl-hostile).
+  Ported relay client + ACP relay client + test example to tokio-rustls 0.26
+  / rustls 0.23 (ring) / webpki-roots (aginx repo, 2 call sites + 1 example).
+  **Gotcha observed on device**: tokio-rustls 0.26 default features pull
+  `aws-lc-rs`; with ring also enabled rustls panics at runtime ("Could not
+  automatically determine the process-level CryptoProvider"). Fix:
+  `default-features = false, features = ["ring", "tls12", "logging"]`.
+  aws-lc-rs then leaves Cargo.lock entirely.
+- Installer v0 (`agpkg`, shell): sha256-verify → stage `.name.new` → atomic
+  rename into `/var/bin`, keeps `.name.prev` for rollback. Both binaries
+  installed through it on device.
+- Gateway registers with relay.aginx.net:8443 (TLS handshake confirmed,
+  ESTABLISHED held; 106.75.32.216). Requires correct clock — `ntpd -q -n -p
+  ntp.aliyun.com` after net-bringup (busybox `date -s` misparses GNU
+  format; it once set the year to 2029).
+- Owner binding flow works headless: `aginx pair` on device (code, 300 s
+  TTL) → `agc --bind <code>` on Mac (token into ~/.aginx/agc/tokens.json).
+- **Env propagation matters**: the ACP child (`aginx-carrier acp`) is
+  spawned by the *gateway*, so `AGINXBRAIN_API_KEY` must be in the
+  gateway's environment, not just the carrier daemon's. `/etc/aginx/env`
+  (0600) + `set -a; . /etc/aginx/env; set +a` in aginx-services. First
+  attempts failed with "LLM driver error: Auth error" exactly because of
+  this (and once because `. env` without `set -a` doesn't export).
+- Round-trips observed: first turn answered `ok`; `--session` resume turn
+  correctly recalled the previous instruction (answered `ok` again).
+  sessionId ed8005a4-…. clone-creator + me seeded; registrations
+  auto-written with self-locating `[command] path = "/var/bin/aginx-carrier"`.
+
+Session-end device state: AginxOS boot, slot a, adb aginxosredfin;
+/var/bin/{aginx,aginx-carrier,agpkg} installed via agpkg; /etc/aginx/env
+(0600, brain key); /var/home/.aginx (gateway id cf49973e, private access);
+gateway + carrier running under setsid, logs /var/log/aginx{,-carrier}.log;
+/etc/init.d/aginx-services + rcS hook pushed (autostart next boot);
+m7-v7 racer still running; Wi-Fi on "Legrand AP" (192.168.0.166).

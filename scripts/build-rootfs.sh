@@ -162,9 +162,12 @@ fi
 mkdir -p "${TREE}/bin" "${TREE}/sbin" "${TREE}/aginxos"
 cp "${RECIPE}/busybox" "${TREE}/bin/busybox"
 cp -R "${RECIPE}/etc/." "${TREE}/etc/"
+mkdir -p "${TREE}/usr/bin"
+cp -R "${RECIPE}/usr/bin/." "${TREE}/usr/bin/"
 chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/touch-bringup" "${TREE}/etc/init.d/battery-bringup" \
-  "${TREE}/etc/init.d/radio-bringup" "${TREE}/etc/init.d/net-bringup"
+  "${TREE}/etc/init.d/radio-bringup" "${TREE}/etc/init.d/net-bringup" \
+  "${TREE}/etc/init.d/aginx-services" "${TREE}/usr/bin/agpkg"
 # NB: wifi.conf.example rides along in ${RECIPE}/etc — the real
 # /etc/wifi.conf (with the passphrase) is pushed by hand, never committed.
 cp "${TARGET}/aginxos-init" "${TARGET}/aginxos-agent" "${TREE}/aginxos/"
