@@ -2206,3 +2206,48 @@ Session-end device state: AginxOS boot, slot a (retry counter refreshed),
 adb aginxosredfin; /etc/init.d/{provision,net-bringup,aginx-services} and
 /usr/bin/{agpkg,agdl} at their M10 versions (0755); all three services
 running; Wi-Fi "Legrand AP" 192.168.0.166; clock ntpd-synced at boot.
+
+## M11: aterm — on-device terminal (launcher + pty shell + touch keyboard) (2026-08-30)
+
+New crate `crates/aterm` (378 KB static musl, deps: libc + vte). The panel
+UI: bootcard hands the panel to aterm once boot finishes.
+
+- DRM layer is a faithful Rust port of bootcard.c's proven msm_drm 4.19
+  path (raw ioctls; zero count_fbs/encoders on the second GETRESOURCES,
+  skip mode-less connectors, prefer DSI type 16, fall back to first
+  compatible encoder when the previous master released the binding).
+- Terminal: vte parser -> own cell grid (90x70 at glyph scale 2 on
+  1080x2340), 400-line scrollback ring, SGR mapped onto the fixed phosphor
+  palette (black bg, green normal, white = bright, inverse supported).
+  busybox sh runs under openpty (setsid + TIOCSCTTY), verified live:
+  `pidof sh` shows the pty child, typing echoes, commands run.
+- Keyboard: on-screen ASCII (evdev /dev/input/event2, type-B protocol).
+  SHF = one-shot shift, SYM = one-shot symbol page (30 shell punctuation
+  chars), SPC/DEL/ENT/ESC. Tap log on device confirmed correct byte decode
+  (letters, shifted digits). Drag on the terminal area scrolls scrollback.
+  v1 has no TAB key.
+- Launcher: CLONE/codex/grok/sh buttons (missing binaries shown dimmed,
+  only SH installed so far); toolbar SH/BACK strip while an app runs;
+  child exit -> back to launcher. Verified on device by hand.
+- Handoff: rcS records bootcard's pid in /run/bootcard.pid (NOT /var/run —
+  that dir doesn't exist on this rootfs; the first attempt wrote into the
+  void and bootcard was never killed, aterm crash-looped on SETCRTC).
+  /etc/init.d/aterm-handoff waits for `done` in /run/boot.state (5 min
+  hard cap), kills bootcard, runs aterm under a respawn loop.
+- **Buffer-latch trap**: the panel snapshots the fb at SETCRTC, and the
+  modeset must latch the SAME dumb buffer the first frame was painted
+  into. First version painted the back buffer but latched fb[0] — static
+  launcher stayed black while interactive sessions eventually relatched
+  (that difference is what made the manual ATERM_START=sh test pass while
+  the boot path showed a dead screen). Fixed: initial_modeset latches the
+  painted back buffer; PAGE_FLIP is refused on this driver (same as
+  bootcard observed), so every present() re-SETCRTCs — event-driven, no
+  visible lag typing.
+- Host verification: `aterm --ppm out.ppm` renders launcher + terminal
+  frames to PPM off-device (same pattern as bootcard --ppm).
+- Manifest activated: aginx v0.3.2 and aginx-carrier v0.1.0 musl release
+  assets are published on GitHub; /etc/agpkg.manifest entries are now
+  live. `agpkg sync` on device downloaded both (sha256-verified, atomic
+  install, .prev kept) and the stack restarted clean on the release
+  binaries (relay ESTABLISHED, carrier daemon ready). aginxbrowser's musl
+  asset is still pending — its manifest line stays commented.

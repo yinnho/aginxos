@@ -22,6 +22,7 @@ SIZE="${SIZE:-512m}"
 test -x "${RAMDISK}/system/bin/adbd" || { echo "missing ${RAMDISK} — run boot/unpack-boot.sh first" >&2; exit 1; }
 test -x "${RECIPE}/busybox" || { echo "missing ${RECIPE}/busybox" >&2; exit 1; }
 test -x "${TARGET}/aginxos-init" || { echo "missing musl binaries — run scripts/build-phone.sh musl first" >&2; exit 1; }
+test -x "${TARGET}/aterm" || { echo "missing aterm — run scripts/build-phone.sh musl first" >&2; exit 1; }
 MKE2FS="$(command -v mke2fs || true)"
 test -z "${MKE2FS}" && MKE2FS=/opt/homebrew/bin/mke2fs
 test -x "${MKE2FS}" || { echo "mke2fs not found (android-platform-tools provides it)" >&2; exit 1; }
@@ -167,11 +168,14 @@ cp -R "${RECIPE}/usr/bin/." "${TREE}/usr/bin/"
 # agdl (M10) — the only working HTTPS fetcher on the phone; agpkg sync and
 # the first-boot provisioner download required-tier software with it.
 cp "${TARGET}/agdl" "${TREE}/usr/bin/agdl"
+# aterm (M11) — the on-device terminal UI: launcher + pty shell on the panel.
+cp "${TARGET}/aterm" "${TREE}/usr/bin/aterm"
 chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/touch-bringup" "${TREE}/etc/init.d/battery-bringup" \
   "${TREE}/etc/init.d/radio-bringup" "${TREE}/etc/init.d/net-bringup" \
   "${TREE}/etc/init.d/aginx-services" "${TREE}/etc/init.d/provision" \
-  "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdl"
+  "${TREE}/etc/init.d/aterm-handoff" \
+  "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdl" "${TREE}/usr/bin/aterm"
 # NB: wifi.conf.example rides along in ${RECIPE}/etc — the real
 # /etc/wifi.conf (with the passphrase) is pushed by hand, never committed.
 cp "${TARGET}/aginxos-init" "${TARGET}/aginxos-agent" "${TREE}/aginxos/"

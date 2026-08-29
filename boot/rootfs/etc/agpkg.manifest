@@ -5,12 +5,11 @@
 # the canonical source is GitHub releases. On networks where GitHub stalls,
 # prefix the URL with https://gh-proxy.com/ (sha256 still verified).
 #
-# The entries below stay commented until each repo's release pipeline ships
-# the musl asset (aginx/aginxbrowser on GitHub; aginx-carrier has no public
-# release source yet). Until then, first-boot provisioning installs via
-# adb + `agpkg install`, and a device-local manifest can override this one
-# (agpkg sync /path/to/manifest, or AGPKG_MANIFEST).
-#
-# aginx         https://github.com/yinnho/aginx/releases/download/v0.3.1/aginx-aarch64-unknown-linux-musl <sha256>
-# aginxbrowser  https://github.com/yinnho/aginxbrowser/releases/download/v0.2.4/aginxbrowser-v0.2.4-aarch64-unknown-linux-musl <sha256>
-# aginx-carrier <no public release source yet> <sha256>
+# aginx v0.3.2 and aginx-carrier v0.1.0 musl assets shipped 2026-08-30 and
+# are active below. aginxbrowser's musl asset is still pending — until its
+# release pipeline ships it, aginxbrowser installs via adb + `agpkg install`.
+
+aginx          https://github.com/yinnho/aginx/releases/download/v0.3.2/aginx-aarch64-unknown-linux-musl 1f8134d0d7bbead9ffcff9c7c1cb1499f3fcc10b4c7f3db7f44e41d658991690
+aginx-carrier  https://github.com/yinnho/aginx-carrier/releases/download/v0.1.0/aginx-carrier-v0.1.0-aarch64-unknown-linux-musl 6fbf5c9cb73c5a3ab8b6e8c58dd5de0165499bed357eb1667054b33569be53d0
+
+# aginxbrowser  https://github.com/yinnho/aginxbrowser/releases/download/v0.2.4/aginxbrowser-v0.2.4-aarch64-unknown-linux-musl <sha256 pending>

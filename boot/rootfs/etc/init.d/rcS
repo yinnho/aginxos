@@ -48,6 +48,8 @@ date > /etc/.rcs-ran
 mkdir -p /run 2>/dev/null
 : > /run/boot.state
 ( exec /bin/bootcard /run/boot.state ) >/var/bootcard.log 2>&1 &
+# aterm-handoff (M11) kills bootcard by this pid once boot finishes.
+echo $! > /run/bootcard.pid
 
 # Touch bring-up (M3) — backgrounded: it waits out the ~60s panel
 # registration, and the console must not block on it. Loads the display
@@ -79,3 +81,7 @@ mkdir -p /run 2>/dev/null
 # The gateway's relay client reconnects until Wi-Fi lands, so no ordering
 # dependency on net-bringup. Quiet no-op before first provisioning (M10).
 /etc/init.d/aginx-services &
+
+# Panel handoff (M11) — when boot finishes, bootcard's panel goes to aterm
+# (launcher + shell). Backgrounded: waits on /run/boot.state.
+/etc/init.d/aterm-handoff &

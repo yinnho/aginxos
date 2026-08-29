@@ -1,0 +1,9 @@
+[package]
+name = "aterm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+libc = { workspace = true }
+vte = "0.13"

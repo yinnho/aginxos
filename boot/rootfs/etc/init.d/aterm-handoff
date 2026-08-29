@@ -1,0 +1,28 @@
+#!/bin/sh
+# Panel handoff (M11): bootcard -> aterm.
+#
+# bootcard never exits on its own — dropping DRM master lets dsi_backlight's
+# dpms hooks blank the panel. So once boot finishes (a "done ok|fail" line
+# lands in /run/boot.state, or a hard 5 min timeout for broken boots), we
+# kill bootcard and start aterm. aterm re-takes master and paints its first
+# frame before SETCRTC, so the panel only dips for the modeset itself.
+# The respawn loop keeps the UI alive if aterm ever crashes.
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+n=0
+while ! grep -q '^done ' /run/boot.state 2>/dev/null && [ $n -lt 150 ]; do
+  sleep 2; n=$((n+1))
+done
+# let the operator see the final boot card for a moment
+sleep 5
+
+[ -f /run/bootcard.pid ] && kill "$(cat /run/bootcard.pid)" 2>/dev/null
+# belt and braces: if the pidfile was lost, kill by name
+pidof bootcard >/dev/null 2>&1 && kill $(pidof bootcard) 2>/dev/null
+sleep 1
+
+( while :; do
+    echo "=== aterm start $(date) ===" >> /var/aterm.log
+    /usr/bin/aterm >> /var/aterm.log 2>&1
+    sleep 2
+  done ) &
