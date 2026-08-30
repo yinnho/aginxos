@@ -432,11 +432,14 @@ fn main() {
     // the 28 px side margins — 6/28 cols felt a bit too few).
     let scale = 5usize;
     let area_top = lg.toolbar_h + 20;
-    let area_h = kg.extra_y - area_top;
+    // Keyboard starts hidden; a tap in the terminal area summons/dismisses
+    // it and the terminal rows grow/shrink to match (child gets SIGWINCH).
+    let area_bottom = |vis: bool| if vis { kg.extra_y } else { h - 24 };
+    let rows_for = |vis: bool| ((area_bottom(vis) - area_top) / (8 * scale + ROW_GAP)).max(4);
     let term_cols = ((w - 2 * kb::KB_M) / (6 * scale)).max(20);
-    let term_rows = (area_h / (8 * scale + ROW_GAP)).max(4);
+    let mut kb_visible = false;
 
-    let mut term = Term::new(term_cols, term_rows);
+    let mut term = Term::new(term_cols, rows_for(kb_visible));
     let mut parser = vte::Parser::new();
     let mut mode = Mode::Launcher;
     // Debug/headless path: ATERM_START=<bin> skips the launcher and spawns
@@ -444,7 +447,7 @@ fn main() {
     if let Ok(prog) = std::env::var("ATERM_START") {
         // leak: aterm is a forever-process
         let prog: &'static str = Box::leak(prog.into_boxed_str());
-        match spawn_shell(term_cols as u16, term_rows as u16, &[prog]) {
+        match spawn_shell(term_cols as u16, rows_for(kb_visible) as u16, &[prog]) {
             Ok(c) => mode = Mode::Running(c),
             Err(e) => eprintln!("aterm: ATERM_START spawn: {e}"),
         }
@@ -465,10 +468,12 @@ fn main() {
             Mode::Running(_) => {
                 fill_rect(buf, pitch, w, h, 0, 0, w as i32, h as i32, BG);
                 r.toolbar(buf, lg.m, lg.toolbar_h);
-                r.terminal(buf, &term, area_top, area_h, scale, true, lg.m);
+                r.terminal(buf, &term, area_top, area_bottom(kb_visible) - area_top, scale, true, lg.m);
             }
         }
-        r.keyboard(buf, &kg, &kb);
+        if kb_visible {
+            r.keyboard(buf, &kg, &kb);
+        }
         d.back_buf().copy_from_slice(&canvas);
     }
     if let Err(e) = d.initial_modeset() {
@@ -505,7 +510,8 @@ fn main() {
             if child_exited(child.pid) {
                 mode = Mode::Launcher;
                 entries = launch::entries();
-                term = Term::new(term_cols, term_rows);
+                kb_visible = false;
+                term = Term::new(term_cols, rows_for(false));
                 parser = vte::Parser::new();
                 redraw = true;
             }
@@ -555,10 +561,11 @@ fn main() {
                                     if let Some(i2) = lg.button_at(x, y, entries.len()) {
                                         if entries[i2].avail {
                                             let prog = entries[i2].bin;
-                                            match spawn_shell(term_cols as u16, term_rows as u16, &[prog]) {
+                                            match spawn_shell(term_cols as u16, rows_for(false) as u16, &[prog]) {
                                                 Ok(c) => {
                                                     mode = Mode::Running(c);
-                                                    term = Term::new(term_cols, term_rows);
+                                                    kb_visible = false;
+                                                    term = Term::new(term_cols, rows_for(false));
                                                     parser = vte::Parser::new();
                                                     kb_dirty = true;
                                                     // wipe launcher pixels below the header —
@@ -574,7 +581,7 @@ fn main() {
                                     }
                                 }
                             }
-                            if y >= kg.extra_y {
+                            if kb_visible && y >= kg.extra_y {
                                 let bytes = if y >= kg.panel_y {
                                     kb.key_at(&kg, x, y)
                                 } else {
@@ -612,8 +619,32 @@ fn main() {
                             }
                         }
                         // Finger lifted: everything fired at Down already.
-                        Touch::Tap(_x, _y) => {
+                        // A tap in the terminal area (no drag) summons or
+                        // dismisses the keyboard; rows resize + SIGWINCH.
+                        Touch::Tap(_x, y) => {
                             held = None;
+                            let kb_bot = if kb_visible { kg.extra_y } else { h };
+                            if let Mode::Running(c) = &mode {
+                                if y >= lg.toolbar_h && y < kb_bot {
+                                    kb_visible = !kb_visible;
+                                    let nr = rows_for(kb_visible);
+                                    term.resize_rows(nr);
+                                    let ws = libc::winsize {
+                                        ws_row: nr as u16,
+                                        ws_col: term_cols as u16,
+                                        ws_xpixel: 0,
+                                        ws_ypixel: 0,
+                                    };
+                                    unsafe {
+                                        libc::ioctl(c.master.as_raw_fd(), libc::TIOCSWINSZ as _, &ws);
+                                    }
+                                    // layout changed — wipe everything below
+                                    // the header and repaint from scratch
+                                    fill_rect(&mut canvas, pitch, w, h, 0, lg.toolbar_h as i32, w as i32, (h - lg.toolbar_h) as i32, BG);
+                                    kb_dirty = true;
+                                    redraw = true;
+                                }
+                            }
                         }
                         // Scrollback drag only counts if the touch STARTED
                         // in the terminal area (dragging across keys types
@@ -623,7 +654,8 @@ fn main() {
                         }
                         Touch::Drag(dy) => {
                             held = None; // finger slid off the key
-                            if down_y < kg.extra_y {
+                            let kb_bot = if kb_visible { kg.extra_y } else { h };
+                            if down_y < kb_bot {
                                 if let Mode::Running(_) = mode {
                                     let lines = dy / (8 * scale) as isize;
                                     if lines != 0 {
@@ -675,13 +707,14 @@ fn main() {
                 Mode::Launcher => {
                     // launcher() full-covers the canvas
                     r.launcher(buf, &entries, &lg);
-                    r.keyboard(buf, &kg, &kb);
                 }
                 Mode::Running(_) => {
-                    r.terminal(buf, &term, area_top, area_h, scale, blink_on, lg.m);
+                    r.terminal(buf, &term, area_top, area_bottom(kb_visible) - area_top, scale, blink_on, lg.m);
                     if kb_dirty {
                         r.toolbar(buf, lg.m, lg.toolbar_h);
-                        r.keyboard(buf, &kg, &kb);
+                        if kb_visible {
+                            r.keyboard(buf, &kg, &kb);
+                        }
                     }
                 }
             }

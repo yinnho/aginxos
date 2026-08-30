@@ -2297,3 +2297,14 @@ response body to stdout — plain `agdl <url>` is the "view a page" command
 the full document, file mode still downloads+renames atomically
 (559 B example.com variant, no `.part` residue). On-device note: the adb
 shell's PATH lacks /usr/bin — invoke as /usr/bin/agdl there.
+
+### aterm: keyboard on demand (2026-08-30)
+
+The keyboard no longer sits on screen permanently — it starts hidden
+(launcher shows no keyboard at all now) and a tap in the terminal area
+summons/dismisses it. Row count follows the visible area (~47 rows
+hidden vs ~25 shown at scale 5): Term.resize_rows shifts top lines into
+scrollback when shrinking (capped so the cursor row stays visible) and
+the child gets TIOCSWINSZ/SIGWINCH. Verified on device: toggle works
+both ways, typing after summon works, drag-scroll still works with the
+keyboard hidden (drag region now spans the full terminal area).

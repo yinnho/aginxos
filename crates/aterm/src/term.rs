@@ -93,6 +93,37 @@ impl Term {
         }
     }
 
+    /// Resize the visible grid when the keyboard shows/hides. Growing pads
+    /// with blanks at the bottom; shrinking shifts the top lines into
+    /// scrollback (capped so the cursor row never leaves the screen).
+    pub fn resize_rows(&mut self, new_rows: usize) {
+        if new_rows == self.rows {
+            return;
+        }
+        if new_rows < self.rows {
+            let shift = (self.rows - new_rows).min(self.cursor_y);
+            for i in 0..shift {
+                let line: Vec<Cell> = self.line(i).to_vec();
+                self.push_scrollback(&line);
+            }
+            for y in 0..self.rows - shift {
+                for x in 0..self.cols {
+                    self.grid[y * self.cols + x] = self.grid[(y + shift) * self.cols + x];
+                }
+            }
+            self.grid.truncate(self.cols * new_rows);
+            self.cursor_y -= shift;
+        } else {
+            self.grid.resize(self.cols * new_rows, Cell::default());
+        }
+        self.rows = new_rows;
+        self.scroll_top = 0;
+        self.scroll_bot = new_rows;
+        self.view_offset = 0;
+        self.row_dirty = vec![true; new_rows];
+        self.dirty = true;
+    }
+
     /// New output while scrolled back: jump to the live edge.
     pub fn jump_live(&mut self) {
         if self.view_offset > 0 {
