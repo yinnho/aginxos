@@ -5,7 +5,7 @@
 //! TLS to pull software from GitHub releases, so this is the smallest
 //! possible ureq+rustls fetch: `agdl <url> <out>` streams to `<out>.part`
 //! and renames on completion, so a killed download never leaves a
-//! truncated file at the real path.
+//! truncated file at the real path. `<out>` of `-` streams to stdout.
 //!
 //! TLS needs a roughly-correct clock — net-bringup ntpd's before agpkg sync
 //! runs. Root certs come from webpki-roots (compiled in; no /etc/ssl on the
@@ -17,14 +17,15 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: agdl <url> <output-file>");
+    if args.len() < 2 || args.len() > 3 {
+        eprintln!("usage: agdl <url> [output-file]   (no file = stdout)");
         return ExitCode::from(2);
     }
-    let (url, out) = (&args[1], &args[2]);
+    let url = &args[1];
+    let out: &str = if args.len() == 3 { &args[2] } else { "-" };
     match download(url, out) {
         Ok(n) => {
-            println!("agdl: {} -> {} ({} bytes)", url, out, n);
+            eprintln!("agdl: {} -> {} ({} bytes)", url, out, n);
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -37,7 +38,8 @@ fn main() -> ExitCode {
 fn download(url: &str, out: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let resp = ureq::get(url).call()?;
     let tmp = format!("{out}.part");
-    let mut file = fs::File::create(&tmp)?;
+    let stdout = out == "-";
+    let mut file = if stdout { None } else { Some(fs::File::create(&tmp)?) };
     let mut reader = resp.into_body().into_reader();
     let mut buf = [0u8; 65536];
     let mut total: u64 = 0;
@@ -46,10 +48,17 @@ fn download(url: &str, out: &str) -> Result<u64, Box<dyn std::error::Error>> {
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n])?;
+        match &mut file {
+            Some(f) => f.write_all(&buf[..n])?,
+            None => std::io::stdout().write_all(&buf[..n])?,
+        }
         total += n as u64;
     }
-    file.flush()?;
-    fs::rename(&tmp, out)?;
+    if let Some(mut f) = file {
+        f.flush()?;
+        fs::rename(&tmp, out)?;
+    } else {
+        std::io::stdout().flush()?;
+    }
     Ok(total)
 }

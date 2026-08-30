@@ -2287,3 +2287,13 @@ All results below observed on device this session.
   Fixed: full-canvas BG clear below the header on Launcher→Running
   transition. Verified clean on device.
 
+
+### agdl stdout mode (2026-08-30)
+
+`agdl <url>` with no output argument (or an explicit `-`) streams the
+response body to stdout — plain `agdl <url>` is the "view a page" command
+(status line moved to stderr so pipes stay clean). `-`/stdout skips the
+`.part` file dance. Verified on device over Wi-Fi: `agdl https://example.com -` prints
+the full document, file mode still downloads+renames atomically
+(559 B example.com variant, no `.part` residue). On-device note: the adb
+shell's PATH lacks /usr/bin — invoke as /usr/bin/agdl there.
