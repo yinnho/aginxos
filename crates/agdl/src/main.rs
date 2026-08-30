@@ -16,27 +16,99 @@ use std::io::{Read, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 || args.len() > 3 {
-        eprintln!("usage: agdl <url> [output-file]   (no file = stdout)");
-        return ExitCode::from(2);
+    // agdl [-X METHOD] [-H "k: v"]... [-d @file] <url> [output-file]
+    let mut method = String::from("GET");
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut data: Option<String> = None;
+    let mut pos: Vec<String> = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "-X" => match args.next() {
+                Some(m) => method = m,
+                None => return usage(),
+            },
+            "-H" => match args.next() {
+                Some(h) => match h.split_once(':') {
+                    Some((k, v)) => headers.push((k.trim().to_string(), v.trim().to_string())),
+                    None => return usage(),
+                },
+                None => return usage(),
+            },
+            "-d" => match args.next().and_then(|d| d.strip_prefix('@').map(str::to_string)) {
+                Some(d) => data = Some(d),
+                None => return usage(),
+            },
+            _ => pos.push(a),
+        }
     }
-    let url = &args[1];
-    let out: &str = if args.len() == 3 { &args[2] } else { "-" };
-    match download(url, out) {
-        Ok(n) => {
-            eprintln!("agdl: {} -> {} ({} bytes)", url, out, n);
+    if pos.is_empty() || pos.len() > 2 {
+        return usage();
+    }
+    let url = &pos[0];
+    let out: &str = if pos.len() == 2 { &pos[1] } else { "-" };
+    match fetch(&method, url, &headers, data.as_deref(), out) {
+        Ok((status, n)) => {
+            eprintln!("agdl: {} {} -> {} ({} bytes)", method, url, out, n);
+            eprintln!("agdl: HTTP {}", status);
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("agdl: {}: {}", url, e);
+            eprintln!("agdl: {} {}: {}", method, url, e);
             ExitCode::FAILURE
         }
     }
 }
 
-fn download(url: &str, out: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    let resp = ureq::get(url).call()?;
+fn usage() -> ExitCode {
+    eprintln!("usage: agdl [-X METHOD] [-H \"k: v\"]... [-d @file] <url> [output-file]   (no file = stdout)");
+    ExitCode::from(2)
+}
+
+fn apply_headers<B>(
+    mut rb: ureq::RequestBuilder<B>,
+    headers: &[(String, String)],
+) -> ureq::RequestBuilder<B> {
+    for (k, v) in headers {
+        rb = rb.header(k.as_str(), v.as_str());
+    }
+    rb
+}
+
+fn fetch(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    data: Option<&str>,
+    out: &str,
+) -> Result<(u16, u64), Box<dyn std::error::Error>> {
+    // Non-2xx must not error: probes want the response body either way.
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
+    let m = method.to_ascii_uppercase();
+    let resp = match data {
+        Some(d) => {
+            let body = fs::read(d)?;
+            let rb = match m.as_str() {
+                "PUT" => apply_headers(agent.put(url), headers),
+                "PATCH" => apply_headers(agent.patch(url), headers),
+                _ => apply_headers(agent.post(url), headers),
+            };
+            rb.send(&body[..])?
+        }
+        None => {
+            let rb = match m.as_str() {
+                "HEAD" => apply_headers(agent.head(url), headers),
+                "DELETE" => apply_headers(agent.delete(url), headers),
+                "OPTIONS" => apply_headers(agent.options(url), headers),
+                _ => apply_headers(agent.get(url), headers),
+            };
+            rb.call()?
+        }
+    };
+    let status = resp.status().as_u16();
     let tmp = format!("{out}.part");
     let stdout = out == "-";
     let mut file = if stdout { None } else { Some(fs::File::create(&tmp)?) };
@@ -60,5 +132,5 @@ fn download(url: &str, out: &str) -> Result<u64, Box<dyn std::error::Error>> {
     } else {
         std::io::stdout().flush()?;
     }
-    Ok(total)
+    Ok((status, total))
 }
