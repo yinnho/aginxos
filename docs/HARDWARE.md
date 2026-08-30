@@ -2392,3 +2392,80 @@ keyboard hidden (drag region now spans the full terminal area).
   five entries (aginx, aginx-carrier, aginxbrowser, codex, grok) and
   `agpkg sync` ran clean on device for all five — codex/grok are
   mirrored as raw musl binaries under yinnho/aginxos releases.
+
+## M10 device acceptance: full wipe → unattended re-provision (2026-08-30)
+
+Headless-path acceptance (the adb-fed variant; the scan/password wizard is
+the UI half, still to build). Observed on the experiment unit:
+
+- Backed up /var/home (1 GB) + /etc/wifi.conf over adb, then flashed a
+  fresh rootfs.img (`fastboot flash userdata out/rootfs.img`) built from
+  current master — the full factory reset path.
+- One `no valid slot to boot` on the second reboot: the retry counter
+  drained again (same as the 2026-08-27 incident); `fastboot set_active a`
+  recovered it. Two reboots in quick succession after a userdata flash are
+  enough to burn it.
+- First boot on the wiped userdata: touch/battery/modem ok; aginx,
+  aginx-carrier, aginxbrowser correctly "absent" (/var/bin is empty);
+  net-bringup correctly `wifi fail no /etc/wifi.conf` + `done fail`.
+- Pushed wifi.conf over adb and rebooted. Fully unattended boot then:
+  wifi ok → dhcp ok → internet ok → ntpd time ok (2026-08-30) →
+  provision `agpkg sync` downloaded and sha-verified ALL FIVE manifest
+  entries into /var/bin (aginx 4.5M, aginx-carrier 27M, aginxbrowser 61M,
+  codex 223M, grok 164M) → `pkg ok`. ~470 MB through the phone's Wi-Fi.
+- Download-path observations:
+  - Direct github.com release downloads throttle to ~40 KB/s on this
+    network (aginxbrowser stalled completely once for 20+ min — no bytes
+    to disk, connection ESTABLISHED). Killing the stalled agdl makes
+    agpkg's built-in gh-proxy.com fallback take over; gh-proxy sustained
+    ~1-4 MB/s and carried most of the traffic. The fallback is not
+    optional on this network.
+  - Next boot: aginx run / carrier run / aginxbrowser run, `done ok`.
+- **aginxbrowser v0.2.5 upstream musl asset is broken**: downloads fine,
+  sha-verifies, but segfaults instantly on device (empty log, no server,
+  even `--version` segfaults). Local repo has the fix (b0315d7 "fix(ci):
+  install zig from the official tarball in build-musl") AFTER the v0.2.5
+  tag — the released asset was built by the broken CI zig. M9's verified
+  on-device build was their main@8a52027 locally built (sha 7fe02343…),
+  a different binary. Rebuilding locally per the M9 recipe (cargo zigbuild
+  0.16.0, RUSTY_V8_MIRROR local mirror; mirror files via gh-proxy);
+  result to be appended.
+- aginxbrowser rebuild result: local build of their main@b0315d7 (cargo
+  zigbuild, zig 0.16.0, RUSTY_V8_MIRROR pointing at a local mirror of the
+  four v150.4.0 files — BOTH the aarch64-apple-darwin and musl .a.gz are
+  needed, the host-side build-deps link v8 too) → 61 MB static, runs on
+  device: /health 200 (engine diting), POST /fetch example.com returns
+  title + markdown. Published as mirror release
+  yinnho/aginxos aginxbrowser-v0.2.5 (same treatment as codex/grok);
+  manifest switched to it, `agpkg sync` reports all five up to date.
+
+## M10 UI half: Wi-Fi setup wizard on device (2026-08-30)
+
+`crates/wifi-wizard` — TUI inside aterm's pty (nlscan -> numbered AP list,
+strongest first, same-SSID dedup, signal bars; non-ASCII SSIDs listed but
+marked unjoinable since the v1 keyboard is ASCII-only). Password prompt ->
+writes /etc/wifi.conf (0600) -> runs net-bringup in the background and
+mirrors its boot.state verdict lines (net-bringup redirects its own stdout
+to /var/net.log, so the wizard polls the state file instead) -> offers a
+reboot so services start. EOF on stdin quits the wizard (a rescan loop on
+EOF would spin forever — caught in the first pty test).
+
+- aterm wiring: launcher gained a 5th button (WIFI SETUP; button geometry
+  re-derived for 5) and, at startup, if /etc/wifi.conf is missing the
+  wizard replaces the launcher automatically (SYSTEM.md §9.2's first-boot
+  path; headless adb-fed wifi.conf still works unchanged).
+- Parsing gotchas fixed live: nlscan separates columns with runs of
+  spaces (split(' ') yields empty fields) and the signal is TWO columns
+  (-53.00 dBm) — the parser peels four whitespace tokens and treats the
+  remainder as the SSID.
+- Verified on device: scan list renders correct (6 BSS -> 3 deduped), and
+  the full flow was then driven from the panel with the touch keyboard —
+  wizard auto-started after wifi.conf was removed, network picked,
+  password entered, and boot.state ran to `wifi ok Legrand AP / dhcp ok /
+  internet ok / done ok` with wlan0 holding its lease. First-boot setup
+  now works end-to-end without adb.
+
+Session-end device state: AginxOS boot, slot a, adb aginxosredfin; all
+five packages installed from the manifest; aginx + carrier + aginxbrowser
+running; /var/home auth restored from the pre-wipe backup; out/rootfs.img
+rebuilt with wifi-wizard + updated aterm/manifest/agpkg baked in.
