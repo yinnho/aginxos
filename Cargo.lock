@@ -35,6 +35,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "agsvc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -50,6 +57,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 name = "aterm"
 version = "0.1.0"
 dependencies = [
+ "agsvc",
  "libc",
  "vte",
 ]

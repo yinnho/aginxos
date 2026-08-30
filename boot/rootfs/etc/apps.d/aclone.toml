@@ -1,0 +1,7 @@
+# aclone — local agent (化身). Seeds are copied to /var/apps/<id>/app.toml
+# by /etc/init.d/app-registry while the binary exists; aterm scans
+# /var/apps at every launcher draw. Registry keys: name/binary/args/scale
+# (category/icon/accept reserved, SYSTEM.md §12.3).
+name = CLONE - LOCAL AGENT
+binary = /var/bin/aclone
+scale = 3

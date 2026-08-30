@@ -28,6 +28,8 @@ grep -q '^internet ok' "$STATE" || exit 0
 say pkg run
 if agpkg sync; then
   say pkg ok
+  # new/refreshed binaries -> launcher registry entries (M16)
+  /etc/init.d/app-registry
 else
   say pkg fail "see /var/tmp/agpkg"
 fi

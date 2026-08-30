@@ -1,0 +1,5 @@
+# codex — official musl binary (M12). See aclone.toml for the registry
+# seeding contract.
+name = CODEX
+binary = /var/bin/codex
+scale = 3

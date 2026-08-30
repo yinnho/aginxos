@@ -1,0 +1,13 @@
+# aginx carrier daemon (M8) — iLink channel + cron. Weak-depends on the
+# gateway: agsvc holds this unit while aginx is still starting (§12.1 —
+# readiness blocking is the ordering), which preserves the gateway-first
+# order aginx-services used.
+[unit]
+name = aginx-carrier
+
+[service]
+cmd = /var/bin/aginx-carrier
+args = ["start"]
+type = simple
+requires_weak = ["aginx"]
+env_file = /etc/aginx/env

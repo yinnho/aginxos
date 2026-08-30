@@ -1,0 +1,27 @@
+[package]
+name = "agsvc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AginxOS service layer: agsvc supervisor, agctl client, agboot-ok slot marker"
+
+[lib]
+name = "agsvc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agsvc"
+path = "src/main.rs"
+
+[[bin]]
+name = "agctl"
+path = "src/agctl.rs"
+
+[[bin]]
+name = "agboot-ok"
+path = "src/agboot.rs"
+
+[dependencies]
+libc = { workspace = true }

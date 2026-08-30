@@ -77,10 +77,29 @@ echo $! > /run/bootcard.pid
 # boot. Backgrounded; a no-op when the manifest has no active entries.
 /etc/init.d/provision &
 
-# aginx stack (M8) — gateway + carrier from /var/bin, if installed (agpkg).
-# The gateway's relay client reconnects until Wi-Fi lands, so no ordering
-# dependency on net-bringup. Quiet no-op before first provisioning (M10).
-/etc/init.d/aginx-services &
+# aginx stack (M8/M16) — now supervised: inittab respawns /usr/bin/agsvc
+# once rcS finishes, which starts gateway+carrier+browser from /etc/agsvc.d
+# units, restarts them on crash with backoff, and re-checks absent
+# binaries every 30 s so first provisioning lands without a reboot.
+# Control: agctl list|status|start|stop|restart|reload. aginx-services
+# is retired.
+
+# Launcher app registry (M16) — seed /var/apps from /etc/apps.d so new
+# binaries appear on the launcher. Cheap and idempotent; provision re-runs
+# it after agpkg installs.
+/etc/init.d/app-registry
+
+# Boot-successful marker (M16) — ABL drains the GPT slot-retry attribute
+# on every unmarked boot and the phone ends up in fastboot (or falls
+# through to slot b's stock bootloader, which would format our userdata).
+# Wait for boot.state's final verdict (net-bringup writes it), then flag
+# the active slot successful in every LUN's GPT.
+( n=0
+  while [ $n -lt 150 ]; do
+    grep -q '^done ok' /run/boot.state 2>/dev/null && break
+    sleep 2; n=$((n+1))
+  done
+  /usr/bin/agboot-ok ) &
 
 # Panel handoff (M11) — when boot finishes, bootcard's panel goes to aterm
 # (launcher + shell). Backgrounded: waits on /run/boot.state.

@@ -4,6 +4,11 @@
 # aginxos-init kills the trampoline's adbd before the switch, so this
 # respawn is what brings the console back (~12s to re-enumerate).
 ::respawn:/etc/init.d/adbd
+# M16 service supervisor — owns every non-console daemon (units in
+# /etc/agsvc.d + /var/lib/agpkg/units; control via agctl). busybox
+# respawns agsvc if it dies; agsvc's children carry PDEATHSIG so they go
+# down with it — no double-spawn window.
+::respawn:/usr/bin/agsvc
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/bin/sync
 ::restart:/sbin/init

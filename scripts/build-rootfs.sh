@@ -175,13 +175,19 @@ cp "${TARGET}/aterm" "${TREE}/usr/bin/aterm"
 # wifi-wizard (M10) — first-boot Wi-Fi setup TUI (scan/pick/password),
 # auto-started by aterm when /etc/wifi.conf is missing.
 cp "${TARGET}/wifi-wizard" "${TREE}/usr/bin/wifi-wizard"
+# service layer (M16) — agsvc supervisor (inittab respawns it; units in
+# /etc/agsvc.d + /var/lib/agpkg/units), agctl control client over
+# /run/svc/ctl.sock, and agboot-ok which marks the slot boot-successful
+# so ABL's retry counter stops draining us into fastboot.
+cp "${TARGET}/agsvc" "${TARGET}/agctl" "${TARGET}/agboot-ok" "${TREE}/usr/bin/"
 chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/touch-bringup" "${TREE}/etc/init.d/battery-bringup" \
   "${TREE}/etc/init.d/radio-bringup" "${TREE}/etc/init.d/net-bringup" \
-  "${TREE}/etc/init.d/aginx-services" "${TREE}/etc/init.d/provision" \
+  "${TREE}/etc/init.d/app-registry" "${TREE}/etc/init.d/provision" \
   "${TREE}/etc/init.d/aterm-handoff" \
   "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdl" "${TREE}/usr/bin/aterm" \
-  "${TREE}/usr/bin/wifi-wizard"
+  "${TREE}/usr/bin/wifi-wizard" "${TREE}/usr/bin/agsvc" \
+  "${TREE}/usr/bin/agctl" "${TREE}/usr/bin/agboot-ok"
 # NB: wifi.conf.example rides along in ${RECIPE}/etc — the real
 # /etc/wifi.conf (with the passphrase) is pushed by hand, never committed.
 cp "${TARGET}/aginxos-init" "${TARGET}/aginxos-agent" "${TREE}/aginxos/"

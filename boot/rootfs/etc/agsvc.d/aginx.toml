@@ -1,0 +1,12 @@
+# aginx gateway (M8) — the relay client reconnects until Wi-Fi lands, so
+# no ordering dependency on net-bringup. Foreign binary: no notify
+# protocol and no /run/svc socket yet, so type = simple (alive + 2 s
+# grace = ready). Switch to type = socket once the gateway adopts the
+# §12.2 contract.
+[unit]
+name = aginx
+
+[service]
+cmd = /var/bin/aginx
+type = simple
+env_file = /etc/aginx/env
