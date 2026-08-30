@@ -358,3 +358,45 @@ impl TouchReader {
         out
     }
 }
+
+// ---------------- key events (power / volume) ----------------
+
+const EV_KEY: u16 = 1;
+pub const KEY_POWER: u16 = 116;
+
+/// Non-touch key events from one evdev node. qpnp_pon (/dev/input/event1)
+/// carries power + volume-down on redfin; we only act on KEY_POWER, whose
+/// presence in the node's KEY bitmap was confirmed via /proc/bus/input
+/// (2026-08-31). qpnp_pon has no EV_REP, so every event is a clean
+/// press (1) or release (0) — value 2 autorepeat never appears.
+pub struct KeyReader {
+    fd: std::fs::File,
+}
+
+impl KeyReader {
+    pub fn open(path: &str) -> Option<KeyReader> {
+        Some(KeyReader {
+            fd: OpenOptions::new().read(true).open(path).ok()?,
+        })
+    }
+
+    pub fn raw_fd(&self) -> i32 {
+        self.fd.as_raw_fd()
+    }
+
+    pub fn poll(&mut self) -> Vec<(u16, bool)> {
+        let mut buf = [0u8; 24 * 8];
+        let n = match self.fd.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for chunk in buf[..n].chunks_exact(24) {
+            let ev = unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const input_event) };
+            if ev.type_ == EV_KEY && (ev.value == 0 || ev.value == 1) {
+                out.push((ev.code, ev.value == 1));
+            }
+        }
+        out
+    }
+}

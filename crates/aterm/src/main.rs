@@ -7,6 +7,12 @@
 // once boot finishes: bootcard never exits on its own and holds DRM master
 // forever, so the handoff kills it by /run/bootcard.pid and takes the panel.
 //
+// M15 power management: the qpnp_pon power key (event1) blanks the panel
+// (connector DPMS off — the same path that darkened the screen when a DRM
+// master dropped), a second short press or any touch wakes it, 60 s idle
+// blanks too, holding the key ~1.2 s (or the launcher's POWER OFF / RESTART
+// buttons) runs `reboot2 poweroff|reboot`.
+//
 // Host verification: `aterm --ppm out.ppm` renders the launcher into a P6
 // PPM without touching DRM (same pattern as bootcard --ppm).
 
@@ -17,7 +23,7 @@ mod launch;
 mod term;
 
 use drm::Drm;
-use kb::{Kb, KeyGeom, Touch, TouchReader};
+use kb::{Kb, KeyGeom, KeyReader, Touch, TouchReader, KEY_POWER};
 use std::io::Write as _;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::time::{Duration, Instant};
@@ -30,6 +36,11 @@ const DIM: u32 = 0x001E3A2E; // key outlines / separators
 const ROW_GAP: usize = 8; // extra px between terminal text rows
 const KEYCAP: u32 = 0x000A1410; // key fill
 const UNAVAIL: u32 = 0x00115A3F; // dimmed green for missing apps
+
+// M15 power: short press (< POWER_HOLD) toggles blank; hold at or beyond it
+// shuts down; IDLE_BLANK without input blanks the screen.
+const POWER_HOLD: Duration = Duration::from_millis(1200);
+const IDLE_BLANK: Duration = Duration::from_secs(60);
 
 fn fill_rect(pix: &mut [u32], pitch: usize, w: usize, h: usize, x: i32, y: i32, rw: i32, rh: i32, c: u32) {
     let (mut x, mut y, mut rw, mut rh) = (x, y, rw, rh);
@@ -269,10 +280,10 @@ impl<'a> Render<'a> {
             fill_rect(pix, self.pitch, self.w, self.h, g.bx as i32, y0, 3, g.bh as i32, c);
             fill_rect(pix, self.pitch, self.w, self.h, (g.bx + g.bw - 3) as i32, y0, 3, g.bh as i32, c);
             let scale = 5;
-            let tw = text_w(e.label, scale) as i32;
+            let tw = text_w(e.label.as_str(), scale) as i32;
             let ty = y0 + (g.bh as i32 - 8 * scale as i32) / 2;
             let tc = if e.avail { GREEN } else { UNAVAIL };
-            draw_text(pix, self.pitch, self.w, self.h, self.font, g.bx as i32 + (g.bw as i32 - tw) / 2, ty, e.label, scale, tc);
+            draw_text(pix, self.pitch, self.w, self.h, self.font, g.bx as i32 + (g.bw as i32 - tw) / 2, ty, e.label.as_str(), scale, tc);
             if !e.avail {
                 draw_centered(pix, self.pitch, self.w, self.h, self.font, y0 + g.bh as i32 - 30, "(NOT INSTALLED)", 2, UNAVAIL);
             }
@@ -432,15 +443,32 @@ fn kb0() -> Kb {
     Kb::new()
 }
 
+/// M15 shutdown: draw a farewell frame, show it, then hand the machine to
+/// `reboot2 poweroff` (sync + reboot(RB_POWER_OFF) — the PMIC cuts power).
+/// Never returns.
+fn power_off(d: &mut Drm, font: &[[u8; 8]; 128], canvas: &mut [u32], blanked: bool) {
+    let (w, h, pitch) = (d.width as usize, d.height as usize, d.pitch_px());
+    fill_rect(canvas, pitch, w, h, 0, 0, w as i32, h as i32, BG);
+    draw_centered(canvas, pitch, w, h, font, (h as i32 - 8 * 5) / 2, "POWERING OFF", 5, GREEN);
+    d.back_buf().copy_from_slice(canvas);
+    if blanked {
+        d.dpms(true); // relatch the farewell frame even if we were blanked
+    } else {
+        d.present();
+    }
+    let _ = std::process::Command::new(launch::BIN_REBOOT2).arg("poweroff").spawn();
+    std::process::exit(0);
+}
+
 fn host_ppm(out: &str) {
     let font = font::font_init();
     let (w, h) = (1080usize, 2340usize);
     let pitch = w;
     let mut pix = vec![0u32; pitch * h];
     let kg = Kb::geom(w, h);
-    let lg = launch::Geom::new(w, h, kg.extra_y);
-    let r = Render { font: &font, w, h, pitch };
     let entries = launch::entries();
+    let lg = launch::Geom::new(w, h, kg.extra_y, entries.len());
+    let r = Render { font: &font, w, h, pitch };
     r.launcher(&mut pix, &entries, &lg);
     r.keyboard(&mut pix, &kg, &kb0());
 
@@ -491,7 +519,8 @@ fn main() {
 
     let mut kb = Kb::new();
     let kg = Kb::geom(w, h);
-    let lg = launch::Geom::new(w, h, kg.extra_y);
+    let mut entries = launch::entries();
+    let lg = launch::Geom::new(w, h, kg.extra_y, entries.len());
 
     // Terminal geometry: glyph scale is per-app — sh keeps 5 (30x40 px
     // cells, 34 cols inside the 28 px side margins), the PC-designed TUIs
@@ -539,7 +568,13 @@ fn main() {
         }
     }
     let mut touch = TouchReader::open("/dev/input/event2", w as i32, h as i32);
-    let mut entries = launch::entries();
+    // M15: qpnp_pon keys (power + volume-down) on event1 — hardcoded like
+    // the touch node, per HARDWARE.md.
+    let mut pwr = KeyReader::open("/dev/input/event1");
+    // M15 blank state
+    let mut blanked = false;
+    let mut last_input = Instant::now();
+    let mut power_down: Option<Instant> = None;
 
     // Persistent canvas: renderers repaint only damaged rows into it, and
     // each present() memcpy's it into the back buffer (~10 MB, ~1 ms) so
@@ -588,6 +623,8 @@ fn main() {
                         }
                         term.jump_live(); // new output jumps to live
                         redraw = true;
+                        // active output keeps the screen awake
+                        last_input = Instant::now();
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                     Err(_) => break,
@@ -605,11 +642,15 @@ fn main() {
             }
         }
 
-        // input
-        let mut fds = [libc::pollfd { fd: -1, events: libc::POLLIN, revents: 0 }; 2];
+        // input (touch / power key / pty)
+        let mut fds = [libc::pollfd { fd: -1, events: libc::POLLIN, revents: 0 }; 3];
         let mut nfds = 0usize;
         if let Some(t) = touch.as_ref() {
             fds[nfds].fd = t.raw_fd();
+            nfds += 1;
+        }
+        if let Some(p) = pwr.as_ref() {
+            fds[nfds].fd = p.raw_fd();
             nfds += 1;
         }
         if let Mode::Running(c) = &mode {
@@ -618,7 +659,7 @@ fn main() {
         }
         let timeout: libc::c_int = if redraw {
             0
-        } else if held.is_some() {
+        } else if held.is_some() || power_down.is_some() {
             30
         } else {
             400
@@ -628,7 +669,17 @@ fn main() {
             let mut i = 0;
             if touch.is_some() {
                 if fds[i].revents & libc::POLLIN != 0 {
-                    match touch.as_mut().unwrap().poll() {
+                    let ev = touch.as_mut().unwrap().poll();
+                    last_input = Instant::now();
+                    if blanked {
+                        // Any touch wakes the screen; the waking gesture
+                        // itself is swallowed so it doesn't also type or
+                        // scroll.
+                        blanked = false;
+                        d.dpms(true);
+                        redraw = true;
+                    } else {
+                    match ev {
                         // Keys fire on finger-DOWN. Waiting for finger-up
                         // added the whole rest-of-finger time to every
                         // keystroke — the main source of "typing lag".
@@ -648,13 +699,34 @@ fn main() {
                                 if let Mode::Launcher = &mut mode {
                                     if let Some(i2) = lg.button_at(x, y, entries.len()) {
                                         if entries[i2].avail {
-                                            let prog = entries[i2].bin;
-                                            // PC-designed TUIs need ~56 cols
-                                            // to breathe; sh keeps the big
-                                            // touch-friendly glyphs.
-                                            scale = launch::scale_for(prog);
+                                            let prog = entries[i2].bin.as_str();
+                                            if prog == launch::BIN_REBOOT2 {
+                                                // these draw their own frame
+                                                // and never come back — no
+                                                // pty round-trip
+                                                if entries[i2].args.first().map(String::as_str) == Some("poweroff") {
+                                                    power_off(&mut d, &font, &mut canvas, blanked);
+                                                }
+                                                fill_rect(&mut canvas, pitch, w, h, 0, 0, w as i32, h as i32, BG);
+                                                draw_centered(&mut canvas, pitch, w, h, &font, (h as i32 - 8 * 5) / 2, "RESTARTING", 5, GREEN);
+                                                d.back_buf().copy_from_slice(&canvas);
+                                                d.dpms(true); // relatch the frame (crtc may be off)
+                                                let _ = std::process::Command::new(launch::BIN_REBOOT2)
+                                                    .arg("reboot")
+                                                    .spawn();
+                                                std::process::exit(0);
+                                            }
+                                            // Registry entries carry their
+                                            // own scale; PC-designed TUIs
+                                            // need ~56 cols to breathe, the
+                                            // phone-native UIs keep the big
+                                            // touch glyphs.
+                                            scale = entries[i2].scale;
                                             term_cols = cols_for(scale);
-                                            match spawn_shell(term_cols as u16, rows_for(false, scale) as u16, &[prog]) {
+                                            let argv: Vec<&str> = std::iter::once(prog)
+                                                .chain(entries[i2].args.iter().map(String::as_str))
+                                                .collect();
+                                            match spawn_shell(term_cols as u16, rows_for(false, scale) as u16, &argv) {
                                                 Ok(c) => {
                                                     mode = Mode::Running(c);
                                                     kb_visible = false;
@@ -760,6 +832,34 @@ fn main() {
                         }
                         Touch::None => {}
                     }
+                    }
+                }
+                i += 1;
+            }
+            if pwr.is_some() {
+                if fds[i].revents & libc::POLLIN != 0 {
+                    for (code, down) in pwr.as_mut().unwrap().poll() {
+                        last_input = Instant::now();
+                        if code != KEY_POWER {
+                            continue; // volume-down rides the same node
+                        }
+                        if down {
+                            power_down = Some(Instant::now());
+                        } else if let Some(t) = power_down.take() {
+                            // short press toggles blank; a long press was
+                            // already acted on by the hold check below
+                            if t.elapsed() < POWER_HOLD {
+                                if blanked {
+                                    blanked = false;
+                                    d.dpms(true);
+                                    redraw = true;
+                                } else {
+                                    blanked = true;
+                                    d.dpms(false);
+                                }
+                            }
+                        }
+                    }
                 }
                 i += 1;
             }
@@ -769,6 +869,18 @@ fn main() {
                     redraw = true;
                 }
             }
+        }
+
+        // power key held >= POWER_HOLD: shutdown (fires while still down)
+        if let Some(t) = power_down {
+            if t.elapsed() >= POWER_HOLD {
+                power_off(&mut d, &font, &mut canvas, blanked);
+            }
+        }
+        // idle blank
+        if !blanked && last_input.elapsed() >= IDLE_BLANK {
+            blanked = true;
+            d.dpms(false);
         }
 
         // hold-to-repeat for DEL / arrows
@@ -792,7 +904,10 @@ fn main() {
             }
         }
 
-        if redraw || term.dirty {
+        // while blanked the framebuffer is not scanned out — skip render
+        // and present entirely (pty keeps draining above, output renders
+        // at wake)
+        if !blanked && (redraw || term.dirty) {
             term.dirty = false;
             let r = Render { font: &font, w, h, pitch };
             let buf = &mut canvas[..];

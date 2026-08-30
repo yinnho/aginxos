@@ -403,6 +403,33 @@ impl Drm {
         self.pitch_px
     }
 
+    /// M15 screen blank. This kernel's sde connector has NO legacy DPMS
+    /// property (probed via OBJ_GETPROPERTIES 2026-08-31 — atomic-only
+    /// driver), but a null SETCRTC (fb_id=0, no connectors, mode invalid)
+    /// takes the whole pipeline down: encoder disable -> DSI off ->
+    /// dsi_backlight_early_dpms hooks fire and the touch controller
+    /// suspends (observed in dmesg). `on` re-latches the back buffer — the
+    /// exact path present() uses as its PAGE_FLIP fallback and aterm's
+    /// startup initial_modeset, both proven on this panel. Callers must
+    /// not present() while blanked (a SETCRTC relatch would re-enable).
+    pub fn dpms(&mut self, on: bool) {
+        let fd = self.file.as_raw_fd();
+        if on {
+            let next = 1 - self.cur;
+            if self.modeset(self.fb[next]).is_ok() {
+                self.cur = next;
+            }
+        } else {
+            let mut sc = drm_mode_crtc {
+                crtc_id: self.crtc_id,
+                ..Default::default()
+            };
+            if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_SETCRTC as _, &mut sc) } != 0 {
+                kmsg("aterm: SETCRTC disable failed\n");
+            }
+        }
+    }
+
     pub fn present(&mut self) {
         let next = 1 - self.cur;
         let fd = self.file.as_raw_fd();

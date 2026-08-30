@@ -1,45 +1,79 @@
-// Launcher: four big buttons at boot (clone / codex / grok / sh) plus a
-// thin toolbar strip above the keyboard ([SH] always, [BACK] when an app
-// runs). Program exit -> back to launcher. Touch regions computed from the
+// Launcher (M16, docs/SYSTEM.md §12.3): app buttons come from the
+// registry at /var/apps/<id>/app.toml — scanned at every launcher draw,
+// so a new app appears by dropping a file (agpkg or the app-registry
+// seeder write them), no OS source change. Four system actions (sh /
+// wifi setup / restart / power off) stay built in, plus a thin toolbar
+// strip above the keyboard ([SH] always, [BACK] when an app runs).
+// Program exit -> back to launcher. Touch regions are computed from the
 // keyboard geometry so the layout scales with panel size.
 
-pub const BIN_CLONE: &str = "/var/bin/aclone";
-pub const BIN_CODEX: &str = "/var/bin/codex";
-pub const BIN_GROK: &str = "/var/bin/grok";
+use agsvc::{scan_apps, AppEntry, APPS_DIR};
+
 pub const BIN_SH: &str = "/bin/sh";
 pub const BIN_WIZARD: &str = "/usr/bin/wifi-wizard";
+pub const BIN_REBOOT2: &str = "/bin/reboot2";
 
 pub struct Entry {
-    pub label: &'static str,
-    pub bin: &'static str,
+    pub label: String,
+    pub bin: String,
+    /// argv[1..] for the binary (empty = bare exec). reboot2's actions
+    /// ("reboot" / "poweroff") are intercepted before any pty spawn.
+    pub args: Vec<String>,
     pub avail: bool,
+    /// Terminal glyph scale while this entry runs: phone-native UIs keep
+    /// the big 5x touch glyphs, the PC-designed TUIs (codex/grok) need
+    /// ~56 cols so they get 3.
+    pub scale: usize,
 }
 
-/// Phone-native UIs keep the big touch glyphs; the PC-designed TUIs
-/// (codex/grok) need ~56 cols, so they get the small ones.
+/// Registry apps first (alphabetical by id), then the system actions.
+pub fn entries() -> Vec<Entry> {
+    let mut v: Vec<Entry> = scan_apps(APPS_DIR)
+        .into_iter()
+        .map(app_entry)
+        .collect();
+    v.extend(builtins());
+    v
+}
+
+fn app_entry(a: AppEntry) -> Entry {
+    Entry {
+        label: a.name,
+        bin: a.binary.clone(),
+        args: a.args,
+        avail: std::path::Path::new(&a.binary).is_file(),
+        scale: a.scale,
+    }
+}
+
+fn builtins() -> Vec<Entry> {
+    [
+        ("SH", BIN_SH, &[][..], 5usize),
+        ("WIFI SETUP", BIN_WIZARD, &[][..], 5),
+        ("RESTART", BIN_REBOOT2, &["reboot"][..], 5),
+        ("POWER OFF", BIN_REBOOT2, &["poweroff"][..], 5),
+    ]
+    .into_iter()
+    .map(|(label, bin, args, scale)| Entry {
+        label: label.into(),
+        bin: bin.into(),
+        args: args.iter().map(|s| s.to_string()).collect(),
+        // sh and reboot2 ship in the base image; the wizard is a rootfs
+        // binary that always exists post-M5
+        avail: bin == BIN_SH || bin == BIN_REBOOT2 || std::path::Path::new(bin).is_file(),
+        scale,
+    })
+    .collect()
+}
+
+/// Scale for non-launcher spawns (ATERM_START debug path, the first-boot
+/// wizard): known phone-native binaries get 5, everything else 3.
 pub fn scale_for(bin: &str) -> usize {
-    if bin == BIN_SH || bin == BIN_WIZARD {
+    if bin == BIN_SH || bin == BIN_WIZARD || bin == BIN_REBOOT2 {
         5
     } else {
         3
     }
-}
-
-pub fn entries() -> Vec<Entry> {
-    vec![
-        ("CLONE - LOCAL AGENT", BIN_CLONE),
-        ("CODEX", BIN_CODEX),
-        ("GROK", BIN_GROK),
-        ("SH", BIN_SH),
-        ("WIFI SETUP", BIN_WIZARD),
-    ]
-    .into_iter()
-    .map(|(label, bin)| Entry {
-        label,
-        bin,
-        avail: bin == BIN_SH || std::path::Path::new(bin).is_file(),
-    })
-    .collect()
 }
 
 pub struct Geom {
@@ -55,13 +89,13 @@ pub struct Geom {
 }
 
 impl Geom {
-    pub fn new(w: usize, _h: usize, kb_panel_y: usize) -> Geom {
+    pub fn new(w: usize, _h: usize, kb_panel_y: usize, n: usize) -> Geom {
         let m = 90;
         let toolbar_h = 72;
         let avail_h = kb_panel_y - toolbar_h;
         let gap = 40;
-        // five buttons (clone / codex / grok / sh / wifi)
-        let bh = ((avail_h - 120 - gap * 4) / 5).min(180);
+        // n buttons (launcher entries), evenly filling the space
+        let bh = ((avail_h - 120 - gap * (n - 1)) / n).min(180);
         Geom {
             bx: m,
             bw: w - 2 * m,

@@ -7,3 +7,6 @@ license = "MIT"
 [dependencies]
 libc = { workspace = true }
 vte = "0.13"
+# M16: the launcher's app registry (/var/apps scan + app.toml schema)
+# lives in the agsvc crate so the format has exactly one definition.
+agsvc = { path = "../agsvc" }
