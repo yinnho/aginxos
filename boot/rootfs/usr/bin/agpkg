@@ -74,10 +74,18 @@ sync)
     fi
     f="$DL/$pname"
     rm -f "$f"
-    if agdl "$purl" "$f" && "$0" install "$pname" "$f" "$psum"; then
+    # GitHub release downloads get TLS-reset on some networks; retry once
+    # through gh-proxy.com (content is sha256-pinned either way).
+    if ! agdl "$purl" "$f"; then
+      case "$purl" in
+        https://github.com/*) agdl "https://gh-proxy.com/$purl" "$f" || true ;;
+      esac
+    fi
+    if [ -f "$f" ] && "$0" install "$pname" "$f" "$psum"; then
       rm -f "$f"
     else
       echo "agpkg: $pname sync FAILED (kept previous)" >&2
+      rm -f "$f"
       rc=1
     fi
   done < "$mf"
