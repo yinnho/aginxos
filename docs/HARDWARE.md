@@ -2338,3 +2338,57 @@ keyboard hidden (drag region now spans the full terminal area).
   answered "pong" (9k tokens) through brain.aginx.net. Codex TUI from the
   launcher renders correctly in aterm. bubblewrap missing warning is
   benign (codex falls back to its bundled bwrap).
+
+## M13: grok (xai-org/grok-build) source-built musl on device (2026-08-30)
+
+- No official musl/arm64 release exists, so grok 1.0.12 (bc7f02eddd3d)
+  was source-built for aarch64-unknown-linux-musl via cargo-zigbuild
+  (toolchain pinned 1.94.0, ~41 min build). Build fixes that were needed:
+  - sqlite-vec.c uses u_int8_t/u_int16_t/u_int64_t which musl only exposes
+    via <sys/types.h>; fixed with CFLAGS macro self-typedefs
+    (-Du_int8_t=uint8_t ...). `-include sys/types.h` breaks aws-lc-sys
+    .S assembly, -D_DEFAULT_SOURCE alone is not enough.
+  - jemalloc symbols are undefined under zig cc: build with
+    --no-default-features --features sandbox-enforce.
+  - CARGO_BUILD_JOBS=1 avoids spurious empty-stderr cc-rs failures.
+  - rg/fd bundling pointed at local binaries via GROK_TOOLS_BUNDLE_RG_PATH
+    / GROK_SHELL_BUNDLE_RG_PATH / GROK_TOOLS_BUNDLE_FD_PATH (the
+    auto-download picks the gnu triple and stalls).
+- Result: 172 MB static binary, installed at /var/bin/grok (the aterm
+  launcher's expected path). `grok --version` runs clean.
+- Brain wiring (same gateway as M12 codex): /var/home/.grok/config.toml
+  sets [endpoints] xai_api_base_url + models_base_url to
+  https://brain.aginx.net, [features] remote_fetch = false (the catalog
+  fetch otherwise hits a hardcoded 5 s STARTUP_FETCH_TIMEOUT against
+  brain), [models] default = gpt-5.5, and a [model."gpt-5.5"] override
+  (api_backend = "responses", context_window 272000,
+  inference_idle_timeout_secs = 600 — brain is slow, codex needed the
+  same). Auth: /var/home/.grok/auth.json, scope "xai::api_key",
+  auth_mode "api_key", key extracted on-device from the codex auth —
+  key lives on device only.
+- Verified round-trip: `grok -p "reply with the word ok"` on device
+  returned "ok" via brain.aginx.net (ttft 789 ms, 11.2k input tokens,
+  stop_reason "stop", clean headless exit). brain ignores streaming and
+  answers a single JSON body even for accept: text/event-stream — grok
+  tolerates it. NOTE: an earlier "hang" against brain was not grok at
+  all — wlan0 had dropped to NO-CARRIER (the known Wi-Fi drop issue);
+  after re-running net-bringup the same request completed in seconds.
+- agdl gained curl-lite flags (-X/-H/-d @file, ureq 3 API: Agent with
+  http_status_as_error(false)) so the device can probe HTTPS endpoints
+  directly; used it to prove GET /api-key (200, SPA fallback HTML) and
+  POST /responses (200 in ~6 s) from the phone.
+- aterm adaptations for PC-designed TUIs (user-verified on device):
+  glyph scale is now per-app — sh keeps scale 5 (34 cols), codex/grok
+  run at scale 3 (~56 cols) so their 80-col layouts fit; scale resets
+  to 5 when the child exits. Terminal cells no longer truncate Unicode
+  codepoints to 7-bit font indices: box-drawing/block/shade/arrow and
+  braille (spinner) glyphs render procedurally in the 5x8 bitmap format
+  via glyph(). grok TUI confirmed usable on device after both fixes.
+  CJK/wide chars still unsupported (needs double-width cells + a CJK
+  font — future milestone).
+- agpkg sync retries GitHub release URLs through gh-proxy.com when the
+  direct connection is TLS-reset (observed on the device network;
+  sha256 pinning keeps transport non-load-bearing). Manifest grew to
+  five entries (aginx, aginx-carrier, aginxbrowser, codex, grok) and
+  `agpkg sync` ran clean on device for all five — codex/grok are
+  mirrored as raw musl binaries under yinnho/aginxos releases.
