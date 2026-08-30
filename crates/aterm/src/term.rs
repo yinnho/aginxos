@@ -41,6 +41,7 @@ pub struct Term {
     scroll_bot: usize, // exclusive
     pub view_offset: usize, // lines scrolled back (0 = live)
     pub dirty: bool,
+    row_dirty: Vec<bool>,
     wrap_pending: bool,
 }
 
@@ -63,7 +64,40 @@ impl Term {
             scroll_bot: rows,
             view_offset: 0,
             dirty: true,
+            row_dirty: vec![true; rows],
             wrap_pending: false,
+        }
+    }
+
+    pub fn row_dirty(&self) -> &[bool] {
+        &self.row_dirty
+    }
+
+    pub fn clear_row_dirty(&mut self) {
+        for r in &mut self.row_dirty {
+            *r = false;
+        }
+    }
+
+    pub fn mark_all(&mut self) {
+        for r in &mut self.row_dirty {
+            *r = true;
+        }
+        self.dirty = true;
+    }
+
+    pub fn mark_row(&mut self, y: usize) {
+        if y < self.rows {
+            self.row_dirty[y] = true;
+            self.dirty = true;
+        }
+    }
+
+    /// New output while scrolled back: jump to the live edge.
+    pub fn jump_live(&mut self) {
+        if self.view_offset > 0 {
+            self.view_offset = 0;
+            self.mark_all();
         }
     }
 
@@ -93,7 +127,7 @@ impl Term {
         let max = self.back_len as isize;
         let v = (self.view_offset as isize + delta).clamp(0, max);
         self.view_offset = v as usize;
-        self.dirty = true;
+        self.mark_all();
     }
 
     /// Rendered row: scrollback when view_offset > 0, else live grid.
@@ -114,6 +148,8 @@ impl Term {
         for x in 0..self.cols {
             self.grid[y * self.cols + x] = Cell::default();
         }
+        self.row_dirty[y] = true;
+        self.dirty = true;
     }
 
     fn scroll_up_region(&mut self) {
@@ -127,6 +163,7 @@ impl Term {
             }
         }
         self.blank_line(self.scroll_bot - 1);
+        self.mark_all();
     }
 
     fn scroll_down_region(&mut self) {
@@ -136,14 +173,18 @@ impl Term {
             }
         }
         self.blank_line(self.scroll_top);
+        self.mark_all();
     }
 
     fn newline(&mut self) {
+        self.row_dirty[self.cursor_y] = true;
         if self.cursor_y + 1 == self.scroll_bot {
             self.scroll_up_region();
         } else if self.cursor_y + 1 < self.rows {
             self.cursor_y += 1;
+            self.row_dirty[self.cursor_y] = true;
         }
+        self.dirty = true;
     }
 
     fn put(&mut self, ch: char) {
@@ -154,6 +195,7 @@ impl Term {
         }
         let st = self.style;
         self.grid[self.cursor_y * self.cols + self.cursor_x] = Cell { ch, style: st };
+        self.row_dirty[self.cursor_y] = true;
         if self.cursor_x + 1 >= self.cols {
             self.wrap_pending = true;
         } else {
@@ -162,6 +204,7 @@ impl Term {
     }
 
     fn csi(&mut self, params: &vte::Params, action: char) {
+        let old_y = self.cursor_y;
         let p = |i: usize, d: usize| -> usize {
             params
                 .iter()
@@ -328,6 +371,13 @@ impl Term {
             }
             _ => {}
         }
+        match action {
+            'J' | 'K' | 'L' | 'M' | 'P' | 'S' | 'T' | 'X' | 'r' => self.mark_all(),
+            _ => {
+                self.mark_row(old_y);
+                self.mark_row(self.cursor_y);
+            }
+        }
         self.dirty = true;
     }
 }
@@ -362,7 +412,8 @@ impl vte::Perform for Term {
             }
             _ => {}
         }
-        self.dirty = true;
+        let y = self.cursor_y;
+        self.mark_row(y); // cursor may have moved within the row
     }
 
     fn hook(&mut self, _p: &vte::Params, _i: &[u8], _ignore: bool, _a: char) {}
@@ -410,6 +461,8 @@ impl vte::Perform for Term {
             }
             _ => {}
         }
+        let y = self.cursor_y;
+        self.mark_row(y);
         self.dirty = true;
     }
 }

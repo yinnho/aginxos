@@ -38,12 +38,14 @@ pub struct Geom {
     pub by0: usize,
     pub toolbar_h: usize,
     pub kb_panel_y: usize,
+    pub m: usize, // global side margin (matches kb::KB_M)
+    pub w: usize,
 }
 
 impl Geom {
     pub fn new(w: usize, _h: usize, kb_panel_y: usize) -> Geom {
         let m = 90;
-        let toolbar_h = 44;
+        let toolbar_h = 72;
         let avail_h = kb_panel_y - toolbar_h;
         let gap = 40;
         let bh = ((avail_h - 120 - gap * 3) / 4).min(180);
@@ -55,6 +57,8 @@ impl Geom {
             by0: toolbar_h + 70,
             toolbar_h,
             kb_panel_y,
+            m: 28,
+            w,
         }
     }
 
@@ -71,15 +75,13 @@ impl Geom {
         None
     }
 
-    /// Toolbar regions while an app runs: left = SH (new shell), right =
-    /// BACK (kill app, return to launcher).
+    /// Toolbar regions while an app runs: BACK at the right (kill app,
+    /// return to launcher). Nothing else — the header stays clean.
     pub fn toolbar_hit(&self, x: usize, y: usize, running: bool) -> Option<Toolbar> {
         if y >= self.toolbar_h {
             return None;
         }
-        if x < 200 {
-            Some(Toolbar::Sh)
-        } else if running && x + 200 >= self.bx + self.bw {
+        if running && x >= self.w - self.m - 170 {
             Some(Toolbar::Back)
         } else {
             None
@@ -87,7 +89,7 @@ impl Geom {
     }
 }
 
+#[derive(PartialEq)]
 pub enum Toolbar {
-    Sh,
     Back,
 }

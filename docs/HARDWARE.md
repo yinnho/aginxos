@@ -2251,3 +2251,39 @@ UI: bootcard hands the panel to aterm once boot finishes.
   install, .prev kept) and the stack restarted clean on the release
   binaries (relay ESTABLISHED, carrier daemon ready). aginxbrowser's musl
   asset is still pending — its manifest line stays commented.
+
+### M11 polish (2026-08-30): keyboard/layout/performance round, verified on device
+
+All results below observed on device this session.
+
+- Glyph scale 5 (30x40px cells, 34 cols) is the accepted terminal size,
+  with an 8 px gap between text rows (48 px stride — 40 px rows read as
+  cramped); scale 9 (~20 cols) rejected as too big, scale 6 (~28 cols) a
+  bit too few columns, scale 2/3 far too small.
+- Input lag root-caused in two parts: (1) the renderer repainted the full
+  canvas + re-SETCRTC per frame — fixed with per-row damage tracking
+  (Term.row_dirty) so terminal() repaints only dirty rows, plus a
+  persistent CPU canvas memcpy'd into the back buffer per present
+  (~10 MB ≈ 1 ms); (2) keys fired on finger-up — moved all keys, launcher
+  buttons and toolbar BACK to fire on Touch::Down (emitted at the
+  tracking-id-down SYN). Echo fast-path: after a key write, poll the pty
+  master 15 ms and parse the echo into the same frame = one present per
+  keystroke. Result: typing fast, launcher opens on first tap.
+- Keyboard layout borrowed from Termux (ExtraKeysConstants): slim
+  extra-keys row above the keyboard (ESC TAB CTL arrows), hold-repeat on
+  DEL/arrows at 400 ms delay / 60 ms interval. Letter rows staggered
+  QWERTY-style (row offset = cell_w * row / 4), keycap labels at ~half
+  cap height with side margins (28 px) so it reads as a real keyboard.
+- Runaway-repeat bug: a >30 px drag suppressed the Tap event that cleared
+  the held key, so DEL kept repeating and ate the whole line. Fixed:
+  Touch::Up is now emitted on every finger-up (not only as Tap), and Drag
+  cancels the held key.
+- Header: launcher-style strip with only BACK at right (centered title
+  was tried and rejected — it occluded content); terminal content starts
+  below a 20 px gap.
+- Launcher-remnant bug: the AGINXOS title (drawn at y=86, scale 5) left a
+  squished 6 px sliver visible under the SH header separator (y=72),
+  because row-damage rendering only repaints terminal rows from y=92.
+  Fixed: full-canvas BG clear below the header on Launcher→Running
+  transition. Verified clean on device.
+

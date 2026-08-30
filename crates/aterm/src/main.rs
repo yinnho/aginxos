@@ -27,6 +27,7 @@ const BG: u32 = 0x00000000;
 const GREEN: u32 = 0x0034D399;
 const WHITE: u32 = 0x00F5F7FA;
 const DIM: u32 = 0x001E3A2E; // key outlines / separators
+const ROW_GAP: usize = 8; // extra px between terminal text rows
 const KEYCAP: u32 = 0x000A1410; // key fill
 const UNAVAIL: u32 = 0x00115A3F; // dimmed green for missing apps
 
@@ -215,24 +216,31 @@ impl<'a> Render<'a> {
         draw_centered(pix, self.pitch, self.w, self.h, self.font, g.kb_panel_y as i32 - 40, "TAP TO START", 3, UNAVAIL);
     }
 
-    fn toolbar(&self, pix: &mut [u32], running: bool) {
+    /// Header strip: [BACK] at the right, like the launcher header —
+    /// nothing else, so the content below stays uncovered.
+    fn toolbar(&self, pix: &mut [u32], m: usize, strip_h: usize) {
         let (w, h) = (self.w, self.h);
-        fill_rect(pix, self.pitch, w, h, 0, 44, w as i32, 2, DIM);
-        draw_text(pix, self.pitch, w, h, self.font, 12, 10, "SH", 3, GREEN);
-        if running {
-            draw_text(pix, self.pitch, w, h, self.font, w as i32 - 12 - text_w("BACK", 3) as i32, 10, "BACK", 3, GREEN);
-        }
+        fill_rect(pix, self.pitch, w, h, m as i32, strip_h as i32, (w - 2 * m) as i32, 2, DIM);
+        let ty = (strip_h as i32 - 8 * 3) / 2;
+        draw_text(pix, self.pitch, w, h, self.font, (w - m) as i32 - text_w("BACK", 3) as i32, ty, "BACK", 3, GREEN);
     }
 
-    fn terminal(&self, pix: &mut [u32], t: &Term, area_top: usize, area_h: usize, scale: usize, blink_on: bool) {
+    /// Row-damaged render: only rows the Term marked dirty are repainted
+    /// (bg fill + glyphs + cursor). The full-screen fill is gone — the
+    /// canvas in main() persists between frames.
+    fn terminal(&self, pix: &mut [u32], t: &Term, area_top: usize, _area_h: usize, scale: usize, blink_on: bool, x_off: usize) {
         let (w, h) = (self.w, self.h);
-        fill_rect(pix, self.pitch, w, h, 0, area_top as i32, w as i32, area_h as i32, BG);
         let cell_w = 6 * scale;
         let cell_h = 8 * scale;
+        let stride = cell_h + ROW_GAP;
         for row in 0..t.rows {
+            if !t.row_dirty()[row] {
+                continue;
+            }
+            let y = area_top + row * stride;
+            fill_rect(pix, self.pitch, w, h, x_off as i32, y as i32, (w - 2 * x_off) as i32, stride as i32, BG);
             let line = t.render_line(row);
-            let y = area_top + row * cell_h;
-            let mut x = 0usize;
+            let mut x = x_off;
             for cell in &line {
                 if cell.ch != ' ' {
                     let c = match cell.style {
@@ -264,39 +272,49 @@ impl<'a> Render<'a> {
                 }
                 x += cell_w;
             }
-        }
-        if t.cursor_visible && t.view_offset == 0 && blink_on {
-            fill_rect(
-                pix,
-                self.pitch,
-                w,
-                h,
-                (t.cursor_x * cell_w) as i32,
-                (area_top + t.cursor_y * cell_h + cell_h - 2) as i32,
-                cell_w as i32,
-                2,
-                GREEN,
-            );
+            if row == t.cursor_y && t.cursor_visible && t.view_offset == 0 && blink_on {
+                fill_rect(
+                    pix,
+                    self.pitch,
+                    w,
+                    h,
+                    (x_off + t.cursor_x * cell_w) as i32,
+                    (y + cell_h - 2) as i32,
+                    cell_w as i32,
+                    2,
+                    GREEN,
+                );
+            }
         }
     }
 
     fn keyboard(&self, pix: &mut [u32], kg: &KeyGeom, kb: &Kb) {
         let (w, h) = (self.w, self.h);
-        fill_rect(pix, self.pitch, w, h, 0, kg.panel_y as i32, w as i32, (h - kg.panel_y) as i32, 0x00050A08);
-        fill_rect(pix, self.pitch, w, h, 0, kg.panel_y as i32 - 2, w as i32, 2, DIM);
+        let m = kg.x_off;
+        fill_rect(pix, self.pitch, w, h, m as i32, kg.extra_y as i32, (w - 2 * m) as i32, (h - kg.extra_y) as i32, 0x00050A08);
+        fill_rect(pix, self.pitch, w, h, m as i32, kg.extra_y as i32 - 2, (w - 2 * m) as i32, 2, DIM);
+        // extra-keys row (Termux): ESC TAB CTL < v ^ >
+        let ekw = (w - 2 * m) / kb::EXTRA.len();
+        for (i, name) in kb::EXTRA.iter().enumerate() {
+            let x0 = m + i * ekw + 3;
+            let y0 = kg.extra_y + 2;
+            let active = i == 2 && kb.ctrl_on();
+            let ks = if i >= 3 { 5 } else { 3 }; // arrows bigger than text
+            self.keycap(pix, x0, y0, ekw - 6, kg.extra_h - 4, name, ks, active);
+        }
         for (r, row) in kb.page_rows().iter().enumerate() {
             for (col, ch) in row.chars().enumerate() {
-                let x0 = col * kg.cell_w + 3;
-                let y0 = kg.panel_y + r * kg.cell_h + 3;
-                self.keycap(pix, x0, y0, kg.cell_w - 6, kg.cell_h - 6, &ch.to_string(), kg.scale, false);
+                let x0 = m + kg.row_off(r) + col * kg.cell_w + 4;
+                let y0 = kg.panel_y + r * kg.cell_h + 4;
+                self.keycap(pix, x0, y0, kg.cell_w - 8, kg.cell_h - 8, &ch.to_string(), kg.label_scale, false);
             }
         }
-        let kw = kg.cell_w * 10 / 6;
+        let kw = (w - 2 * m) / 5;
         for (i, name) in Kb::specials().iter().enumerate() {
-            let x0 = i * kw + 3;
-            let y0 = kg.panel_y + 4 * kg.cell_h + 3;
+            let x0 = m + i * kw + 4;
+            let y0 = kg.panel_y + 4 * kg.cell_h + 4;
             let active = (i == 0 && kb.shift_on()) || (i == 1 && kb.sym_on());
-            self.keycap(pix, x0, y0, kw - 6, kg.cell_h - 6, name, kg.scale, active);
+            self.keycap(pix, x0, y0, kw - 8, kg.cell_h - 8, name, 4, active);
         }
     }
 
@@ -308,7 +326,7 @@ impl<'a> Render<'a> {
         fill_rect(pix, self.pitch, w, h, x0 as i32, y0 as i32, 2, kh as i32, edge);
         fill_rect(pix, self.pitch, w, h, (x0 + kw) as i32 - 2, y0 as i32, 2, kh as i32, edge);
         fill_rect(pix, self.pitch, w, h, x0 as i32 + 2, y0 as i32 + 2, kw as i32 - 4, kh as i32 - 4, KEYCAP);
-        let ls = if label.len() > 1 { 2 } else { scale };
+        let ls = scale;
         let tw = text_w(label, ls) as i32;
         let tc = if active { WHITE } else { GREEN };
         draw_text(
@@ -355,17 +373,17 @@ fn host_ppm(out: &str) {
     let pitch = w;
     let mut pix = vec![0u32; pitch * h];
     let kg = Kb::geom(w, h);
-    let lg = launch::Geom::new(w, h, kg.panel_y);
+    let lg = launch::Geom::new(w, h, kg.extra_y);
     let r = Render { font: &font, w, h, pitch };
     let entries = launch::entries();
     r.launcher(&mut pix, &entries, &lg);
     r.keyboard(&mut pix, &kg, &kb0());
 
     // second frame: terminal view with a fake session
-    let area_top0 = lg.toolbar_h;
-    let area_h0 = kg.panel_y - area_top0;
-    let sc0 = 2usize;
-    let mut t = Term::new(w / (6 * sc0), area_h0 / (8 * sc0));
+    let area_top0 = lg.toolbar_h + 20;
+    let area_h0 = kg.extra_y - area_top0;
+    let sc0 = 6usize;
+    let mut t = Term::new((w - 2 * kb::KB_M) / (6 * sc0), area_h0 / (8 * sc0));
     let mut parser = vte::Parser::new();
     let demo: &[u8] = b"root@aginxos:~# uname -a\r\nLinux aginxos 5.4.61-android13 aarch64\r\nroot@aginxos:~# \x1b[1mecho $HOME | tr a-z A-Z\x1b[0m\r\n/VAR/HOME\r\nroot@aginxos:~# ";
     for &b in demo {
@@ -373,8 +391,8 @@ fn host_ppm(out: &str) {
     }
     let mut pix2 = vec![0u32; pitch * h];
     fill_rect(&mut pix2, pitch, w, h, 0, 0, w as i32, h as i32, BG);
-    r.toolbar(&mut pix2, true);
-    r.terminal(&mut pix2, &t, area_top0, area_h0, sc0, true);
+    r.toolbar(&mut pix2, kb::KB_M, lg.toolbar_h);
+    r.terminal(&mut pix2, &t, area_top0, area_h0, sc0, true, kb::KB_M);
     r.keyboard(&mut pix2, &kg, &kb0());
     let term_path = format!("{}-term", out);
     if let Err(e) = ppm_dump(out, &pix, w, h, pitch) {
@@ -408,15 +426,15 @@ fn main() {
 
     let mut kb = Kb::new();
     let kg = Kb::geom(w, h);
-    let lg = launch::Geom::new(w, h, kg.panel_y);
+    let lg = launch::Geom::new(w, h, kg.extra_y);
 
-    // Terminal geometry: glyph scale 2 (12x16 px cells — the readable
-    // minimum on a 1080x2340 panel), cols/rows derived from the area.
-    let scale = 2usize;
-    let area_top = lg.toolbar_h;
-    let area_h = kg.panel_y - area_top;
-    let term_cols = (w / (6 * scale)).max(20);
-    let term_rows = (area_h / (8 * scale)).max(4);
+    // Terminal geometry: glyph scale 5 (30x40 px cells, 34 cols inside
+    // the 28 px side margins — 6/28 cols felt a bit too few).
+    let scale = 5usize;
+    let area_top = lg.toolbar_h + 20;
+    let area_h = kg.extra_y - area_top;
+    let term_cols = ((w - 2 * kb::KB_M) / (6 * scale)).max(20);
+    let term_rows = (area_h / (8 * scale + ROW_GAP)).max(4);
 
     let mut term = Term::new(term_cols, term_rows);
     let mut parser = vte::Parser::new();
@@ -434,19 +452,24 @@ fn main() {
     let mut touch = TouchReader::open("/dev/input/event2", w as i32, h as i32);
     let mut entries = launch::entries();
 
+    // Persistent canvas: renderers repaint only damaged rows into it, and
+    // each present() memcpy's it into the back buffer (~10 MB, ~1 ms) so
+    // double-buffer semantics survive partial redraws.
+    let mut canvas = vec![0u32; pitch * h];
     // First frame BEFORE the mode set (panel snapshots at SETCRTC).
     {
         let r = Render { font: &font, w, h, pitch };
-        let buf = d.back_buf();
+        let buf = &mut canvas[..];
         match &mode {
             Mode::Launcher => r.launcher(buf, &entries, &lg),
             Mode::Running(_) => {
                 fill_rect(buf, pitch, w, h, 0, 0, w as i32, h as i32, BG);
-                r.toolbar(buf, true);
-                r.terminal(buf, &term, area_top, area_h, scale, true);
+                r.toolbar(buf, lg.m, lg.toolbar_h);
+                r.terminal(buf, &term, area_top, area_h, scale, true, lg.m);
             }
         }
         r.keyboard(buf, &kg, &kb);
+        d.back_buf().copy_from_slice(&canvas);
     }
     if let Err(e) = d.initial_modeset() {
         eprintln!("aterm: modeset: {e}");
@@ -455,6 +478,10 @@ fn main() {
 
     let mut last_blink = Instant::now();
     let mut blink_on = false;
+    let mut kb_dirty = true;
+    // Hold-to-repeat (DEL / arrows), Termux-style: next fire deadline.
+    let mut held: Option<(Vec<u8>, Instant)> = None;
+    let mut down_y = 0usize; // where the current touch started
 
     loop {
         // drain pty output
@@ -468,9 +495,7 @@ fn main() {
                         for &b in &buf[..n] {
                             parser.advance(&mut term, b);
                         }
-                        if term.view_offset > 0 {
-                            term.view_offset = 0; // new output jumps to live
-                        }
+                        term.jump_live(); // new output jumps to live
                         redraw = true;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -497,74 +522,114 @@ fn main() {
             fds[nfds].fd = c.master.as_raw_fd();
             nfds += 1;
         }
-        let timeout: libc::c_int = if redraw { 0 } else { 400 };
+        let timeout: libc::c_int = if redraw {
+            0
+        } else if held.is_some() {
+            30
+        } else {
+            400
+        };
         let nready = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout) };
         if nready > 0 {
             let mut i = 0;
             if touch.is_some() {
                 if fds[i].revents & libc::POLLIN != 0 {
                     match touch.as_mut().unwrap().poll() {
-                        Touch::Tap(x, y) => {
-                            eprintln!("aterm: tap x={x} y={y}");
+                        // Keys fire on finger-DOWN. Waiting for finger-up
+                        // added the whole rest-of-finger time to every
+                        // keystroke — the main source of "typing lag".
+                        Touch::Down(x, y) => {
+                            down_y = y;
                             if y < lg.toolbar_h {
-                                match lg.toolbar_hit(x, y, matches!(mode, Mode::Running(_))) {
-                                    Some(launch::Toolbar::Back) => {
-                                        if let Mode::Running(c) = &mode {
-                                            unsafe { libc::kill(c.pid, libc::SIGHUP) };
-                                        }
-                                    }
-                                    Some(launch::Toolbar::Sh) => {
-                                        if let Mode::Running(c) = &mode {
-                                            unsafe { libc::kill(c.pid, libc::SIGHUP) };
-                                        }
-                                        match spawn_shell(term_cols as u16, term_rows as u16, &[launch::BIN_SH]) {
-                                            Ok(c) => {
-                                                mode = Mode::Running(c);
-                                                term = Term::new(term_cols, term_rows);
-                                                parser = vte::Parser::new();
-                                            }
-                                            Err(e) => eprintln!("aterm: spawn sh: {e}"),
-                                        }
-                                    }
-                                    None => {}
-                                }
-                                redraw = true;
-                            } else if y >= kg.panel_y {
-                                if let Some(bytes) = kb.key_at(&kg, x, y) {
-                                    eprintln!("aterm: key {:02x?}", bytes);
-                                    if let Mode::Running(c) = &mut mode {
-                                        let _ = c.master.write_all(&bytes);
+                                // BACK fires on press, same as keys
+                                if lg.toolbar_hit(x, y, matches!(mode, Mode::Running(_)))
+                                    == Some(launch::Toolbar::Back)
+                                {
+                                    if let Mode::Running(c) = &mode {
+                                        unsafe { libc::kill(c.pid, libc::SIGHUP) };
                                     }
                                     redraw = true;
                                 }
-                            } else {
-                                match &mut mode {
-                                    Mode::Launcher => {
-                                        if let Some(i2) = lg.button_at(x, y, entries.len()) {
-                                            if entries[i2].avail {
-                                                let prog = entries[i2].bin;
-                                                match spawn_shell(term_cols as u16, term_rows as u16, &[prog]) {
-                                                    Ok(c) => {
-                                                        mode = Mode::Running(c);
-                                                        term = Term::new(term_cols, term_rows);
-                                                        parser = vte::Parser::new();
-                                                    }
-                                                    Err(e) => eprintln!("aterm: spawn: {e}"),
+                            } else if y < kg.extra_y {
+                                if let Mode::Launcher = &mut mode {
+                                    if let Some(i2) = lg.button_at(x, y, entries.len()) {
+                                        if entries[i2].avail {
+                                            let prog = entries[i2].bin;
+                                            match spawn_shell(term_cols as u16, term_rows as u16, &[prog]) {
+                                                Ok(c) => {
+                                                    mode = Mode::Running(c);
+                                                    term = Term::new(term_cols, term_rows);
+                                                    parser = vte::Parser::new();
+                                                    kb_dirty = true;
+                                                    // wipe launcher pixels below the header —
+                                                    // row-damage rendering only repaints
+                                                    // terminal rows, so launcher art (the
+                                                    // AGINXOS title top sliver) would linger
+                                                    fill_rect(&mut canvas, pitch, w, h, 0, lg.toolbar_h as i32, w as i32, (h - lg.toolbar_h) as i32, BG);
                                                 }
-                                                redraw = true;
+                                                Err(e) => eprintln!("aterm: spawn: {e}"),
+                                            }
+                                            redraw = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if y >= kg.extra_y {
+                                let bytes = if y >= kg.panel_y {
+                                    kb.key_at(&kg, x, y)
+                                } else {
+                                    kb.extra_key_at(&kg, x, y)
+                                };
+                                if let Some(bytes) = bytes {
+                                    if let Mode::Running(c) = &mut mode {
+                                        let _ = c.master.write_all(&bytes);
+                                        if !bytes.is_empty() {
+                                            // fast path: pull the echo into
+                                            // the SAME frame (one present
+                                            // per keystroke, not two)
+                                            let mut pfd = libc::pollfd {
+                                                fd: c.master.as_raw_fd(),
+                                                events: libc::POLLIN,
+                                                revents: 0,
+                                            };
+                                            if unsafe { libc::poll(&mut pfd, 1, 15) } > 0 {
+                                                let mut buf2 = [0u8; 8192];
+                                                if let Ok(n) = std::io::Read::read(&mut c.master, &mut buf2) {
+                                                    for &b in &buf2[..n] {
+                                                        parser.advance(&mut term, b);
+                                                    }
+                                                    term.jump_live();
+                                                }
                                             }
                                         }
                                     }
-                                    Mode::Running(_) => {}
+                                    if kb::repeatable(&bytes) {
+                                        held = Some((bytes, Instant::now() + Duration::from_millis(400)));
+                                    }
+                                    kb_dirty = true; // modifier highlight may flip
+                                    redraw = true;
                                 }
                             }
                         }
+                        // Finger lifted: everything fired at Down already.
+                        Touch::Tap(_x, _y) => {
+                            held = None;
+                        }
+                        // Scrollback drag only counts if the touch STARTED
+                        // in the terminal area (dragging across keys types
+                        // nothing and scrolls nothing).
+                        Touch::Up => {
+                            held = None;
+                        }
                         Touch::Drag(dy) => {
-                            if let Mode::Running(_) = mode {
-                                let lines = dy / (8 * scale) as isize;
-                                if lines != 0 {
-                                    term.scroll_view(lines); // finger down = view earlier? keep natural: drag down shows newer
-                                    redraw = true;
+                            held = None; // finger slid off the key
+                            if down_y < kg.extra_y {
+                                if let Mode::Running(_) = mode {
+                                    let lines = dy / (8 * scale) as isize;
+                                    if lines != 0 {
+                                        term.scroll_view(lines);
+                                        redraw = true;
+                                    }
                                 }
                             }
                         }
@@ -581,11 +646,23 @@ fn main() {
             }
         }
 
-        // blink toggle
+        // hold-to-repeat for DEL / arrows
+        if let Some((b, next)) = &mut held {
+            if Instant::now() >= *next {
+                if let Mode::Running(c) = &mut mode {
+                    let _ = c.master.write_all(b);
+                }
+                *next = Instant::now() + Duration::from_millis(60);
+                redraw = true;
+            }
+        }
+
+        // blink toggle — repaint only the cursor's row
         if last_blink.elapsed() > Duration::from_millis(500) {
             blink_on = !blink_on;
             last_blink = Instant::now();
-            if matches!(mode, Mode::Running(_)) {
+            if matches!(mode, Mode::Running(_)) && term.view_offset == 0 {
+                term.mark_row(term.cursor_y);
                 redraw = true;
             }
         }
@@ -593,19 +670,30 @@ fn main() {
         if redraw || term.dirty {
             term.dirty = false;
             let r = Render { font: &font, w, h, pitch };
-            let buf = d.back_buf();
+            let buf = &mut canvas[..];
             match &mode {
                 Mode::Launcher => {
+                    // launcher() full-covers the canvas
                     r.launcher(buf, &entries, &lg);
+                    r.keyboard(buf, &kg, &kb);
                 }
                 Mode::Running(_) => {
-                    fill_rect(buf, pitch, w, h, 0, 0, w as i32, h as i32, BG);
-                    r.toolbar(buf, true);
-                    r.terminal(buf, &term, area_top, area_h, scale, blink_on);
+                    r.terminal(buf, &term, area_top, area_h, scale, blink_on, lg.m);
+                    if kb_dirty {
+                        r.toolbar(buf, lg.m, lg.toolbar_h);
+                        r.keyboard(buf, &kg, &kb);
+                    }
                 }
             }
-            r.keyboard(buf, &kg, &kb);
+            term.clear_row_dirty();
+            kb_dirty = false;
+            d.back_buf().copy_from_slice(&canvas);
+            let t0 = Instant::now();
             d.present();
+            let el = t0.elapsed();
+            if el > Duration::from_millis(25) {
+                eprintln!("aterm: slow present {}ms", el.as_millis());
+            }
         }
     }
 }
