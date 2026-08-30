@@ -6,6 +6,7 @@ members = [
     "crates/aginxos-init",
     "crates/agdl",
     "crates/aterm",
+    "crates/wifi-wizard",
 ]
 default-members = ["crates/aginxos-probe"]
 

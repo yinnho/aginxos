@@ -514,12 +514,28 @@ fn main() {
     if let Ok(prog) = std::env::var("ATERM_START") {
         // leak: aterm is a forever-process
         let prog: &'static str = Box::leak(prog.into_boxed_str());
-        scale = if prog == launch::BIN_SH { 5 } else { 3 };
+        scale = launch::scale_for(prog);
         term_cols = cols_for(scale);
         term = Term::new(term_cols, rows_for(kb_visible, scale));
         match spawn_shell(term_cols as u16, rows_for(kb_visible, scale) as u16, &[prog]) {
             Ok(c) => mode = Mode::Running(c),
             Err(e) => eprintln!("aterm: ATERM_START spawn: {e}"),
+        }
+    } else if !std::path::Path::new("/etc/wifi.conf").exists()
+        && std::path::Path::new(launch::BIN_WIZARD).is_file()
+    {
+        // First boot / wiped userdata: no network credentials yet, so the
+        // wizard is the setup UI (SYSTEM.md §9.2) instead of the launcher.
+        scale = launch::scale_for(launch::BIN_WIZARD);
+        term_cols = cols_for(scale);
+        term = Term::new(term_cols, rows_for(kb_visible, scale));
+        match spawn_shell(
+            term_cols as u16,
+            rows_for(kb_visible, scale) as u16,
+            &[launch::BIN_WIZARD],
+        ) {
+            Ok(c) => mode = Mode::Running(c),
+            Err(e) => eprintln!("aterm: wizard spawn: {e}"),
         }
     }
     let mut touch = TouchReader::open("/dev/input/event2", w as i32, h as i32);
@@ -636,7 +652,7 @@ fn main() {
                                             // PC-designed TUIs need ~56 cols
                                             // to breathe; sh keeps the big
                                             // touch-friendly glyphs.
-                                            scale = if prog == launch::BIN_SH { 5 } else { 3 };
+                                            scale = launch::scale_for(prog);
                                             term_cols = cols_for(scale);
                                             match spawn_shell(term_cols as u16, rows_for(false, scale) as u16, &[prog]) {
                                                 Ok(c) => {

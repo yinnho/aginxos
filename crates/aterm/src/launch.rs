@@ -7,11 +7,22 @@ pub const BIN_CLONE: &str = "/var/bin/aclone";
 pub const BIN_CODEX: &str = "/var/bin/codex";
 pub const BIN_GROK: &str = "/var/bin/grok";
 pub const BIN_SH: &str = "/bin/sh";
+pub const BIN_WIZARD: &str = "/usr/bin/wifi-wizard";
 
 pub struct Entry {
     pub label: &'static str,
     pub bin: &'static str,
     pub avail: bool,
+}
+
+/// Phone-native UIs keep the big touch glyphs; the PC-designed TUIs
+/// (codex/grok) need ~56 cols, so they get the small ones.
+pub fn scale_for(bin: &str) -> usize {
+    if bin == BIN_SH || bin == BIN_WIZARD {
+        5
+    } else {
+        3
+    }
 }
 
 pub fn entries() -> Vec<Entry> {
@@ -20,6 +31,7 @@ pub fn entries() -> Vec<Entry> {
         ("CODEX", BIN_CODEX),
         ("GROK", BIN_GROK),
         ("SH", BIN_SH),
+        ("WIFI SETUP", BIN_WIZARD),
     ]
     .into_iter()
     .map(|(label, bin)| Entry {
@@ -48,7 +60,8 @@ impl Geom {
         let toolbar_h = 72;
         let avail_h = kb_panel_y - toolbar_h;
         let gap = 40;
-        let bh = ((avail_h - 120 - gap * 3) / 4).min(180);
+        // five buttons (clone / codex / grok / sh / wifi)
+        let bh = ((avail_h - 120 - gap * 4) / 5).min(180);
         Geom {
             bx: m,
             bw: w - 2 * m,

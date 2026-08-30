@@ -1,0 +1,13 @@
+[package]
+name = "wifi-wizard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AginxOS first-boot Wi-Fi setup wizard — scan, pick AP, enter password (SYSTEM.md §9.2)"
+publish = false
+
+[[bin]]
+name = "wifi-wizard"
+path = "src/main.rs"
+
+[dependencies]
