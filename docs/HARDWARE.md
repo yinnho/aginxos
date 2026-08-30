@@ -2469,3 +2469,103 @@ Session-end device state: AginxOS boot, slot a, adb aginxosredfin; all
 five packages installed from the manifest; aginx + carrier + aginxbrowser
 running; /var/home auth restored from the pre-wipe backup; out/rootfs.img
 rebuilt with wifi-wizard + updated aterm/manifest/agpkg baked in.
+
+## M15 power management on device (2026-08-31)
+
+aterm gained: qpnp_pon key reading (/dev/input/event1, KEY_POWER=116; the
+node also carries volume-down, ignored), screen blank via null-SETCRTC,
+60 s idle auto-blank, short-press blank/wake toggle, hold >=1.2 s =
+shutdown, launcher RESTART + POWER OFF buttons, and reboot2 extended
+(`reboot2 poweroff` = RB_POWER_OFF; no arg = plain restart; other args
+stay RESTART2 reasons).
+
+- **Blank path probed, not assumed**: this kernel's sde connector has NO
+  legacy DPMS property (OBJ_GETPROPERTIES on connector 29 lists 17 props —
+  EDID/link-status/caps/roi/hdr/autorefresh/bl_scale/topology/LP — no
+  DPMS; sysfs card0-DSI-1/dpms accepts writes but nothing happens; no
+  /dev/fb*, msm_drm has no fbdev emulation). The working route is a null
+  SETCRTC (fb_id=0, count_connectors=0, mode_valid=0): dmesg then shows
+  `sec_ts suspend` + `dsi_backlight_early_dpms power_mode:5` and
+  panel0-backlight/bl_power goes 4 (POWERDOWN). Wake = re-SETCRTC relatch
+  (the same path as aterm's PAGE_FLIP-refused fallback). While blanked
+  aterm must not present() — a relatch would re-enable the CRTC — so the
+  render loop is gated on !blanked.
+- **Injected-key verification** (toybox sendevent into event1, so every
+  step below was observed without touching the device): 60 s idle ->
+  blank (bl_power 0->4, screen held off, aterm alive); short press while
+  blanked -> wake (dsi_display_set_mode relatch, bl_power 4->0); short
+  press while lit -> blank (4); short press -> wake (0). KeyReader's
+  event1 parsing proven by the toggle itself.
+- **Shutdown verified**: held KEY_POWER (no release) -> aterm drew the
+  farewell frame, spawned `reboot2 poweroff`, and the machine cut power
+  (adb offline, device off).
+- Battery current_now (qpnp-qgauge) is FROZEN at 7324 — useless as an
+  observable for power experiments on this kernel.
+- Not yet physically re-checked by hand: real power-key feel (same node
+  as the injected events, low risk), touch wake while blanked (sec_ts
+  suspends with the panel — may deliver nothing until the power key
+  wakes it), launcher RESTART/POWER OFF buttons, charge/power-on
+  behavior while off.
+
+Session-end device state: POWERED OFF via the new M15 shutdown path.
+Power back on with the physical power button (or plug USB). Slot a,
+rootfs has new aterm + reboot2 via adb push (persisted, ext4); the
+baked-in rootfs image is NOT yet rebuilt — next build-rootfs.sh run
+should include them.
+
+## M16 service layer + slot-successful marker on device (2026-08-31)
+
+Supervision (`::respawn:/usr/bin/agsvc` in inittab, busybox init stays
+PID 1) observed live after a full reboot:
+
+- Units from /etc/agsvc.d (aginx, aginx-carrier, aginxbrowser; type
+  simple, carrier gated by requires_weak aginx): all three `ready` via
+  `agctl list`, children re-parented under agsvc (PPID = agsvc).
+- `kill -9` a service -> respawned with growing backoff (spawns counter
+  ticks). 5 kills inside 60 s -> unit parked `failed`, no more spawning;
+  `agctl start` clears the breaker and returns it to ready.
+- Readiness contracts verified with throwaway units: type notify (`sh -c
+  'echo -n r >&3; sleep 60'`) goes Starting->ready on the fd-3 byte;
+  exiting before notifying (`exit 3`) counts died-before-ready, not
+  ready. `agctl stop/restart/reload` all behaved; reload picked up new
+  and removed unit files live.
+- `kill -9` agsvc itself -> children die with it (PDEATHSIG), init
+  respawns agsvc within seconds, whole stack re-spawns from unit files.
+  Verified twice (manual + post-reboot instance).
+- App registry: rcS runs /etc/init.d/app-registry; /var/apps seeded with
+  codex + grok (aclone correctly pruned — no /var/bin/aclone yet);
+  launcher draws them from the scan (new aterm binary on device).
+
+Slot-successful marker — the fastboot-loop fix. The original assumption
+(libboot_control bootloader_control at misc+2048) was **wrong on this
+device** and the probe chain that disproved it:
+
+- misc (1 MiB, /dev/sda3): no TCAB magic anywhere. +2048 = "theme-dark"
+  (recovery's vendor-space theme string), +0x8000 = misc_virtual_ab_message
+  (v2, magic 0x56740AB0). devinfo/ssd/uefivarstore/logfs/spunvm/secdata/
+  limits/storsec/toolsfv/klog/splash all scanned: no TCAB.
+- One plain reboot re-dumped: ONLY klog changed (UEFI log tail append).
+  So the boot-time slot write is not in any partition *payload*.
+- bootctrl.lito.so (vendor_boot ramdisk, /system/lib64/hw) imports
+  gpt_disk_*/gpt_utils_* — the slot store is the **GPT entry attribute
+  u64** of every *_a/_b partition, per-LUN (/dev/sda sdb sdc sde sdf).
+  Observed bits: 48-51 priority, 52-55 tries-remaining, 56 successful.
+  **These UFS LUNs are 4K-logical-block** — GPT header at byte 0x1000,
+  entries at 0x2000 on /dev/sda; 512B-offset reads see only MBR padding
+  (that burned an hour; agboot-ok reads queue/logical_block_size now).
+- State before marking: boot_a pri=15 tries=0 succ=0 — our unmarked
+  boots since the last `fastboot set_active a` had drained the counter
+  to the edge. boot_b still pri=2 tries=8: the next slot-a failure
+  would fall through to stock Android on our ext4 userdata (first_stage
+  would format it). Marked before that could happen.
+- `agboot-ok` (new, GPT-based) set succ=1 tries=7 on all 29 *_a entries
+  across 5 LUNs (primary+backup GPT, CRCs rewritten, fsync). Reboot:
+  slot a booted and `agboot-ok status` shows tries STILL 7 succ STILL 1
+  — ABL does not drain a successful slot. rcS re-marks after every
+  `done ok` boot as belt-and-braces.
+
+Session-end device state: RUNNING AginxOS, slot a marked successful,
+agsvc stack supervised (aginx/carrier/browser ready), registry seeded
+(codex+grok), new aterm/agboot-ok/rcS/inittab/provision pushed by hand
+(persisted in the ext4 rootfs; baked image NOT rebuilt — fold into the
+next build-rootfs.sh run together with M15).
