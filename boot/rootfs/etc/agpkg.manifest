@@ -6,13 +6,15 @@
 # prefix the URL with https://gh-proxy.com/ (sha256 still verified).
 #
 # aginx v0.3.2 and aginx-carrier v0.1.0 musl assets shipped 2026-08-30.
-# aginxbrowser musl shipped upstream in v0.2.5. codex/grok have no usable
-# upstream raw-musl asset (codex ships a tarball, grok has no musl release
-# at all) — both are mirrored as raw binaries under yinnho/aginxos releases
-# (M12/M13, sha256 matches the on-device verified installs).
+# codex/grok have no usable upstream raw-musl asset (codex ships a tarball,
+# grok has no musl release at all) — mirrored as raw binaries under
+# yinnho/aginxos releases. aginxbrowser's UPSTREAM v0.2.5 musl asset
+# segfaults on device (their CI zig was broken at tag time; fixed in
+# b0315d7 after the tag) — same mirror treatment, device-verified rebuild
+# (M10, /health + /fetch ok). All sha256 match the on-device installs.
 
 aginx          https://github.com/yinnho/aginx/releases/download/v0.3.2/aginx-aarch64-unknown-linux-musl 1f8134d0d7bbead9ffcff9c7c1cb1499f3fcc10b4c7f3db7f44e41d658991690
 aginx-carrier  https://github.com/yinnho/aginx-carrier/releases/download/v0.1.0/aginx-carrier-v0.1.0-aarch64-unknown-linux-musl 6fbf5c9cb73c5a3ab8b6e8c58dd5de0165499bed357eb1667054b33569be53d0
-aginxbrowser   https://github.com/yinnho/aginxbrowser/releases/download/v0.2.5/aginxbrowser-v0.2.5-aarch64-unknown-linux-musl 4d9229a89aa4b3efd12b5bf35d003733f3b58a496d129ea520c427d7d3089fb3
+aginxbrowser   https://github.com/yinnho/aginxos/releases/download/aginxbrowser-v0.2.5/aginxbrowser-v0.2.5-aarch64-unknown-linux-musl 5561e6287d6b146a94170bb71fc2c5b0ff0e9e6cfd0aa0a8ea84a21d630a99e6
 codex          https://github.com/yinnho/aginxos/releases/download/codex-v0.151.0/codex-v0.151.0-aarch64-unknown-linux-musl 56f026015ccc3ebc12895282200d89c216892bf6fa15fa7f228e6e0c6ad6ce76
 grok           https://github.com/yinnho/aginxos/releases/download/grok-v1.0.12/grok-v1.0.12-aarch64-unknown-linux-musl dac1ccb2084ee8ccbfd3e9656210e5dfb689c080b05d0fc1c5349c010fd6796d
