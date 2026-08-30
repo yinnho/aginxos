@@ -61,6 +61,71 @@ fn fill_rect(pix: &mut [u32], pitch: usize, w: usize, h: usize, x: i32, y: i32, 
     }
 }
 
+// Glyph lookup for terminal cells. The built-in font is 7-bit ASCII only,
+// but the TUIs we host (grok, codex) draw borders/spinners with Unicode
+// box-drawing, blocks and braille. Render those procedurally in the same
+// 5x8 bitmap format instead of truncating the codepoint to a random ASCII
+// glyph. Anything else non-ASCII falls back to '?'.
+fn glyph(font: &[[u8; 8]; 128], ch: char) -> [u8; 8] {
+    const V: u8 = 0x04; // center column
+    const H: u8 = 0x1F; // full row
+    const L: u8 = 0x1C; // row, left of center
+    const R: u8 = 0x07; // row, right of center
+    match ch {
+        c if (c as u32) < 128 => font[c as usize],
+        '─' | '╌' | '┄' => [0, 0, 0, H, 0, 0, 0, 0],
+        '━' => [0, 0, 0, H, H, 0, 0, 0],
+        '│' | '┆' | '┊' => [V; 8],
+        '┃' => [0x0C; 8],
+        '┌' | '╭' => [0, 0, 0, R, V, V, V, V],
+        '┐' | '╮' => [0, 0, 0, L, V, V, V, V],
+        '└' | '╰' => [V, V, V, R, 0, 0, 0, 0],
+        '┘' | '╯' => [V, V, V, L, 0, 0, 0, 0],
+        '├' => [V, V, V, R, V, V, V, V],
+        '┤' => [V, V, V, L, V, V, V, V],
+        '┬' => [0, 0, 0, H, V, V, V, V],
+        '┴' => [V, V, V, H, 0, 0, 0, 0],
+        '┼' => [V, V, V, H, V, V, V, V],
+        '═' => [0, 0, H, 0, H, 0, 0, 0],
+        '║' => [0x0A; 8],
+        '╔' => [0, 0, 0x0E, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A],
+        '╗' => [0, 0, 0x1A, 0x0A, 0x0A, 0x0A, 0x0A, 0x0A],
+        '╚' => [0x0A, 0x0A, 0x0A, 0x0A, 0x0E, 0, 0, 0],
+        '╝' => [0x0A, 0x0A, 0x0A, 0x0A, 0x1A, 0, 0, 0],
+        '█' => [H; 8],
+        '▀' => [H, H, H, H, 0, 0, 0, 0],
+        '▄' => [0, 0, 0, 0, H, H, H, H],
+        '▌' => [L; 8],
+        '▐' => [R; 8],
+        '░' => [0x11, 0, 0x04, 0, 0x11, 0, 0x04, 0],
+        '▒' => [0x15, 0x0A, 0x15, 0x0A, 0x15, 0x0A, 0x15, 0x0A],
+        '▪' | '▫' | '•' | '·' => [0, 0, 0, 0x06, 0x06, 0, 0, 0],
+        '❯' | '›' => [0x10, 0x08, 0x04, 0x02, 0x04, 0x08, 0x10, 0],
+        '✓' => [0, 0x01, 0x01, 0x0A, 0x0A, 0x04, 0, 0],
+        '✗' | '×' => [0x11, 0x0A, 0x04, 0x04, 0x0A, 0x11, 0, 0],
+        '…' => [0, 0, 0, 0, 0, 0, 0x15, 0],
+        '→' => [0, 0, 0x04, 0x02, H, 0x02, 0x04, 0],
+        '←' => [0, 0, 0x04, 0x08, H, 0x08, 0x04, 0],
+        '↑' => [0x04, 0x0E, 0x15, 0x04, 0x04, 0x04, 0x04, 0],
+        '↓' => [0x04, 0x04, 0x04, 0x04, 0x15, 0x0E, 0x04, 0],
+        // Braille patterns: 2x4 dot matrix encoded in the low byte.
+        c @ '\u{2800}'..='\u{28FF}' => {
+            let b = c as u32 - 0x2800;
+            let mut g = [0u8; 8];
+            if b & 0x01 != 0 { g[1] |= 0x08; }
+            if b & 0x02 != 0 { g[3] |= 0x08; }
+            if b & 0x04 != 0 { g[5] |= 0x08; }
+            if b & 0x40 != 0 { g[7] |= 0x08; }
+            if b & 0x08 != 0 { g[1] |= 0x02; }
+            if b & 0x10 != 0 { g[3] |= 0x02; }
+            if b & 0x20 != 0 { g[5] |= 0x02; }
+            if b & 0x80 != 0 { g[7] |= 0x02; }
+            g
+        }
+        _ => font['?' as usize],
+    }
+}
+
 fn draw_text(pix: &mut [u32], pitch: usize, w: usize, h: usize, font: &[[u8; 8]; 128], x: i32, y: i32, s: &str, scale: usize, c: u32) -> i32 {
     let mut cx = x;
     for &b in s.as_bytes() {
@@ -251,7 +316,7 @@ impl<'a> Render<'a> {
                             BG
                         }
                     };
-                    let g = self.font[(cell.ch as u8 & 127) as usize];
+                    let g = glyph(self.font, cell.ch);
                     for r in 0..8 {
                         for col in 0..5 {
                             if g[r] & (0x10 >> col) != 0 {
@@ -428,18 +493,20 @@ fn main() {
     let kg = Kb::geom(w, h);
     let lg = launch::Geom::new(w, h, kg.extra_y);
 
-    // Terminal geometry: glyph scale 5 (30x40 px cells, 34 cols inside
-    // the 28 px side margins — 6/28 cols felt a bit too few).
-    let scale = 5usize;
+    // Terminal geometry: glyph scale is per-app — sh keeps 5 (30x40 px
+    // cells, 34 cols inside the 28 px side margins), the PC-designed TUIs
+    // (codex/grok) get 3 (18x24 px, ~56 cols) so their 80-col layouts fit.
+    let mut scale = 5usize;
     let area_top = lg.toolbar_h + 20;
     // Keyboard starts hidden; a tap in the terminal area summons/dismisses
     // it and the terminal rows grow/shrink to match (child gets SIGWINCH).
     let area_bottom = |vis: bool| if vis { kg.extra_y } else { h - 24 };
-    let rows_for = |vis: bool| ((area_bottom(vis) - area_top) / (8 * scale + ROW_GAP)).max(4);
-    let term_cols = ((w - 2 * kb::KB_M) / (6 * scale)).max(20);
+    let rows_for = |vis: bool, sc: usize| ((area_bottom(vis) - area_top) / (8 * sc + ROW_GAP)).max(4);
+    let cols_for = |sc: usize| ((w - 2 * kb::KB_M) / (6 * sc)).max(20);
+    let mut term_cols = cols_for(scale);
     let mut kb_visible = false;
 
-    let mut term = Term::new(term_cols, rows_for(kb_visible));
+    let mut term = Term::new(term_cols, rows_for(kb_visible, scale));
     let mut parser = vte::Parser::new();
     let mut mode = Mode::Launcher;
     // Debug/headless path: ATERM_START=<bin> skips the launcher and spawns
@@ -447,7 +514,10 @@ fn main() {
     if let Ok(prog) = std::env::var("ATERM_START") {
         // leak: aterm is a forever-process
         let prog: &'static str = Box::leak(prog.into_boxed_str());
-        match spawn_shell(term_cols as u16, rows_for(kb_visible) as u16, &[prog]) {
+        scale = if prog == launch::BIN_SH { 5 } else { 3 };
+        term_cols = cols_for(scale);
+        term = Term::new(term_cols, rows_for(kb_visible, scale));
+        match spawn_shell(term_cols as u16, rows_for(kb_visible, scale) as u16, &[prog]) {
             Ok(c) => mode = Mode::Running(c),
             Err(e) => eprintln!("aterm: ATERM_START spawn: {e}"),
         }
@@ -511,7 +581,9 @@ fn main() {
                 mode = Mode::Launcher;
                 entries = launch::entries();
                 kb_visible = false;
-                term = Term::new(term_cols, rows_for(false));
+                scale = 5;
+                term_cols = cols_for(scale);
+                term = Term::new(term_cols, rows_for(false, scale));
                 parser = vte::Parser::new();
                 redraw = true;
             }
@@ -561,11 +633,16 @@ fn main() {
                                     if let Some(i2) = lg.button_at(x, y, entries.len()) {
                                         if entries[i2].avail {
                                             let prog = entries[i2].bin;
-                                            match spawn_shell(term_cols as u16, rows_for(false) as u16, &[prog]) {
+                                            // PC-designed TUIs need ~56 cols
+                                            // to breathe; sh keeps the big
+                                            // touch-friendly glyphs.
+                                            scale = if prog == launch::BIN_SH { 5 } else { 3 };
+                                            term_cols = cols_for(scale);
+                                            match spawn_shell(term_cols as u16, rows_for(false, scale) as u16, &[prog]) {
                                                 Ok(c) => {
                                                     mode = Mode::Running(c);
                                                     kb_visible = false;
-                                                    term = Term::new(term_cols, rows_for(false));
+                                                    term = Term::new(term_cols, rows_for(false, scale));
                                                     parser = vte::Parser::new();
                                                     kb_dirty = true;
                                                     // wipe launcher pixels below the header —
@@ -627,7 +704,7 @@ fn main() {
                             if let Mode::Running(c) = &mode {
                                 if y >= lg.toolbar_h && y < kb_bot {
                                     kb_visible = !kb_visible;
-                                    let nr = rows_for(kb_visible);
+                                    let nr = rows_for(kb_visible, scale);
                                     term.resize_rows(nr);
                                     let ws = libc::winsize {
                                         ws_row: nr as u16,
