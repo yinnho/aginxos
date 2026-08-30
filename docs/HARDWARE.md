@@ -2308,3 +2308,33 @@ scrollback when shrinking (capped so the cursor row stays visible) and
 the child gets TIOCSWINSZ/SIGWINCH. Verified on device: toggle works
 both ways, typing after summon works, drag-scroll still works with the
 keyboard hidden (drag region now spans the full terminal area).
+
+## M12: codex official musl binary on device (2026-08-30)
+
+- Root cause of "no space": the rootfs image (build-rootfs.sh SIZE=512m)
+  is a 487 MB ext4 written onto sda19 (userdata, 114 GB) — the filesystem
+  simply never grew to the partition. Fix on device: cross-built a static
+  musl resize2fs (e2fsprogs 1.47.0, zig cc; had to force HAVE_LSEEK64 and
+  skip the uuid test binaries), online-resized / to 107 GB. NOTE: any
+  re-flash of userdata reverts to ~487 MB until resized again.
+- codex-cli 0.151.0 (codex-aarch64-unknown-linux-musl.tar.gz from the
+  openai/codex rust-v0.151.0 release, binary sha256 56f02601...6ce76,
+  223 MB static) installed at /var/bin/codex (the launcher's expected
+  path). `codex --version` runs clean on device. CODEX button now live.
+
+### M12 verified (2026-08-30): codex -> brain.aginx.net round-trip works
+
+- codex auth/config copied verbatim from the host ~/.codex (provider
+  aginxbrain, base_url https://brain.aginx.net, wire_api=responses,
+  model gpt-5.5, requires_openai_auth) into /var/home/.codex/ — key lives
+  on device only, never in the repo.
+- First `codex exec` hung in "Reconnecting... waiting for network":
+  root cause was the missing TLS trust store (no /etc/ssl on the phone —
+  codex reads system-native roots; our own agdl compiles webpki-roots in,
+  which is why agdl worked). Fix: Mozilla cacert.pem installed at
+  /etc/ssl/certs/ca-certificates.crt; build-rootfs.sh now bakes it into
+  the image and SIZE grew 512m -> 2g so a re-flash fits codex.
+- After the CA install: `codex exec --skip-git-repo-check` on device
+  answered "pong" (9k tokens) through brain.aginx.net. Codex TUI from the
+  launcher renders correctly in aterm. bubblewrap missing warning is
+  benign (codex falls back to its bundled bwrap).

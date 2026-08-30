@@ -17,7 +17,9 @@ RECIPE="${ROOT}/boot/rootfs"
 TARGET="${ROOT}/target/aarch64-unknown-linux-musl/release"
 TREE="${TREE:-/tmp/aginxos-rootfs}"
 IMG="${IMG:-${ROOT}/out/rootfs.img}"
-SIZE="${SIZE:-512m}"
+# 2 GB sparse-ish image: codex alone is 223 MB, and the fs is flashed onto
+# the 114 GB userdata partition (grow with resize2fs later if ever needed).
+SIZE="${SIZE:-2g}"
 
 test -x "${RAMDISK}/system/bin/adbd" || { echo "missing ${RAMDISK} — run boot/unpack-boot.sh first" >&2; exit 1; }
 test -x "${RECIPE}/busybox" || { echo "missing ${RECIPE}/busybox" >&2; exit 1; }
@@ -193,6 +195,17 @@ ln -sf ../bin/busybox "${TREE}/sbin/init"
 ln -sf ../bin/busybox "${TREE}/sbin/reboot"
 ln -sf ../bin/busybox "${TREE}/sbin/poweroff"
 ln -sf ../bin/busybox "${TREE}/sbin/ifconfig"
+
+# TLS trust store: codex (and anything using system-native cert roots)
+# fails with "waiting for network" without it. Cached under out/ so the
+# download happens once per host, not once per build.
+CACERT="${ROOT}/out/cacert.pem"
+if [ ! -s "${CACERT}" ]; then
+  curl -sL --max-time 120 -o "${CACERT}" https://curl.se/ca/cacert.pem
+fi
+mkdir -p "${TREE}/etc/ssl/certs"
+cp "${CACERT}" "${TREE}/etc/ssl/certs/ca-certificates.crt"
+ln -sf certs/ca-certificates.crt "${TREE}/etc/ssl/cert.pem"
 
 mkdir -p "${ROOT}/out"
 "${MKE2FS}" -t ext4 -b 4096 -F -d "${TREE}" "${IMG}" "${SIZE}"
