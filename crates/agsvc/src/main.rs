@@ -431,6 +431,17 @@ impl Svc {
     fn tick(&mut self, now: Instant) {
         let names: Vec<String> = self.runs.keys().cloned().collect();
         for name in names {
+            // Absent→Backoff pre-pass: try_spawn only acts on Backoff, so
+            // a due absent-recheck must flip the state first or it spins
+            // forever without ever reaching spawn_unit (found on
+            // first-boot provisioning, 2026-08-31: units stayed absent
+            // 25 min after /var/bin filled).
+            if let Some(r) = self.runs.get_mut(&name) {
+                if r.st == St::Absent && r.absent_check.map(|t| now >= t).unwrap_or(false) {
+                    r.set_st(St::Backoff);
+                    r.backoff_until = Some(now);
+                }
+            }
             enum Act {
                 Spawn,
                 Ready,
@@ -439,13 +450,6 @@ impl Svc {
             let act = {
                 let Some(r) = self.runs.get(&name) else { continue };
                 match r.st {
-                    St::Absent => {
-                        if r.absent_check.map(|t| now >= t).unwrap_or(false) {
-                            Some(Act::Spawn)
-                        } else {
-                            None
-                        }
-                    }
                     St::Backoff => {
                         if r.backoff_until.map(|t| now >= t).unwrap_or(false) {
                             Some(Act::Spawn)
