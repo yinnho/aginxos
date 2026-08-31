@@ -2758,8 +2758,12 @@ boots 6 manual + 7 script-only):
 QUIN_TDM_RX_0 (AMP PCM Gain 17 / Digital PCM Volume 817, Main AMP
 Enable) plays rc=0 with no XRUN on the fully baked chain (boot 8).
 Routing verified in-band: the tone appears in a simultaneous capture.
-Acoustic speaker audibility is NOT recorded — no human ear verified it
-this session; needs a user listen before 说 is called done.
+Acoustic audibility human-confirmed (user ear, 2026-08-31): the 880 Hz
+beep at vol 60 is clearly audible from the speaker. A 15 s Chinese
+TTS speech sample (48 kHz stereo, vol 80) then played rc=0 and was
+heard and understood (user ear, same day) — 说 is acoustically closed
+end to end: baked boot → MM1 → QUIN_TDM_RX_0 → dual CS35L41 →
+audible, intelligible speech.
 
 **The captured "mic audio" is a digital aDSP echo, not a microphone**:
 FFT of captures during playback shows 96-99 % of energy at the played
@@ -2845,3 +2849,69 @@ browser + aginx all ready, five /var/bin binaries live.
 Device session end state: RUNNING the fully baked image, carrier +
 browser + aginx ready, audio chain live, patched vendor_boot still
 flashed (standing M18+ experiment state).
+
+## M18 听 closed: 'DSP ADC' ctl boots the rt5514 DSP; mic live end to end (2026-08-31)
+
+Continuation of #69 on the baked image. The blocker diagnosis from the
+earlier session was rebuilt from source (redbull lineage-22.1) and two
+wrong turns corrected:
+
+1. **'DSP Booted' is not an rt5514 control at all.** The string exists
+   only in `/vendor_a/etc/mixer_paths_noextcodec_snd.xml` (and the crus
+   copy), inside the cs35l41 path
+   `cs35l41-load-protection-firmware-start` — it is the speaker amp's
+   firmware-load marker. No module binary contains it. The prior
+   "'DSP Booted' = 0 ⇒ mic DSP never booted" inference is void.
+2. rt5514-spi.c is only the AP-side **buffer reader** (copy_work_0..3;
+   ADC ring = RT5514_BUFFER_ADC_BASE/LIMIT/WP, validated against the
+   0x4fe00000 DRAM window). The DSP boot lives in rt5514.c and is
+   triggered by an ALSA ctl: **`DSP ADC`=1** → rt5514_dsp_enable →
+   i2c patch + `request_firmware(rt5514p_dsp_fw1..4.bin)` (files in
+   /vendor/firmware; v_p part, fw_addrs 0x4fe00000/0x4ff00000/
+   0x4fe98000/0x4fea8000) pushed over SPI. Observed on write:
+   `DSP Firmware Version: 2.1.20.0`.
+3. Before that ctl write, pcm58c ("ADC Capture" FE = rt5514-dsp-fe-dai3,
+   8 kHz mono) hw_params'd fine but READI EIO'd, and dmesg showed the
+   exact failure: `adc is streaming` → `rt5514_schedule_copy: Fail for
+   address read` (SPI buffer-descriptor reads outside 0x4fe00000). After
+   the write the FE opens and streams rc=0 — but its buffer stays
+   all-zeros even with the mic acoustically live (beep + speech tests).
+   The DSP ring buffer is NOT a usable mic source in this config; MM1 is.
+4. **DMIC mux enum is `{"DMIC1","DMIC2"}` — index 0 is the live handset
+   mic.** The earlier recipe (and mixer_paths XML string "DMIC1" ≠ 1)
+   had `Stereo1 DMIC Mux=1` = DMIC2 = dead. 3-window matrix with the
+   phone's own speaker as source: DSP-off+DMIC1 0.0 rms, DSP-off+DMIC2
+   0.0 rms, **DSP-on+DMIC1 rms 154 / 880 Hz mag 164.6** — the rt5514
+   DSP supplies the DMIC clock; codec-side routing alone powers nothing.
+5. **Acoustic (non-loop) proof**: with the phone completely silent, a
+   1 kHz tone from the Mac speaker across the room lands at rms 11.4 /
+   1 kHz mag 17.4 in MM1 — air-conducted, no loopback involvement. A
+   Mac TTS speech sample then produced a proper speech envelope
+   (rms 285.7, peak ±2934, 0.5 s windows 12→516→160→546→485…); the
+   recording was played back on the Mac for the user. The earlier
+   "user speaks" windows stayed silent — speech cues never coincided
+   with the capture window (one run also had the DSP left off after a
+   control window); the Mac-source tests made the verification
+   self-contained.
+
+**听 recipe now baked in audio-bringup** (replacing the wrong mux):
+`PRI_TDM_TX_0 Channels=1` (vendor handset-mic), `DSP ADC=1`, sleep,
+then `Stereo1 DMIC Mux=0` + `Sto1 ADC MIXL DMIC Switch=1` +
+`ADC1 Capture Volume=60 60` (vendor 1st-mic-only level) — order matters,
+the fw load rewrites codec regs so the mic route goes after it. Warm-up
+MM1 capture now mono to match the proven session shape.
+
+**Cold-boot verification, zero manual steps** (script pushed to
+/etc/init.d on device, image not yet re-baked): fresh boot shows
+`DSP Firmware Version: 2.1.20.0` at t+53 s from the script's own ctl
+write; boot.state full chain ok (wifi auto-joined Legrand AP → dhcp →
+internet → pkg → done ok); the FIRST capture session on that boot
+carried speech with no warm-up crutch beyond the baked one
+(rms 130.0, peak ±1088, speech bursts in every 0.5 s window). 听 is
+acoustically closed end to end: DMIC1 → rt5514(DSP) → PRI_TDM_TX_0 →
+q6 MM1 → /dev/snd/pcmC0D0c, 48 kHz mono.
+
+Device session end state: RUNNING baked image + the updated
+audio-bringup pushed over adb (device copy newer than the image — fold
+into the next re-bake), patched vendor_boot still flashed (standing
+experiment state).

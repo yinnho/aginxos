@@ -119,21 +119,27 @@ fi
 # --- mixer recipe (device-proven 2026-08-31, M18) ---------------------------
 # Playback 说: MM1 → QUIN_TDM_RX_0 → CS35L41 dual amp; levels from the
 # vendor speaker path (AMP PCM Gain 17, Digital PCM Volume 817).
-# Capture 听: MM1 ← PRI_TDM_TX_0 with the rt5514 handset-mic codec route
-# (Stereo1 DMIC Mux=DMIC1, MIXL DMIC switch, ADC1 vol 23). NOTE the loop
-# route "PRI_TDM_TX_0 Audio Mixer MultiMedia1": without vendor ACDB
-# calibration the aDSP tears down codec-TX capture sessions (async READ_DONE
+# Capture 听: MM1 ← PRI_TDM_TX_0 with the rt5514 handset-mic codec route.
+# The rt5514 DSP must be RUNNING for the DMICs to get their clock — write
+# "DSP ADC"=1 boots it (request_firmware rt5514p_dsp_fw1..4.bin from
+# /vendor/firmware, pushed over SPI by snd-soc-rt5514-spi; observed
+# "DSP Firmware Version: 2.1.20.0"). Without it every capture is digital
+# silence with the mic LDO on (2026-08-31 DSP-off windows were exactly
+# 0.0 rms). The fw load rewrites codec regs, so the mic route goes AFTER
+# it. Mux enum is {"DMIC1","DMIC2"} — value 0 is DMIC1, the live handset
+# mic (value 1 gave 0.0 rms; XML string "DMIC1" ≠ index 1).
+# NOTE the loop route "PRI_TDM_TX_0 Audio Mixer MultiMedia1": without vendor
+# ACDB calibration the aDSP tears down codec-TX capture sessions (async READ_DONE
 # size 0 → EPIPE/EIO on READI); with the loop attached the TX COPP opens in
-# loopback mode and sessions run (data = mic + whatever MM1 plays back).
-# Keep it on until 听 moves to a calibrated path (SLPI/ACDB — see
-# HARDWARE.md M18 notes).
+# loopback mode and sessions run. Playback through MM1 while capturing adds the
+# played audio to the capture — the agent should not play and listen at once.
 # Boot 6 lesson (2026-08-31): the two Channels ctls are load-bearing. They
 # reset to 0 on a fresh card and a 0-channel backend gives healthy sessions
 # that carry all zeros — the loop's tell is an 880 Hz line at FFT peak
 # 6.4e6 with them set, 0.0 rms without. The routing mixer ctls read back
 # "1,0" after writing "1 1" — q6's put only consumes value[0], expected.
 mix() { /bin/snd-mixer "$1" $2 2>/dev/null | tail -1; }
-mix "PRI_TDM_TX_0 Channels" 2
+mix "PRI_TDM_TX_0 Channels" 1
 mix "QUIN_TDM_RX_0 Channels" 2
 mix "QUIN_TDM_RX_0 Audio Mixer MultiMedia1" "1 1"
 mix "Main AMP Enable Switch" 1
@@ -144,9 +150,13 @@ mix "Digital PCM Volume" 817
 mix "R Digital PCM Volume" 817
 mix "MultiMedia1 Mixer PRI_TDM_TX_0" "1 1"
 mix "PRI_TDM_TX_0 Audio Mixer MultiMedia1" "1 1"
-mix "Stereo1 DMIC Mux" 1
+# Boot the rt5514 DSP first (fw load, a few seconds), then the mic route —
+# see the comment block above for why the order matters.
+mix "DSP ADC" 1
+sleep 4
+mix "Stereo1 DMIC Mux" 0
 mix "Sto1 ADC MIXL DMIC Switch" 1
-mix "ADC1 Capture Volume" "23 23"
+mix "ADC1 Capture Volume" "60 60"
 echo "mixer done"
 
 # --- aDSP warm-up pass (boot 7, 2026-08-31) ---------------------------------
@@ -157,7 +167,7 @@ echo "mixer done"
 # cold cycle here at volume 0 so the agent's first real session is hot.
 dd if=/dev/zero of=/tmp/.awarm.pcm bs=1000 count=192 2>/dev/null
 /bin/snd-play /dev/snd/pcmC0D0p /tmp/.awarm.pcm 48000 2 0 >/dev/null 2>&1
-/bin/snd-cap /dev/snd/pcmC0D0c 1 /dev/null 48000 2 >/dev/null 2>&1
+/bin/snd-cap /dev/snd/pcmC0D0c 1 /dev/null 48000 1 >/dev/null 2>&1
 rm -f /tmp/.awarm.pcm
 echo "warm-up done"
 
