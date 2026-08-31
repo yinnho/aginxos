@@ -2707,3 +2707,89 @@ the iPhone hotspot (ssid 666, psk device-only). Note for the next
 build: the wifi-join/nlscan/agsvc fixes are in the source tree; the
 flashed image predates them (current /bin binaries are adb-pushed
 replacements on the rw ext4).
+
+## M18 audio bring-up: 说 proven baked, 听 blocked at the sensor-DSP boundary (2026-08-31)
+
+Task #69. Card: sm7250-noextcodec-snd-card (card 0, 53 pcm + 8 compr
+devices). All work via freestanding ioctl tools (snd-cap/snd-play/
+snd-mixer + new i2c-reg), no alsa-lib, musl-static.
+
+**uapi ioctl numbers were the first "silent mic"** — snd-pcm-uapi.h
+gave PREPARE HWSYNC's slot (0x22→kernel treats it as HWSYNC on a SETUP
+stream → -EBADFD), READI/WRITEI compat-range nrs and a wrong READI
+direction. Numbers now match uapi sound/asound.h exactly, frozen with
+_Static_asserts on both struct sizes and ioctl encodings. Two more
+stream-keeping fixes the hard way: read the period size the kernel
+wrote back into hw_params (a fixed 1024 against the q6 FE's 2000-frame
+period overruns in seconds) and stop_threshold = 1<<62 (rate*4
+self-stops capture on overrun). Hostless FEs need geometry taken from
+HW_REFINE's own bounds (they cap period ≤1024 / buffer ≤4096).
+
+**Module order proven at symbol level, baked in audio-bringup**: q6_dlkm
+EXPORTS msm_aud_evt_* and digital_cdc_rsc_mgr_hw_vote_* → swr_ctrl_dlkm
+loads after q6 (it was failing in every baked boot, dragging the four
+macro modules with it). Slimbus chain slimbus → of_slimbus (imports
+slim_register_board_info) → msm_sps → slim_msm_ngd (imports
+of_register_slim_devices) → bluetooth_power. Boots 7/8: `load done,
+0 failed`.
+
+**Boot 6 "audio fail no-card" was not audio**: the card and all 53 pcm
+devices sat registered in /sys/class/sound while /dev/snd held one
+stale `timer` node. This kernel has NO devtmpfs (`mount -t devtmpfs` →
+ENODEV — rcS's mount line is dead code, same family as the missing
+debugfs). Android gets nodes from ueventd; we get them from `mdev -s`
+after the modules load — same trick touch-bringup already used. Baked
+into the card-check loop; boots 7/8 report `audio ok`.
+
+**Two aDSP behaviors that fake a dead mic path** (both proven twice,
+boots 6 manual + 7 script-only):
+
+1. Backend `Channels` ctls reset to 0 on a fresh card. Sessions open
+   healthy, READI returns data — all zeros. With
+   `PRI_TDM_TX_0/QUIN_TDM_RX_0 Channels` = 2 the same play+capture
+   carries the loop (880 Hz FFT peak 6.4e6 vs 0.0 rms).
+2. First session cycle after the mixer writes is a cold cycle: run 1
+   all zeros, identical run 2 carries the loop. The aDSP wires the TX
+   loopback graph one session late. audio-bringup now burns it with a
+   vol-0 1 s play + 1 s capture; boot 8's FIRST real session after
+   boot carried the tone (rms 174.7, 880 Hz peak 6.38e6).
+
+**说 (playback)**: 3 s 48 kHz stereo 880 Hz tone through MM1 →
+QUIN_TDM_RX_0 (AMP PCM Gain 17 / Digital PCM Volume 817, Main AMP
+Enable) plays rc=0 with no XRUN on the fully baked chain (boot 8).
+Routing verified in-band: the tone appears in a simultaneous capture.
+Acoustic speaker audibility is NOT recorded — no human ear verified it
+this session; needs a user listen before 说 is called done.
+
+**The captured "mic audio" is a digital aDSP echo, not a microphone**:
+FFT of captures during playback shows 96-99 % of energy at the played
+880 Hz ± sidebands plus 1760/2640 harmonics, zero broadband floor;
+captured amplitude scales linearly with playback volume (~7 %, peak
+685 @ vol 60, 59 @ vol 5); after playback stops the capture is
+bit-silence. The loop mixer ctl 'PRI_TDM_TX_0 Audio Mixer MultiMedia1'
+is also REQUIRED for session survival without vendor ACDB: with it off,
+READI fails EIO in ~10 s and kmsg shows `event_handler: reclaimed all
+bufs` (aDSP async teardown of the codec-TX COPP). Route mixer ctls read
+back "1,0" after writing "1 1" — q6's put only consumes value[0].
+
+**听 (capture) root cause sits past the codec, at the sensor-DSP/SLPI
+boundary**. The rt5514 codec is alive and configured — new i2c-reg tool
+(bus 0 addr 0x57, regs accessed as `reg | 0x18000000`, 32-bit BE):
+VENDOR_ID2 0x10ec5514, DOWNFILTER AD_AD_MUTE bits clear, DIG_SOURCE
+AD0+AD1 DMIC select, CLK_CTRL1 AD0/AD1 enables + DMIC clock, mic LDO
+DAPM event fires per capture — but its driver forces
+DSP_FUNC=WOV_I2S_SENSOR (rt5514 hw_params), i.e. the I2S output carries
+the sensor DSP's stream, not raw ADC. 'DSP Booted' (rt5514-qmi) was 0;
+boot 6 brought the QMI handshake ALIVE: `remote rtk_spi server online,
+connecting` + `Send request success` — but the SPI-side DSP firmware
+never streams. Alternatives without the loop all fail on-device:
+MM1/MM2 no-loop EIO, hostless pcm53c ADSP_EFAILED, LSM pcm56c/57c need
+the LSM protocol (EIO), ADC pcm58c is 8 kHz mono only. Next lever:
+boot the SLPI-side sensor stack (rtk_spi firmware path) or obtain ACDB
+calibration.
+
+Device session end state: RUNNING AginxOS with the baked audio chain
+(boots 7/8 `audio ok`, warm-up in place); patched vendor_boot image
+still flashed (M18 experiment state). wifi join rc=2 both boots —
+hotspot "666" absent (iPhone auto-off), expected. i2c-reg/snd-mixer
+added to build-rootfs.sh for the next re-bake (#72).
