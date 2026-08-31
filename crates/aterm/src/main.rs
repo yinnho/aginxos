@@ -13,17 +13,26 @@
 // blanks too, holding the key ~1.2 s (or the launcher's POWER OFF / RESTART
 // buttons) runs `reboot2 poweroff|reboot`.
 //
+// M17 input split: the keyboard hit tests return typed InputEvents
+// (KeyEvent vs TextInputEvent, input.rs) and EVERY write to the pty goes
+// through inject() — the same entry point M18's voice input will call
+// with recognized text. ATERM_INJECT=1 watches /run/aterm.inject: any
+// process drops text there, it types into the session verbatim (that's
+// the voice path, testable without audio).
+//
 // Host verification: `aterm --ppm out.ppm` renders the launcher into a P6
 // PPM without touching DRM (same pattern as bootcard --ppm).
 
 mod drm;
 mod font;
+mod input;
 mod kb;
 mod launch;
 mod term;
 
 use drm::Drm;
-use kb::{Kb, KeyGeom, KeyReader, Touch, TouchReader, KEY_POWER};
+use input::InputEvent;
+use kb::{Act, Kb, KeyDef, KeyGeom, KeyReader, Touch, TouchReader, KEY_POWER};
 use std::io::Write as _;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::time::{Duration, Instant};
@@ -215,6 +224,27 @@ fn spawn_shell(cols: u16, rows: u16, argv: &[&str]) -> Result<Child, String> {
             if slave > 2 {
                 libc::close(slave);
             }
+            // SIG_IGN survives exec, and aterm's own ancestry carries one:
+            // rcS's busybox sh ignores HUP+INT (observed SigIgn 0x1006 on
+            // device, 2026-08-31), adbd ignores INT for adb-run instances.
+            // Without this reset every terminal job is immune to ^C — the
+            // bytes reach the ldisc, kill_pgrp fires, the disposition
+            // discards the signal. Rust std's ignored SIGPIPE is also
+            // inherited; shells want the default back.
+            for sig in [
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                libc::SIGTSTP,
+                libc::SIGTTIN,
+                libc::SIGTTOU,
+                libc::SIGPIPE,
+            ] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            let empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
             libc::setenv(
                 b"TERM\0".as_ptr() as *const _,
                 b"xterm-256color\0".as_ptr() as *const _,
@@ -249,6 +279,38 @@ fn child_exited(pid: libc::pid_t) -> bool {
     let mut status: libc::c_int = 0;
     let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
     r == pid
+}
+
+/// The one input path: encode a KeyEvent/TextInputEvent for the child's
+/// current terminal mode and write it to the pty, pulling the echo into
+/// the same render frame (the keystroke fast-path from M11). The on-screen
+/// keyboard, hold-repeat and — from M18 — voice ASR all come through
+/// here; nothing else writes typed input to the pty.
+fn inject(mode: &mut Mode, term: &mut Term, parser: &mut vte::Parser, ev: &InputEvent) {
+    let bytes = input::encode(ev, term.app_cursor);
+    if std::env::var("ATERM_DEBUG").is_ok() {
+        eprintln!("aterm: inject {:?} appcur={} -> {} bytes {:?}", ev, term.app_cursor, bytes.len(), String::from_utf8_lossy(&bytes));
+    }
+    if bytes.is_empty() {
+        return; // modifier toggle — consumed by the keyboard, no output
+    }
+    if let Mode::Running(c) = mode {
+        let _ = c.master.write_all(&bytes);
+        let mut pfd = libc::pollfd {
+            fd: c.master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 15) } > 0 {
+            let mut buf2 = [0u8; 8192];
+            if let Ok(n) = std::io::Read::read(&mut c.master, &mut buf2) {
+                for &b in &buf2[..n] {
+                    parser.advance(term, b);
+                }
+                term.jump_live();
+            }
+        }
+    }
 }
 
 // ---------------- modes ----------------
@@ -369,14 +431,15 @@ impl<'a> Render<'a> {
         let m = kg.x_off;
         fill_rect(pix, self.pitch, w, h, m as i32, kg.extra_y as i32, (w - 2 * m) as i32, (h - kg.extra_y) as i32, 0x00050A08);
         fill_rect(pix, self.pitch, w, h, m as i32, kg.extra_y as i32 - 2, (w - 2 * m) as i32, 2, DIM);
-        // extra-keys row (Termux): ESC TAB CTL < v ^ >
-        let ekw = (w - 2 * m) / kb::EXTRA.len();
-        for (i, name) in kb::EXTRA.iter().enumerate() {
+        // extra-keys row (Termux): ESC TAB CTL < v ^ > — labels from the
+        // key table, arrows drawn bigger than text labels
+        let ekw = (w - 2 * m) / kb::EXTRA_KEYS.len();
+        for (i, kd) in kb::EXTRA_KEYS.iter().enumerate() {
             let x0 = m + i * ekw + 3;
             let y0 = kg.extra_y + 2;
-            let active = i == 2 && kb.ctrl_on();
-            let ks = if i >= 3 { 5 } else { 3 }; // arrows bigger than text
-            self.keycap(pix, x0, y0, ekw - 6, kg.extra_h - 4, name, ks, active);
+            let active = self.mod_active(kd, kb);
+            let ks = if i >= 3 { 5 } else { 3 };
+            self.keycap(pix, x0, y0, ekw - 6, kg.extra_h - 4, kd.label, ks, active);
         }
         for (r, row) in kb.page_rows().iter().enumerate() {
             for (col, ch) in row.chars().enumerate() {
@@ -386,11 +449,21 @@ impl<'a> Render<'a> {
             }
         }
         let kw = (w - 2 * m) / 5;
-        for (i, name) in Kb::specials().iter().enumerate() {
+        for (i, kd) in kb::SPECIALS.iter().enumerate() {
             let x0 = m + i * kw + 4;
             let y0 = kg.panel_y + 4 * kg.cell_h + 4;
-            let active = (i == 0 && kb.shift_on()) || (i == 1 && kb.sym_on());
-            self.keycap(pix, x0, y0, kw - 8, kg.cell_h - 8, name, 4, active);
+            let active = self.mod_active(kd, kb);
+            self.keycap(pix, x0, y0, kw - 8, kg.cell_h - 8, kd.label, 4, active);
+        }
+    }
+
+    /// Modifier keycaps light up while their one-shot is armed.
+    fn mod_active(&self, kd: &KeyDef, kb: &Kb) -> bool {
+        match kd.act {
+            Act::Ctrl => kb.ctrl_on(),
+            Act::Shift => kb.shift_on(),
+            Act::Sym => kb.sym_on(),
+            _ => false,
         }
     }
 
@@ -605,9 +678,15 @@ fn main() {
     let mut last_blink = Instant::now();
     let mut blink_on = false;
     let mut kb_dirty = true;
-    // Hold-to-repeat (DEL / arrows), Termux-style: next fire deadline.
-    let mut held: Option<(Vec<u8>, Instant)> = None;
+    // Hold-to-repeat (DEL / arrows), Termux-style: the event + next fire
+    // deadline. Repeats go through inject() like every other input.
+    let mut held: Option<(InputEvent, Instant)> = None;
     let mut down_y = 0usize; // where the current touch started
+    // M17 debug/voice hook: ATERM_INJECT=1 watches /run/aterm.inject —
+    // any process can drop text there and it types into the running
+    // session as TextInputEvent, verbatim (\r included if written). This
+    // is the exact path M18's ASR callback takes, testable without audio.
+    let inject_file = std::env::var("ATERM_INJECT").ok().as_deref() == Some("1");
 
     loop {
         // drain pty output
@@ -685,6 +764,9 @@ fn main() {
                         // keystroke — the main source of "typing lag".
                         Touch::Down(x, y) => {
                             down_y = y;
+                            if std::env::var("ATERM_DEBUG").is_ok() {
+                                eprintln!("aterm: touch down {x},{y} kbvis={kb_visible} mode={}", matches!(mode, Mode::Running(_)));
+                            }
                             if y < lg.toolbar_h {
                                 // BACK fires on press, same as keys
                                 if lg.toolbar_hit(x, y, matches!(mode, Mode::Running(_)))
@@ -747,36 +829,15 @@ fn main() {
                                 }
                             }
                             if kb_visible && y >= kg.extra_y {
-                                let bytes = if y >= kg.panel_y {
+                                let ev = if y >= kg.panel_y {
                                     kb.key_at(&kg, x, y)
                                 } else {
                                     kb.extra_key_at(&kg, x, y)
                                 };
-                                if let Some(bytes) = bytes {
-                                    if let Mode::Running(c) = &mut mode {
-                                        let _ = c.master.write_all(&bytes);
-                                        if !bytes.is_empty() {
-                                            // fast path: pull the echo into
-                                            // the SAME frame (one present
-                                            // per keystroke, not two)
-                                            let mut pfd = libc::pollfd {
-                                                fd: c.master.as_raw_fd(),
-                                                events: libc::POLLIN,
-                                                revents: 0,
-                                            };
-                                            if unsafe { libc::poll(&mut pfd, 1, 15) } > 0 {
-                                                let mut buf2 = [0u8; 8192];
-                                                if let Ok(n) = std::io::Read::read(&mut c.master, &mut buf2) {
-                                                    for &b in &buf2[..n] {
-                                                        parser.advance(&mut term, b);
-                                                    }
-                                                    term.jump_live();
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if kb::repeatable(&bytes) {
-                                        held = Some((bytes, Instant::now() + Duration::from_millis(400)));
+                                if let Some(ev) = ev {
+                                    inject(&mut mode, &mut term, &mut parser, &ev);
+                                    if input::repeatable(&ev) {
+                                        held = Some((ev, Instant::now() + Duration::from_millis(400)));
                                     }
                                     kb_dirty = true; // modifier highlight may flip
                                     redraw = true;
@@ -788,6 +849,9 @@ fn main() {
                         // dismisses the keyboard; rows resize + SIGWINCH.
                         Touch::Tap(_x, y) => {
                             held = None;
+                            if std::env::var("ATERM_DEBUG").is_ok() {
+                                eprintln!("aterm: touch tap y={y} kbvis={kb_visible}");
+                            }
                             let kb_bot = if kb_visible { kg.extra_y } else { h };
                             if let Mode::Running(c) = &mode {
                                 if y >= lg.toolbar_h && y < kb_bot {
@@ -884,13 +948,23 @@ fn main() {
         }
 
         // hold-to-repeat for DEL / arrows
-        if let Some((b, next)) = &mut held {
+        if let Some((ev, next)) = &mut held {
             if Instant::now() >= *next {
-                if let Mode::Running(c) = &mut mode {
-                    let _ = c.master.write_all(b);
-                }
+                inject(&mut mode, &mut term, &mut parser, ev);
                 *next = Instant::now() + Duration::from_millis(60);
                 redraw = true;
+            }
+        }
+
+        // voice-path hook: file content types into the session, consumed
+        if inject_file {
+            if let Ok(s) = std::fs::read_to_string("/run/aterm.inject") {
+                let _ = std::fs::remove_file("/run/aterm.inject");
+                if !s.is_empty() {
+                    last_input = Instant::now();
+                    inject(&mut mode, &mut term, &mut parser, &InputEvent::Text(s));
+                    redraw = true;
+                }
             }
         }
 

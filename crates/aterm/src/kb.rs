@@ -4,15 +4,23 @@
 // Drag-scroll of scrollback is armed only by touches starting ABOVE the
 // keyboard, so dragging across keys no longer scrolls.
 //
+// M17: the keyboard is a key table (inputd shape) — every keycap is a
+// KeyDef (label + Act), and hit tests return typed input::InputEvents,
+// never raw pty bytes. Text keys (letters, symbols, space) come back as
+// TextInputEvent, control keys as KeyEvent; encoding to bytes happens
+// once, in the terminal layer (input::encode). Voice (M18) injects
+// TextInputEvent through the same path in main.rs.
+//
 // Extra-keys row (borrowed from Termux's ExtraKeysView): a slim row above
 // the letter rows with ESC TAB CTL and arrows; DEL + arrows repeat while
 // held (Termux PRIMARY_REPETITIVE_KEYS). Specials row: SHF (one-shot
 // shift) SYM (one-shot symbol page) SPC DEL ENT. CTL is a one-shot
-// modifier: letter -> control byte (CTL c = 0x03).
+// modifier: letter -> KeyEvent::Ctrl (CTL c = 0x03 when encoded).
 //
 // Layout math (1080x2340): 10 keys/row x 4 rows, 28 px side margins,
 // 24 px bottom margin; keys scale to fit.
 
+use crate::input::{Dir, InputEvent, KeyEvent};
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
@@ -31,18 +39,49 @@ const SYM_ROWS: [&str; 4] = [
     "ZXCVBNM.,-",
 ];
 const SPEC_Y_ROW: usize = 4; // fifth row: SHF SYM SPC DEL ENT
+
+/// What a keycap does. The letter pages stay char grids (ROWS/SYM_ROWS)
+/// because their behavior is combinatorial (page x shift x ctrl), so they
+/// bypass the table; the fixed rows spell their actions out here. The
+/// vocabulary grows with the table — add a KeyDef, not a match arm.
+pub enum Act {
+    /// Fixed key: emits this event every tap.
+    Ev(InputEvent),
+    /// Space — a Text event, composed at hit time (" ".into() is not const).
+    Space,
+    /// One-shot modifiers — toggle state, compose nothing themselves.
+    Shift,
+    Sym,
+    Ctrl,
+}
+
+pub struct KeyDef {
+    pub label: &'static str,
+    pub act: Act,
+}
+
 // Extra-keys row (above the letter rows), Termux default order:
 // ESC TAB CTL LEFT DOWN UP RIGHT. Arrows are font glyphs 0x10-0x13.
-pub const EXTRA: [&str; 7] = ["ESC", "TAB", "CTL", "\u{10}", "\u{11}", "\u{12}", "\u{13}"];
+pub const EXTRA_KEYS: [KeyDef; 7] = [
+    KeyDef { label: "ESC", act: Act::Ev(InputEvent::Key(KeyEvent::Esc)) },
+    KeyDef { label: "TAB", act: Act::Ev(InputEvent::Key(KeyEvent::Tab)) },
+    KeyDef { label: "CTL", act: Act::Ctrl },
+    KeyDef { label: "\u{10}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Left))) },
+    KeyDef { label: "\u{11}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Down))) },
+    KeyDef { label: "\u{12}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Up))) },
+    KeyDef { label: "\u{13}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Right))) },
+];
+
+pub const SPECIALS: [KeyDef; 5] = [
+    KeyDef { label: "SHF", act: Act::Shift },
+    KeyDef { label: "SYM", act: Act::Sym },
+    KeyDef { label: "SPC", act: Act::Space },
+    KeyDef { label: "DEL", act: Act::Ev(InputEvent::Key(KeyEvent::Backspace)) },
+    KeyDef { label: "ENT", act: Act::Ev(InputEvent::Key(KeyEvent::Enter)) },
+];
+
 pub const KB_M: usize = 28; // side margin (px)
 pub const KB_B: usize = 24; // bottom margin (px)
-
-/// DEL and the arrows repeat while held (Termux repetitive keys).
-pub fn repeatable(bytes: &[u8]) -> bool {
-    bytes == [0x7f]
-        || (bytes.len() == 3 && bytes[0] == 0x1b && bytes[1] == b'['
-            && matches!(bytes[2], b'A'..=b'D'))
-}
 
 pub struct Kb {
     shift: bool,
@@ -102,23 +141,19 @@ impl Kb {
 
 
     /// Extra-keys row hit test. y in [extra_y, panel_y).
-    pub fn extra_key_at(&mut self, g: &KeyGeom, x: usize, y: usize) -> Option<Vec<u8>> {
+    pub fn extra_key_at(&mut self, g: &KeyGeom, x: usize, y: usize) -> Option<InputEvent> {
         if y < g.extra_y || y >= g.panel_y || x < g.x_off {
             return None;
         }
         let kw = g.span / 7;
         let k = ((x - g.x_off) / kw).min(6);
-        match k {
-            0 => Some(vec![0x1b]),
-            1 => Some(b"\t".to_vec()),
-            2 => {
+        match &EXTRA_KEYS[k].act {
+            Act::Ctrl => {
                 self.ctrl = !self.ctrl;
-                Some(vec![])
+                Some(InputEvent::Text(String::new())) // consumed, no output
             }
-            3 => Some(b"\x1b[D".to_vec()),
-            4 => Some(b"\x1b[B".to_vec()),
-            5 => Some(b"\x1b[A".to_vec()),
-            _ => Some(b"\x1b[C".to_vec()),
+            Act::Ev(ev) => Some(ev.clone()),
+            _ => None,
         }
     }
 
@@ -126,9 +161,11 @@ impl Kb {
         if self.sym { &SYM_ROWS } else { &ROWS }
     }
 
-    /// Key at panel coords -> bytes to write to the pty. Consumes one-shot
-    /// shift/sym. Returns Some(vec![]) for the SHF/SYM toggles themselves.
-    pub fn key_at(&mut self, g: &KeyGeom, x: usize, y: usize) -> Option<Vec<u8>> {
+    /// Key at panel coords -> input event. Text keys (page/shift/ctrl
+    /// compositing) come back as TextInputEvent; specials as KeyEvent.
+    /// Consumes one-shot shift/sym. Modifier toggles return empty Text
+    /// (consumed, no output).
+    pub fn key_at(&mut self, g: &KeyGeom, x: usize, y: usize) -> Option<InputEvent> {
         if y < g.panel_y || x < g.x_off {
             return None;
         }
@@ -176,26 +213,24 @@ impl Kb {
             let ctrl = self.ctrl;
             self.ctrl = false;
             if ctrl && ch.is_ascii_alphabetic() {
-                return Some(vec![(ch.to_ascii_lowercase() as u8) & 0x1f]);
+                return Some(InputEvent::Key(KeyEvent::Ctrl(ch)));
             }
-            let mut v = vec![0u8; 4];
-            let s3 = ch.encode_utf8(&mut v);
-            Some(s3.as_bytes().to_vec())
+            Some(InputEvent::Text(ch.to_string()))
         } else if row == SPEC_Y_ROW {
             let kw = g.span / 5;
             let k = (x / kw).min(4);
-            match k {
-                0 => {
+            match &SPECIALS[k].act {
+                Act::Shift => {
                     self.shift = !self.shift;
-                    Some(vec![])
+                    Some(InputEvent::Text(String::new()))
                 }
-                1 => {
+                Act::Sym => {
                     self.sym = !self.sym;
-                    Some(vec![])
+                    Some(InputEvent::Text(String::new()))
                 }
-                2 => Some(b" ".to_vec()),
-                3 => Some(vec![0x7f]),
-                _ => Some(b"\r".to_vec()),
+                Act::Ev(ev) => Some(ev.clone()),
+                Act::Space => Some(InputEvent::Text(" ".into())),
+                _ => None,
             }
         } else {
             None
@@ -212,10 +247,6 @@ impl Kb {
 
     pub fn ctrl_on(&self) -> bool {
         self.ctrl
-    }
-
-    pub fn specials() -> [&'static str; 5] {
-        ["SHF", "SYM", "SPC", "DEL", "ENT"]
     }
 }
 
@@ -254,6 +285,17 @@ pub struct TouchReader {
     raw_y: i32,
     down: bool,
     pending_down: bool,
+    /// The y of THIS touch hasn't been seen yet (tracking-id came first):
+    /// the first ABS_MT_POSITION_Y anchors start_y, instead of inheriting
+    /// the previous touch's position and instantly reading as a 30 px
+    /// "drag". Keeps both event orders working — firmware that reports
+    /// positions before tracking-id and synthetic frames after it.
+    fresh: bool,
+    /// A POSITION_Y was already read in the current frame (before its
+    /// tracking-id — real firmware order). Lets the tracking-id handler
+    /// tell "position seen" (anchor now) from "position pending" (anchor
+    /// at the next y, i.e. synthetic-frame order).
+    y_in_frame: bool,
     start_y: i32,
     last_y: i32,
     dragged: bool,
@@ -274,6 +316,8 @@ impl TouchReader {
             raw_y: 0,
             down: false,
             pending_down: false,
+            fresh: false,
+            y_in_frame: false,
             start_y: 0,
             last_y: 0,
             dragged: false,
@@ -303,6 +347,9 @@ impl TouchReader {
                 }
                 (EV_ABS, ABS_MT_TRACKING_ID) => {
                     if ev.value == -1 {
+                        if std::env::var("ATERM_DEBUG").is_ok() {
+                            eprintln!("aterm: lift: down={} dragged={}", self.down, self.dragged);
+                        }
                         // finger up — ALWAYS reported (hold-repeat cleanup
                         // depends on it, even when the gesture was a drag)
                         self.pending_down = false;
@@ -322,14 +369,31 @@ impl TouchReader {
                         self.down = true;
                         self.dragged = false;
                         self.pending_down = true;
-                        self.start_y = self.raw_y;
-                        self.last_y = self.raw_y;
+                        // Anchor start_y for the drag threshold. Real
+                        // firmware reports position before tracking-id, so
+                        // raw_y is this touch's; synthetic frames put
+                        // tracking-id first and raw_y is the PREVIOUS
+                        // touch's position — anchoring from it would read
+                        // as an instant 30 px drag and kill the tap.
+                        if self.y_in_frame {
+                            self.start_y = self.raw_y;
+                            self.last_y = self.raw_y;
+                            self.fresh = false;
+                        } else {
+                            self.fresh = true; // first y anchors
+                        }
                     }
                 }
                 (EV_ABS, ABS_MT_POSITION_X) => self.raw_x = ev.value,
                 (EV_ABS, ABS_MT_POSITION_Y) => {
                     self.raw_y = ev.value;
-                    if self.down {
+                    self.y_in_frame = true;
+                    if self.fresh {
+                        // first y of this touch: anchor, no drag judgment
+                        self.fresh = false;
+                        self.start_y = ev.value;
+                        self.last_y = ev.value;
+                    } else if self.down {
                         let dy = self.raw_y - self.last_y;
                         if (self.raw_y - self.start_y).abs() > 30 {
                             self.dragged = true;
@@ -351,6 +415,7 @@ impl TouchReader {
                             y.min(self.screen_h as usize - 1),
                         );
                     }
+                    self.y_in_frame = false; // frame boundary
                 }
                 _ => {}
             }

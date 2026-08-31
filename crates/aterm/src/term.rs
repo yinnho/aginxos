@@ -36,6 +36,9 @@ pub struct Term {
     pub cursor_y: usize,
     saved: (usize, usize),
     pub cursor_visible: bool,
+    /// DECCKM (?1): child wants SS3 arrows (ESC O A), not CSI (ESC [ A).
+    /// input::encode reads this — arrow encoding is the terminal's call.
+    pub app_cursor: bool,
     style: Style,
     scroll_top: usize,
     scroll_bot: usize, // exclusive
@@ -59,6 +62,7 @@ impl Term {
             cursor_y: 0,
             saved: (0, 0),
             cursor_visible: true,
+            app_cursor: false,
             style: Style::Normal,
             scroll_top: 0,
             scroll_bot: rows,
@@ -234,7 +238,7 @@ impl Term {
         }
     }
 
-    fn csi(&mut self, params: &vte::Params, action: char) {
+    fn csi(&mut self, params: &vte::Params, intermediates: &[u8], action: char) {
         let old_y = self.cursor_y;
         let p = |i: usize, d: usize| -> usize {
             params
@@ -391,11 +395,17 @@ impl Term {
                 }
             }
             'h' | 'l' => {
-                // Private modes we care about: ?25 cursor visibility.
-                for sub in params.iter() {
-                    for &v in sub {
-                        if v == 25 {
-                            self.cursor_visible = action == 'h';
+                // Private modes (vte collects the '?' into intermediates):
+                // ?1 application cursor keys, ?25 cursor visibility.
+                // Non-private SM/RM carries nothing we track.
+                if intermediates == [b'?'] {
+                    for sub in params.iter() {
+                        for &v in sub {
+                            match v {
+                                1 => self.app_cursor = action == 'h',
+                                25 => self.cursor_visible = action == 'h',
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -454,11 +464,11 @@ impl vte::Perform for Term {
     fn csi_dispatch(
         &mut self,
         params: &vte::Params,
-        _intermediates: &[u8],
+        intermediates: &[u8],
         _ignore: bool,
         action: char,
     ) {
-        self.csi(params, action);
+        self.csi(params, intermediates, action);
     }
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, byte: u8) {
@@ -489,6 +499,7 @@ impl vte::Perform for Term {
                 self.style = Style::Normal;
                 self.scroll_top = 0;
                 self.scroll_bot = self.rows;
+                self.app_cursor = false;
             }
             _ => {}
         }
