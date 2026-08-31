@@ -117,7 +117,30 @@ Convention: treat Linux as the authority for anything that packs a bootable phon
 - **Do not commit vendor firmware blobs** or redistribute proprietary radio/Wi‑Fi images in-tree.
 - Scripts may document **how to extract** firmware from a factory/vendor image the developer already has; extracted files stay local / gitignored.
 
+## 8. Positioning: an OS for agents (refines §1 purpose, §4 role, §5 UI scope; 2026-08-31)
+
+**AginxOS is built for agents, not for humans.** The system's primary user is an
+agent; humans are operators and debuggers. Every feature is judged first by "how
+does an agent use this", then by "how does a human debug it".
+
+- **arm64 only, always.** One architecture, one target: `aarch64` static musl.
+  No x86_64, no second build matrix. Current practice, now locked as principle.
+- **Low power is a first-class constraint, not a feature.** Agent nodes are
+  7×24 residents that sleep and wake on events; the power budget defines the
+  product form. Battery node = phone, powered node = server — same OS, different
+  node shapes.
+- **Hardware is agent perception.** Audio (M18), camera (M19) are the agent's
+  input channels, not human multimedia.
+- **Humans reach the system over the network, through channels** — e.g. iLink
+  (the WeChat channel adapter in aginx-carrier): human → own phone → channel →
+  relay → aginx gateway → ACP → agent on the AginxOS node. Human access is one
+  more inbound channel over the protocol surface, never a local UI requirement.
+- **The local screen/keyboard is a debug/rescue console.** aterm stays (agent
+  applications like codex/grok TUIs hard-require a real pty terminal), but the
+  UI line ends there: no further human-facing UI work is in scope.
+
 ## Naming (unchanged)
+
 
 | Use | Form |
 |-----|------|
