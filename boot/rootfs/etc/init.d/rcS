@@ -71,6 +71,11 @@ echo $! > /run/bootcard.pid
 # loads the codec chain in dependency order and reports into boot.state.
 /etc/init.d/audio-bringup &
 
+# Camera bring-up (M19) — backgrounded: loads the Qualcomm cam_req_mgr
+# stack for the IFE route. cam_req_mgr_late must be the LAST module (it
+# seals the subdev registry); camera-bringup encodes that order.
+/etc/init.d/camera-bringup &
+
 # Network bring-up (M5) — backgrounded: waits for wlan0 from radio-bringup,
 # joins /etc/wifi.conf, DHCP, then fetches http://www.baidu.com; every step
 # lands in /run/boot.state and the card flips to the BOOT COMPLETE banner.
