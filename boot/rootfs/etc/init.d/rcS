@@ -66,6 +66,11 @@ echo $! > /run/bootcard.pid
 # both chains re-insmod with 2>/dev/null.
 /etc/init.d/radio-bringup &
 
+# Audio bring-up (M18) — backgrounded: waits for radio-bringup's ADSP ONLINE
+# + "Q6 is Up" (apr's of_platform_populate creating the sound subtree), then
+# loads the codec chain in dependency order and reports into boot.state.
+/etc/init.d/audio-bringup &
+
 # Network bring-up (M5) — backgrounded: waits for wlan0 from radio-bringup,
 # joins /etc/wifi.conf, DHCP, then fetches http://www.baidu.com; every step
 # lands in /run/boot.state and the card flips to the BOOT COMPLETE banner.

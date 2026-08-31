@@ -50,6 +50,27 @@
 #      (qcwlanstate), NOT /proc/misc — the old /proc/misc grep never
 #      matched, so /dev/wlan and cnss-daemon never came up (observed
 #      2026-08-27).
+#   7. Audio gate (M18, worked out 2026-08-31): q6_pdr's
+#      get_service_location("avs/audio") is ONE-SHOT (service-locator.c
+#      frees the work after the first attempt) and there are TWO races
+#      around it, both observed live:
+#      (a) it must run with servloc enable=1, else -ENODEV and the PDR
+#          framework never initializes — boot 2026-08-31 #1.
+#      (b) q6_pdr must insmod while the query is still BLOCKED waiting
+#          for the locator (no pd-mapper yet), so q6_notifier's
+#          audio_pdr_register() is on the callback list before the QMI
+#          roundtrip resolves. With pd-mapper already up the roundtrip
+#          takes ~10 ms and the LOCATOR_UP callback beats the next
+#          insmod — lost, audio_notifier sits UNINIT forever — boot
+#          2026-08-31 #2. Stock never sees this: its modules load ~1-3 s
+#          and pd-mapper starts much later, so the query always blocks.
+#          Hence: enable=1 → insmod q6 chain → START pd-mapper.
+#      When it fires, pd-mapper answers from /vendor/firmware/adspua.jsn
+#      (domain msm/adsp/audio_pd, qmi_instance_id 74), apr registers on
+#      PDR, the ADSP's servreg reports UP, and apr_adsp_up() runs
+#      of_platform_populate() — the sound subtree (q6core-audio/sound,
+#      bolero) only exists after that; /etc/init.d/audio-bringup waits
+#      for its "Q6 is Up" line before loading the codec chain.
 #
 # Firmware comes from modem_a — the pristine factory image
 # g7250-00264-230619-B-10346159 (reflashed 2026-08-27 from .factory after
@@ -170,14 +191,15 @@ start_retry() {  # binary-path [args...] — start, verify it stays up
   echo "$name FAILED to stay up"
   return 1
 }
-start_retry /vendor/bin/pd-mapper
+# pd-mapper deliberately does NOT start here — header note 7: the q6 chain
+# must insmod while its "avs/audio" query is still blocked waiting for the
+# locator, so start_retry pd-mapper runs after that loop instead.
 # PATCHED copy — see header note 2. Never substitute /vendor/bin/rmt_storage.
 # Both file servers run under trace_open.so ([T] open lines in their logs) so
 # any fetch the modem makes during a wlan_pd spawn attempt is visible.
 ( export LD_PRELOAD=/lib/trace_open.so; start_retry /bin/rmt_storage )
 ( export LD_PRELOAD=/lib/trace_open.so; start_retry /vendor/bin/tftp_server )
 sleep 2
-ps | grep -aq "[p]d-mapper"   && echo "pd-mapper up"   || echo "pd-mapper DEAD"
 ps | grep -aq "[r]mt_storage" && echo "rmt_storage up" || echo "rmt_storage DEAD"
 ps | grep -aq "[t]ftp_server" && echo "tftp_server up" || echo "tftp_server DEAD"
 
@@ -187,8 +209,7 @@ for m in qcom_ipcc smp2p msm_qmp mdt_loader subsystem_notif subsystem-restart \
          qcom_glink_native qcom_glink_smem qcom_glink_spss glink_probe glink_pkt \
          service-locator service-notifier cnss_utils cnss_prealloc cnss_nl \
          qcom_socinfo modemsmem msm_gsi ipa3 google_wlan_mac \
-         nvmem_qfprom q6_pdr_dlkm q6_notifier_dlkm snd_event_dlkm \
-         apr_dlkm adsp_loader_dlkm; do
+         nvmem_qfprom; do
   insmod "$M/$m.ko" 2>/dev/null && echo "ok $m"
 done
 
@@ -296,6 +317,20 @@ echo "ramdumps enabled: $(cat /sys/module/subsystem_restart/parameters/enable_ra
 # THE gate: stock sets this; without it icnss's WLFW discovery
 # returns -ENODEV forever ("servloc: Service Locator not enabled").
 echo 1 > /sys/module/service_locator/parameters/enable && echo "servloc enabled"
+# --- audio gate: enable, then q6 chain, THEN pd-mapper (header note 7) ----
+# q6_pdr's one-shot "avs/audio" query blocks waiting for the locator (up
+# to 300 s) — that window guarantees q6_notifier's audio_pdr_register()
+# is on the callback list before LOCATOR_UP fires. adsp_loader rides
+# along: it uses apr symbols and creates the /sys/kernel/boot_adsp/boot
+# attr the trigger below writes.
+for m in q6_pdr_dlkm q6_notifier_dlkm snd_event_dlkm apr_dlkm adsp_loader_dlkm; do
+  insmod "$M/$m.ko" 2>/dev/null && echo "ok $m"
+done
+# NOW the locator: pd-mapper resolves "avs/audio" from adspua.jsn and the
+# notifier chain fires (apr hears SERVICE_UP once the ADSP's servreg
+# registers below). icnss's lookup reuses the same blocked connection.
+start_retry /vendor/bin/pd-mapper
+sleep 2
 insmod "$M/msm_icnss.ko" 2>/dev/null && echo "ok msm_icnss"
 # ADSP up before the modem (stock: enable >/sys/kernel/boot_adsp/boot).
 # The attr only exists if nvmem_qfprom bound (header note 4) — the wait

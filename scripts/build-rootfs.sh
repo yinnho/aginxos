@@ -121,6 +121,19 @@ echo "built preload helpers (trace_open.so, fake-props.so)"
   -o "${TREE}/bin/wifi-join" "${RECIPE}/src/wifi-join.c"
 "${ZIG}" cc -target aarch64-linux-musl -static -O2 \
   -o "${TREE}/bin/wifi-trace" "${RECIPE}/src/wifi-trace.c"
+# M18 audio I/O: bare-ioctl PCM pair (no alsa-lib) — capture is the
+# agent's "listen" path, playback its "speak" path. Shared uapi header.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/snd-cap" "${RECIPE}/src/snd-cap.c"
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/snd-play" "${RECIPE}/src/snd-play.c"
+# snd-mixer: ctl get/set (no alsa-lib) — audio-bringup's whole routing
+# recipe runs through it. i2c-reg: rt5514 register peek/poke over
+# /dev/i2c-N (kernel has no debugfs here — see audio-bringup notes).
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/snd-mixer" "${RECIPE}/src/snd-mixer.c"
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/i2c-reg" "${RECIPE}/src/i2c-reg.c"
 # Boot card (M5): DRM boot-status renderer — polls /run/boot.state and
 # paints the AginxOS bring-up checklist on the panel. Holds DRM master
 # for its whole life (it replaces the M3 green splash). Same zig static
