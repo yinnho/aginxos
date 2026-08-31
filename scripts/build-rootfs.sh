@@ -195,7 +195,8 @@ cp "${TARGET}/wifi-wizard" "${TREE}/usr/bin/wifi-wizard"
 cp "${TARGET}/agsvc" "${TARGET}/agctl" "${TARGET}/agboot-ok" "${TREE}/usr/bin/"
 chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/touch-bringup" "${TREE}/etc/init.d/battery-bringup" \
-  "${TREE}/etc/init.d/radio-bringup" "${TREE}/etc/init.d/net-bringup" \
+  "${TREE}/etc/init.d/radio-bringup" "${TREE}/etc/init.d/audio-bringup" \
+  "${TREE}/etc/init.d/net-bringup" \
   "${TREE}/etc/init.d/app-registry" "${TREE}/etc/init.d/provision" \
   "${TREE}/etc/init.d/aterm-handoff" \
   "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdl" "${TREE}/usr/bin/aterm" \

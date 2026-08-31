@@ -2793,3 +2793,55 @@ Device session end state: RUNNING AginxOS with the baked audio chain
 still flashed (M18 experiment state). wifi join rc=2 both boots —
 hotspot "666" absent (iPhone auto-off), expected. i2c-reg/snd-mixer
 added to build-rootfs.sh for the next re-bake (#72).
+
+## Rootfs re-bake #2: M18 audio chain + wifi-join/agsvc fixes in the image (2026-08-31)
+
+Task #72 follow-up bake. `build-phone.sh musl` + `build-rootfs.sh` (now
+also baking snd-mixer/i2c-reg and chmodding audio-bringup) →
+out/rootfs.img, 129 MB content / 2 GB fs, flashed to userdata after the
+state backup (.local/backup-pre-bake-0831b: wifi.conf + /var/home/
+.aginx/.codex/.grok, 992 MB).
+
+**Boot from the image alone, zero adb-pushed crutches** (boot.state):
+
+    touch ok / battery ok 100% / modem ok
+    audio ok  0 [sm7250noextcode]: sm7250-noextcodec-snd-card
+    wlan ok wlan0 / wifi fail no /etc/wifi.conf   ← expected, by design
+
+Audio holds on the fresh image: the FIRST play+capture after boot
+carries the loop (880 Hz FFT peak 5.8e6, rms 175) — mdev coldplug,
+backend Channels ctls and the silent aDSP warm-up all correct in the
+baked script.
+
+wifi.conf restored from backup → net-bringup joined the "666" hotspot
+(172.20.10.3), ntpd set the clock, boot.state flipped to `done ok`.
+Provision then re-synced the wiped /var/bin over the air: direct
+GitHub TLS was reset (standing network condition), the gh-proxy
+fallback delivered — aginx, aginx-carrier, aginxbrowser (64 MB),
+codex (233 MB) all sha256-verified; `codex --version` runs (0.151.0).
+
+**agsvc absent-recheck fix verified from the baked image**: aginx-
+carrier and aginxbrowser were running as children of agsvc (~4 min
+after their binaries landed, no reboot, no manual spawn). One nuance
+observed: the `aginx` unit had FAILED during the pre-install window
+("No agents configured" + carrier path missing) and the recheck does
+not resurrect a failed unit — only Absent→spawn; after carrier
+existed, `agctl restart aginx` brought it to ready. A unit that fails
+while its dependency is still downloading stays failed until nudged.
+
+grok (largest asset) outlived this entry twice: the reboot killed its
+first download, and the retry's direct GitHub GET STALLED (no error,
+0 bytes for minutes — agdl has no read timeout, so the gh-proxy
+fallback never triggers). Killing the stalled agdl unblocked the
+fallback, which pulled ~100 MB/min via gh-proxy; grok 1.0.12 installed
+and provision reached `pkg ok`. agdl needs a connect+read timeout to
+make the mirror fallback self-healing — added the same day
+(timeout_connect 30 s / timeout_recv_body 60 s) and verified on
+device: a held-open response that sends headers but no body now
+fails at exactly 60 s with "timeout: receive body"; a slow-but-
+flowing trickle (8.2 MB in 200 s direct) is correctly NOT killed. End state re-checked: carrier +
+browser + aginx all ready, five /var/bin binaries live.
+
+Device session end state: RUNNING the fully baked image, carrier +
+browser + aginx ready, audio chain live, patched vendor_boot still
+flashed (standing M18+ experiment state).
