@@ -2569,3 +2569,76 @@ agsvc stack supervised (aginx/carrier/browser ready), registry seeded
 (codex+grok), new aterm/agboot-ok/rcS/inittab/provision pushed by hand
 (persisted in the ext4 rootfs; baked image NOT rebuilt — fold into the
 next build-rootfs.sh run together with M15).
+
+## M17 keyboard: event split + on-device input-path fixes (2026-08-31)
+
+Input path split (SYSTEM.md §12.6): keyboard is now a key table
+(kb.rs `KeyDef`/`Act`, EXTRA_KEYS 7 + SPECIALS 5 as const tables; letter
+pages stay char grids). Hit tests return `InputEvent` — `Key(KeyEvent)`
+for Esc/Tab/Enter/Backspace/arrows/Ctrl+letter, `Text(String)` for
+composed text — and byte encoding happens once at the terminal layer
+(`input::encode`), which reads the child's DECCKM state: `Term` tracks
+`app_cursor` from CSI ?1 h/l (vte 0.13 collects the '?' into
+`intermediates`, so private modes gate on `intermediates == [b'?']`);
+arrows encode SS3 (ESC O A) when set, CSI (ESC [ A) otherwise; RIS
+resets it. Hold-repeat (DEL + arrows, 400 ms) and the M18 voice
+injection point (ATERM_INJECT=1 → aterm polls /run/aterm.inject each
+loop and injects the file's content verbatim as TextInputEvent) both go
+through the same `inject()` in main.rs.
+
+Verified on device (adb-pushed binary, ATERM_START=/bin/sh test loop;
+synthetic taps via sendevent on /dev/input/event2, text via
+/run/aterm.inject):
+
+- Letter tap compose: tap 'h' + inject "ello\r" → sh ran
+  `touch /var/k2-hello` (file exists). Keys fire on finger-DOWN; inject
+  path end-to-end incl. `\r` → command execution.
+- Arrow + DEL line edit: inject "touch /var/arw-XX", tap LEFT
+  (ESC [ D), tap DEL (0x7f), inject "\r" → `/var/arw-X` exists,
+  `/var/arw-XX` never created.
+- CTL+c: one-shot CTL latch + 'c' composes KeyEvent::Ctrl('c') → 0x03;
+  a foreground `/bin/busybox sleep 30` (exec'd, own pgrp, tpgid set)
+  died and the next injected command executed.
+- ESC: tap ESC → 0x1b written to pty; a canonical-mode `dd bs=1`
+  read it back (`od` shows 1b). ESC alone doesn't complete a canonical
+  read — raw-mode consumers (codex/readline) get it immediately.
+
+Two bugs found on device, both fixed:
+
+1. **TouchReader stale start_y** — synthetic frames (tracking-id before
+   x/y, e.g. sendevent order) anchored `start_y` from the *previous*
+   touch's `raw_y`, so any new touch >30 px away instantly read as a
+   drag: Tap became Up, keyboard summon silently failed. Real firmware
+   reports position before tracking-id, which masked it. Fix: track
+   `y_in_frame` (y seen this frame) — anchor from raw_y at tracking-id
+   when the position already arrived, else mark `fresh` and anchor at
+   the first y of the touch. Both orders now produce clean
+   down=false-drag taps (observed in the lift trace).
+2. **SIGINT discarded: SIG_IGN inheritance** — CTL+c bytes reached the
+   ldisc (kill_pgrp fired) but every pty child ignored SIGINT. Root
+   cause via /proc/*/status SigIgn masks: rcS's busybox sh ignores
+   SIGHUP+SIGINT (0x1006), adbd ignores both too (0x...06 + rt-sig 38),
+   and SIG_IGN survives exec — so the whole aterm→sh→jobs chain was
+   immune to ^C (init itself only ignores SIGPIPE, so this is ancestry,
+   not kernel). Even `kill -INT` from adb couldn't kill an
+   adb-spawned sleep. Fix: the pty child now resets HUP/INT/QUIT/TERM/
+   TSTP/TTIN/TTOU/PIPE to SIG_DFL and clears the signal mask before
+   execv. After the fix the sh child's SigIgn lacks INT, and CTL+c
+   kills a foreground job (test above).
+
+Testing anomalies (not bugs, cost real time):
+
+- busybox sh runs `sleep 30` as a NOFORK applet *inside* the shell
+  process — invisible to `ps` by name. Interrupt tests must exec a
+  real binary (`/bin/busybox sleep 30`) to be observable.
+- First inject after an aterm restart is sometimes lost (master write
+  racing child setup) — warm the instance with a throwaway `#\r`.
+- Keyboard starts hidden on fresh instances; a tap above the panel
+  toggles visibility. Test sequences must establish kb state first
+  (our CTL "failures" twice were just the CTL tap toggling kb on).
+
+Session-end device state: RUNNING AginxOS, aterm restored to the
+standard aterm-handoff respawn loop (launcher mode, /var/aterm.log),
+test artifacts removed. Same rootfs caveat as M15/M16: the new aterm is
+adb-pushed (persisted on ext4) but the baked rootfs image is not yet
+rebuilt — fold M15+M16+M17 into the next build-rootfs.sh run.
