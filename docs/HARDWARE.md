@@ -2642,3 +2642,68 @@ standard aterm-handoff respawn loop (launcher mode, /var/aterm.log),
 test artifacts removed. Same rootfs caveat as M15/M16: the new aterm is
 adb-pushed (persisted on ext4) but the baked rootfs image is not yet
 rebuilt — fold M15+M16+M17 into the next build-rootfs.sh run.
+
+## rootfs re-bake + full boot chain on device (2026-08-31)
+
+Task #72: fold M15+M16+M17 into a baked rootfs image and prove the whole
+boot chain with no adb-pushed crutches. `scripts/build-rootfs.sh` (with
+build-phone.sh `all` now including wifi-wizard) produced out/rootfs.img
+(124 MB); flashed to userdata after a full state backup
+(.local/backup-pre-bake-0831: wifi.conf, /var/home/.aginx/.codex/.grok —
+restored post-flash).
+
+**Full chain observed after one reboot** (boot.state):
+
+    touch ok / battery ok 100% / modem ok / wlan ok wlan0
+    wifi ok 666 / dhcp ok 172.20.10.3 / internet ok www.baidu.com 696199B
+    time ok 2026-08-31 / done ok
+
+aterm, agsvc, adbd all up from the baked image. Provision then
+agpkg-synced the must-exist tier over the air: aginx-carrier (28.7 MB),
+aginxbrowser (64 MB), codex (233 MB) — downloaded, sha256-verified,
+installed to /var/bin with no host involvement. carrier came up ready
+with the iLink WeChat channel online.
+
+The AP was an iPhone hotspot ("666", psk device-only), which cost three
+wifi-join fixes — all device-observed:
+
+1. **iOS masks the beacon SSID** (length kept, bytes zeroed: `00 00 00`);
+   wildcard scans never unmask it. nlscan now hex-escapes non-printable
+   SSID bytes (the old `?` substitution destroyed the evidence); wifi-join
+   sends a directed probe (SSID attr in TRIGGER_SCAN) and accepts an
+   all-zero SSID of matching length as a hidden-AP match.
+2. **WPA3-transition 5 GHz BSS associates but never handshakes**: with
+   SAE (00:0f:ac:08) in the AKM list, Apple accepts assoc and then never
+   sends EAPOL M1 (rx counters stayed 0 for 20 s; kmsg showed auth/assoc
+   complete, SME akm 9 = eCSR_AUTH_TYPE_RSN_PSK, correct). Same SSID in
+   "Maximize Compatibility" mode (2.4 GHz, PSK-only) handshakes fine.
+   wifi-join now prefers a PSK-only BSS over any SAE-advertising one
+   when both carry the SSID. SAE/PMF support stays future work.
+3. **M2 rejected on plain WPA2 when our RSNE carried MFPC**: setting
+   PMF-capable bits (an experiment against #2) made Apple MIC-accept
+   nothing — M2 sent, no M3, no M1 retransmission. Plain WPA2 APs want
+   rsn caps 0x0000 exactly. Reverted; M1→M4 completed and
+   "passphrase correct".
+
+**agsvc absent-recheck bug (M16, first real exercise)**: with /var/bin
+empty at agsvc start, all three units went Absent and stayed there for
+25 min after the binaries landed. `try_spawn()` only acts on Backoff,
+but the tick loop's Absent recheck called it with the unit still in
+Absent — a no-op forever. Fixed with an Absent→Backoff pre-pass in
+tick(); after the binary swap aginx-carrier and aginxbrowser were ready
+2 s later (observed in kmsg + agctl). M16 acceptance never caught this
+because binaries existed before agsvc started.
+
+Remaining (network-bound, not system bugs): aginx (gateway) and grok
+never landed — first a TLS reset at 02:29, later the hotspot's DNS
+(172.20.10.1) and then the whole data path died (iPhone hotspot
+auto-off). Provision correctly recorded `pkg fail`; next networked boot
+re-syncs, and the now-working 30 s recheck starts the gateway unit
+without a reboot.
+
+Device session end state: RUNNING AginxOS from the baked rootfs,
+carrier + browser ready, aginx absent pending network. wifi.conf holds
+the iPhone hotspot (ssid 666, psk device-only). Note for the next
+build: the wifi-join/nlscan/agsvc fixes are in the source tree; the
+flashed image predates them (current /bin binaries are adb-pushed
+replacements on the rw ext4).
