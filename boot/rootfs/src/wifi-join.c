@@ -457,9 +457,9 @@ static int join_group(const char *name)
 
 struct target { const char *ssid; unsigned ifindex; unsigned char bssid[6];
 		__u32 freq; int found; __s32 sig;
-		__u32 grpcipher; int grp_known; };
+		__u32 grpcipher; int grp_known; int bss_sae; };
 
-/* RSN IE: CCMP/CCMP/PSK, no MFP. Body is exactly 20 bytes:
+/* RSN IE: CCMP/CCMP/PSK, MFPC. Body is exactly 20 bytes:
  * ver(2)+grp(4)+pcnt(2)+pair(4)+acnt(2)+akm(4)+caps(2) */
 static const unsigned char rsne[] = {
 	0x30, 0x14,
@@ -467,7 +467,9 @@ static const unsigned char rsne[] = {
 	0x00, 0x0f, 0xac, 0x04,		/* group CCMP */
 	0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, /* 1 x pairwise CCMP */
 	0x01, 0x00, 0x00, 0x0f, 0xac, 0x02, /* 1 x AKM PSK */
-	0x00, 0x00			/* rsn caps */
+	0x00, 0x00			/* rsn caps — plain WPA2: Apple hotspots
+					 * MIC-fail an M2 whose RSNE carries
+					 * PMF caps they never offered */
 };
 
 static void parse_bss(struct nlattr *bss, struct target *t)
@@ -511,7 +513,17 @@ static void parse_bss(struct nlattr *bss, struct target *t)
 		}
 		}
 	}
-	if (ssid_len == (int)strlen(t->ssid) && !memcmp(ssid, t->ssid, ssid_len)) {
+	/* Hidden APs mask the beacon SSID (length kept, bytes zeroed —
+	 * iOS hotspots do this, 2026-08-31); a wildcard scan never unmasks
+	 * it. An all-zero SSID of the right length is accepted as a match:
+	 * the associate request below carries the real SSID from argv,
+	 * which the AP validates. */
+	int hidden = 1;
+	int sae = 0;
+	for (int i = 0; i < ssid_len; i++)
+		if (((const unsigned char *)ssid)[i]) { hidden = 0; break; }
+	if (ssid_len == (int)strlen(t->ssid) &&
+	    (!memcmp(ssid, t->ssid, ssid_len) || hidden)) {
 		/* one diagnostic line per BSSID carrying the SSID — the SME scan
 		 * filter matches against exactly this info. RSNE layout after the
 		 * 2-byte header: ver(2) grp(2..5) pcnt(6..7) pairwise(8..)
@@ -535,19 +547,32 @@ static void parse_bss(struct nlattr *bss, struct target *t)
 			for (int k = 0; k < pc && 8 + 4 * k + 3 < rsn_len; k++)
 				fprintf(stderr, " uc%02x%02x%02x%02x",
 					rsn[8 + 4*k], rsn[9 + 4*k], rsn[10 + 4*k], rsn[11 + 4*k]);
-			for (int k = 0; k < ac && ao + 2 + 4 * k + 3 < rsn_len; k++)
+			for (int k = 0; k < ac && ao + 2 + 4 * k + 3 < rsn_len; k++) {
+				if (rsn[ao + 2 + 4*k] == 0x00 && rsn[ao + 3 + 4*k] == 0x0f &&
+				    rsn[ao + 4 + 4*k] == 0xac && rsn[ao + 5 + 4*k] == 0x08)
+					sae = 1;	/* SAE (WPA3) in the AKM list */
 				fprintf(stderr, " akm%02x%02x%02x%02x",
 					rsn[ao + 2 + 4*k], rsn[ao + 3 + 4*k],
 					rsn[ao + 4 + 4*k], rsn[ao + 5 + 4*k]);
+			}
 		} else if (!rsn) {
 			fprintf(stderr, " rsn:none");
 		}
 		fprintf(stderr, "\n");
-		if (!t->found || sig > t->sig) {
+		/* We speak PSK only. A WPA3-transition AP (e.g. an iPhone
+		 * hotspot in 5 GHz mode, 2026-08-31) associates fine over the
+		 * PSK AKM but its WPA policy never starts the 4WHS without
+		 * PMF/SAE — the join times out with zero EAPOL. When the same
+		 * SSID has several BSSIDs (transition 5 GHz + plain-PSK 2.4 GHz
+		 * "Maximize Compatibility"), pick a PSK-only BSS over any
+		 * SAE-advertising one, signal breaks ties. */
+		if (!t->found || (!sae && t->bss_sae) ||
+		    (sae == t->bss_sae && sig > t->sig)) {
 			memcpy(t->bssid, bssid, 6);
 			t->freq = freq;
 			t->sig = sig;
 			t->found = 1;
+			t->bss_sae = sae;
 			if (rsn && rsn_len >= 6) {
 				t->grpcipher = (__u32)rsn[2] << 24 | rsn[3] << 16 |
 					       rsn[4] << 8 | rsn[5];
@@ -581,6 +606,10 @@ static int scan_and_find(struct target *t)
 	 * with no IE on record that is malloc(0) → NULL → NOMEM and the whole
 	 * join path aborts before the filter ever runs. */
 	nla_put(n, BUF, NL80211_ATTR_IE, rsne, sizeof(rsne));
+	/* Directed probe for hidden APs: SSID in TRIGGER_SCAN makes the scan
+	 * unicast a probe request carrying the real name, which a hidden AP
+	 * answers (wildcard probes get nothing). */
+	nla_put(n, BUF, NL80211_ATTR_SSID, t->ssid, strlen(t->ssid));
 	nl_send(n, nl80211_fam);
 	nl_read_loop(NULL, NULL, 1500);
 	sleep(3);

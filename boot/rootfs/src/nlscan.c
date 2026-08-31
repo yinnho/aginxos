@@ -184,13 +184,21 @@ static void parse_bss(struct nlattr *bss)
 
 	printf("%02x:%02x:%02x:%02x:%02x:%02x  ch=%-2d  %4d.%02d dBm  ",
 	       bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
-	       freq >= 5000 ? (freq - 5000) / 4 : freq > 2412 ? (freq - 2407) / 5 : 0,
+	       freq >= 5000 ? (freq - 5000) / 5 : freq > 2412 ? (freq - 2407) / 5 : 0,
 	       sig / 100, abs(sig % 100));
 	if (ssid_len <= 0) {
 		printf("<hidden>");
 	} else {
-		for (int i = 0; i < ssid_len; i++)
-			putchar((ssid[i] >= 32 && ssid[i] < 127) ? ssid[i] : '?');
+		/* SSIDs are arbitrary bytes, not text — hex-escape the
+		 * non-printables so a CJK name stays joinable (wifi-join
+		 * needs the exact bytes; '?' destroyed them). */
+		for (int i = 0; i < ssid_len; i++) {
+			unsigned char c = ssid[i];
+			if (c >= 32 && c < 127)
+				putchar(c);
+			else
+				printf("\\x%02x", c);
+		}
 	}
 	putchar('\n');
 }
