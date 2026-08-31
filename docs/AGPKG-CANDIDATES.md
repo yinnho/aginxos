@@ -1,13 +1,13 @@
 # agpkg 候选册（2026-08-30 调研 + 实测剥壳；08-31 增补媒体/文档管线 4 件）
 
-CLI 工具生态普查产物：19 个工具已从上游 release 下载、剥壳、逐个
+CLI 工具生态普查产物：20 个工具已从上游 release 下载、剥壳、逐个
 `file` 验证（ELF aarch64）并算出**裸二进制 sha256**。上游资产全是
 压缩包而 agpkg 装裸文件——按 codex/grok 先例走剥壳镜像：把这批
 `.bin` 原字节上传到 `yinnho/aginxos` releases（tag `<name>-<ver>`，
 资产名 `<name>-<ver>-aarch64-unknown-linux-musl`），下方 manifest
 行的 sha256 即刻生效（镜像必须原字节，改一字节就失配）。
 
-**镜像已建**：19/19 releases 全部上传成功（2026-08-31），manifest
+**镜像已建**：20/20 releases 全部上传成功（2026-08-31），manifest
 行可按需启用；上机后逐个跑 `--version` 是最终验证闸门
 （aginxbrowser v0.2.5 先例：静态 ELF 仍可能真机 segfault）。
 
@@ -38,6 +38,7 @@ ffmpeg    https://github.com/yinnho/aginxos/releases/download/ffmpeg-v7.0.2/ffmp
 ffprobe   https://github.com/yinnho/aginxos/releases/download/ffprobe-v7.0.2/ffprobe-v7.0.2-aarch64-unknown-linux-musl d17ae9b4c297d48e2521ba14e417bb0537c6ff77c584cdbcd6bb0d8d0307a2e8
 typst     https://github.com/yinnho/aginxos/releases/download/typst-v0.15.1/typst-v0.15.1-aarch64-unknown-linux-musl 3088dd985a891d804a98c69db24dfca77a35878e45d40e38c79cf36d72bcd4c1
 pandoc    https://github.com/yinnho/aginxos/releases/download/pandoc-3.11/pandoc-3.11-aarch64-unknown-linux-musl 80e7b7b04282e6fb5dfd245c6be5957c204a398aece6935b43c9f3ac1fe38dff
+lux       https://github.com/yinnho/aginxos/releases/download/lux-v0.24.1/lux-v0.24.1-aarch64-unknown-linux-musl c1f1bb63ef40d25729be5cd699204823de310c0e57dc0676d6ff96841c4cbce7
 
 # --- 自建档（自有仓 release，同 aginx 形制，无需镜像）---
 xlsx      https://github.com/yinnho/xlsx/releases/download/v0.1.0/xlsx-aarch64-unknown-linux-musl 78a6bf454b453a68880d00ea860d0725fa2cf137dedb62a4526a1580fc1f083f
@@ -106,6 +107,7 @@ digest 应等于 manifest 行的 sha256（GitHub 存的就是文件 sha256）。
 | ffprobe | 7.0.2 | 同上（同 tarball）| 同上 |
 | typst | v0.15.1 | typst/typst …/typst-aarch64-unknown-linux-musl.tar.xz | 5aa8d74a…23dcee |
 | pandoc | 3.11 | jgm/pandoc …/pandoc-3.11-linux-arm64.tar.gz | 56ed5566…314c79a |
+| lux | v0.24.1 | iawia002/lux …/lux_0.24.1_Linux_arm64.tar.gz | 479b0929…873879d7 |
 
 ## 链接形态备注（上机验证项）
 
@@ -121,6 +123,25 @@ digest 应等于 manifest 行的 sha256（GitHub 存的就是文件 sha256）。
 | eza | 只有 gnu（含 no_libgit 变体） | `cargo-zigbuild --target aarch64-unknown-linux-musl`，用 no_libgit 特性树 |
 | qsv | 22.0.1 只有 gnu zip | 同上（qsv 曾发 musl，新版掉了；自建注意 `--no-default-features` 减依赖） |
 | pdftotext(poppler)/newsboat | C/C++，无官方静态 musl | 交叉编译成本高，按需再议 |
+| whisper.cpp | 官方只发 ubuntu-arm64（glibc） | CI alpine 容器交叉出 musl 静态（ggml 纯 C++）；**附带模型分发**（ggml.bin 57~466MB，agpkg 需非 bin 资产装法） |
+| resvg | 只发 linux-x86_64 | Rust zigbuild 半小时；typst 出 PNG 已覆盖大半，按需 |
+| alass（字幕对轴） | 只发 x86_64 | Rust zigbuild；小众按需 |
+
+## 视频制作配套缺口（08-31 全景盘点）
+
+主干已闭环：ffmpeg（转码/拼接/抽帧/tile 接触表/GIF/loudnorm/libass 烧字幕）
++ ffprobe（探针/质检）+ typst（海报字幕卡出 PNG）+ lux（B站/yt 下载）+
+rclone（分发）。真缺口两个：
+
+1. **中文字体包**——libass 烧字幕与 typst 排版都要 CJK 字体，musl
+   rootfs 裸奔=豆腐块。Noto Sans CJK ~20MB/字重。这是 **agpkg 格式
+   缺口**：manifest 现只装裸 bin，字体要装 fonts 目录且 fontconfig
+   可见——需 assets 扩展（加装目录列或独立 manifest），属格式立法。
+2. **whisper.cpp musl 自建 + 模型放置约定**（见 Tier3 表）——补齐后
+   视频字幕自动生成 + 语音消息转文字一次到位。
+
+非本地件：Seedance/Seedream 生成与 TTS 配音走服务端 API；NLE 不做
+（agent 视频是程序化组装，ffmpeg filter_complex 即剪辑 DSL）。
 
 ## 与生态的咬合点
 
