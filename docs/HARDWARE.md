@@ -2915,3 +2915,217 @@ Device session end state: RUNNING baked image + the updated
 audio-bringup pushed over adb (device copy newer than the image — fold
 into the next re-bake), patched vendor_boot still flashed (standing
 experiment state).
+
+## M19 camera: full driver stack loaded, nodes up (2026-08-31)
+
+Task #71 start. The whole Qualcomm camera driver stack (IFE route, no
+ICP) now loads on device — 31 modules, proven by insmod rounds with
+per-symbol dmesg evidence:
+
+    camcc-lito, cam_debug_util, cam_tasklet_util, cam_res_mgr,
+    cam_smmu_api, cam_mem_mgr, cam_utils, cam_req_mgr, cam_irq_controller,
+    cam_isp_packet_parser, cam_sensor_vsync_pb, cam_cpas, cam_cdm,
+    cam-sync, cam_cci, cam_csiphy, cam-sensor-io, cam_sensor_util,
+    cam_gyro_core, cam_ife_csid, cam_ife_csid17x, cam_ife_csid_lite17x,
+    cam_vfe, cam_ife_hw_mgr, cam_isp_hw_mgr, cam_sensor_vsync_dev,
+    cam_req_mgr_late, fw-update, cam_sensor, cam-context, cam_isp
+
+Node result: /dev/media0-3, /dev/video0-4, /dev/v4l-subdev1-5 after
+mdev (media2/3 + video3/4 + subdevs appear with cam-context/cam_isp).
+CSIPHY0-3 probes link regulators (dmesg "Linked as a consumer to
+regulator.64/.7"). DT: cci0 → cam-sensor@0/@1 + eeprom@0/@1 +
+actuator@0 + ois@0 (rear main+ultrawide), cci1 → cam-sensor@2 +
+eeprom@2 (front).
+
+**Two traps that cost the first hour, both recorded for good:**
+
+1. **Mixed dash/underscore filenames.** cam-sync.ko, cam-sensor-io.ko,
+   cam-context.ko use dashes; every other cam module uses underscores.
+   `insmod cam_sync.ko` fails with "No such file" — which a 2>/dev/null
+   eats, and a status-check bug (tr -d instead of tr '-') then read as
+   "loaded". Result: cam_sync appeared loaded while never being
+   inserted, and cam_isp/cam_context cascaded "Unknown symbol
+   cam_sync_*". Diagnosis tool that cracked it: busybox insmod prints
+   the per-module "Unknown symbol X (err -2)" lines to dmesg — read
+   THOSE, not the insmod exit text.
+2. **fw-update.ko is outside the cam_* namespace** and exports
+   checkOISFWUpdate/getFWVersion (Google OIS helpers) that cam_sensor
+   imports. Without it cam_sensor fails "unknown symbol" forever.
+
+kallsyms gotcha for future symbol work: CONFIG_KALLSYMS_ALL is unset on
+this kernel — /proc/kallsyms lists TEXT symbols only, so diffing a
+module's UND list against it produces phantom "missing" data symbols
+(v4l2_subdev_fops, __tracepoint_*).
+
+Proven recipe baked as boot/rootfs/etc/init.d/camera-bringup (not yet
+in rcS — standalone until first light; idempotent, re-run green).
+eeprom/actuator/ois/flash/ICP/JPEG/LRME/FD/custom modules stay out of
+the minimal set until a frame lands. Next: identify the media topology
+(subdev1-5 roles), then the cam-shot userspace (cam_req_mgr packets →
+IFE RDI → raw frame).
+
+Device session end state: RUNNING baked image + camera-bringup pushed
+over adb (newer than the image), 31-module camera stack live, patched
+vendor_boot still flashed (standing experiment state).
+
+## M19 camera: sensor subdevs up — three ordering traps found and fixed (2026-08-31, second session)
+
+Wrote boot/rootfs/src/media-topo.c (zig-static, /bin/media-topo): media-
+controller ENUM_ENTITIES/ENUM_LINKS dump. media2 = cam_req_mgr (video3 +
+subdevs + 2x cam-cci-driver), media3 = cam_sync (video4). media0/1 =
+vim2m/vicodec test drivers, irrelevant. The Qualcomm entity types decode
+via uapi cam_req_mgr.h CAM_*_DEVICE_TYPE (cpas=+7, csiphy=+8,
+actuator=+9, cci=+10, eeprom=+12, ois=+13 over MEDIA_ENT_F_OLD_BASE).
+
+After the first 31-module load, sensors were MISSING: all three
+cam-sensor@N platform devices unbound, zero sensor subdevs. Three
+independent causes, each observed:
+
+1. **cam_req_mgr_late seals the subdev registry.** Its module init calls
+   cam_dev_mgr_create_subdev_nodes() → v4l2_device_register_subdev_nodes,
+   after which cam_register_subdev() rejects everything:
+   `CAM_ERR: CAM-CRM: cam_register_subdev: 675 dynamic node is not
+   allowed, name: cam-isp` (observed; cam_sensor's probes hit the same
+   wall). cam_req_mgr_late must be the LAST camera module, after
+   sensor/isp/context/eeprom/actuator/ois have all probed. With it last,
+   cam-isp registers (v4l-subdev14, type CAM_IFE_DEVICE_TYPE).
+2. **fw_devlink defers camera probes silently.** Every camera DT node
+   (sensor@0/1/2, eeprom@0/1/2, actuator@0, ois@0) is a device-link
+   consumer of i2c 1-0075 = slg51000, the camera PMIC (dmesg "Linked as
+   a consumer to 1-0075"). Without its driver, every camera probe
+   returns -EPROBE_DEFER — which prints NOTHING (no CAM_ERR, no kernel
+   probe-failed line, driver dir simply empty) and this kernel has no
+   debugfs (CONFIG_DEBUG_FS off) to list deferred-probes. Symptom is
+   "driver loaded, devices match, nothing binds, zero log lines".
+   slg51000-regulator.ko is the fix and belongs in the chain.
+3. **GPIO race on PM8150L gpio9 (global 1109).** Loading
+   slg51000-regulator late (after the rest of the stack) failed its probe
+   with `slg51000-regulator 1-0075: GPIO(1109) request failed(-16)` —
+   dlg,enable-gpios = <pm8150l_gpio 10>, <pm8150l_gpio 9> and gpio9 was
+   already gpio_requested by someone (DT-wide sweep found no other
+   reference: pm8150l pinctrl states only claim gpio3 (irq_pin_top),
+   gpio5 (key_vol_up), gpio8 (camera_rear_vcm_en — that one is the
+   bound /soc/gpio-regulator@0), gpio10 (en_rwcam + reset_pin_bottom,
+   shared), gpio11 (reset_pin_top), gpio12 (eldo13_pin); camera nodes
+   reference pm8150l gpio2). Loading slg51000-regulator FIRST — before
+   every other camera module — wins the race; at boot 14:37 it probed
+   clean ("No IRQ configured" only, informational) and 1-0075 bound.
+
+Also this boot: rcS now runs /etc/init.d/camera-bringup (explicit call
+added — rcS invokes bring-ups by name; a script sitting in /etc/init.d
+that rcS doesn't name never runs. That cost one reboot to notice: pushed
+script + reboot produced a boot with zero camera nodes and a camera.log
+whose only entry was the previous session's manual run, pre-NTP clock
+stamp 14:18 vs real boot 14:30). eeprom/actuator/ois modules added to
+the chain (their devices were also frozen on 1-0075).
+
+Observed result, boot 2026-08-31 14:37 UTC: camera-bringup via rcS,
+0 failed loads, **14 v4l subdevs**: cam-cpas, 4x cam-csiphy-driver,
+3x cam-eeprom, cam-actuator-driver, cam-ois, **3x cam-sensor-driver**
+(media2 entities 16/17/18, type CAM_SENSOR_DEVICE_TYPE), cam-isp; all
+three cam-sensor@N platform devices bound to driver "qcom,camera";
+1-0075 bound to slg51000-regulator. media2 entity list complete.
+
+Device identity still unknown at this stage (sensor power-up/chip-ID
+read is a userspace packet op — cam-shot's first job). Next: cam-shot
+v0 = CREATE_SESSION on video3 + CAM_SENSOR_PROBE_CMD on each sensor
+subdev to read chip IDs over CCI; then the IFE RDI capture path.
+
+## M19 camera: all three sensors identified — chip-ID read from userspace (2026-08-31, third session)
+
+cam-shot v0 (boot/rootfs/src/cam-shot.c, musl-static, /bin/cam-shot on
+device) walks /dev/mediaN entities for type 0x10001 subdevs whose
+major:minor exactly matches a /dev/v4l-subdevN sysfs dev node, opens
+/dev/video3 (cam_req_mgr), and issues CAM_SENSOR_PROBE_CMD
+(0x10A) packets built entirely in userspace: 3 cam_mem_mgr allocations
+(ALLOC_BUF 0x112 with flags KMD_ACCESS|CMD_BUF_TYPE — size field must
+be sizeof(cam_mem_mgr_alloc_cmd)=104, NOT 24; video3 validates
+k_ioctl->size against the payload struct), mmap the returned fds, and
+lay out a cam_packet with num_cmd_buf=2: desc0 = i2c_info{slave,
+freq=FAST, cmd=4} + probe{WORD/WORD, reg 0x0016, expected 0xFFFF,
+mask 0, camera_id=slot}; desc1 = power blob.
+
+Discovery trick: expected 0xFFFF + mask 0 makes cam_sensor_id_by_mask
+return the full 16-bit id and the compare always fail, so kmsg prints
+`CAM_WARN ... cam_sensor_match_id: 767 read id: 0xNNN expected id
+0xffff:` with the REAL chip id, then powers down cleanly — sensor
+stays unprobed and the attempt is repeatable. NACK (wrong address)
+prints rc=-22 / read id 0x0 instead.
+
+Observed result: all three sensors answered at 8-bit slave 0x34
+(7-bit 0x1A), id reg 0x0016 WORD:
+- slot 0 rear-main /dev/v4l-subdev11: **IMX363 (0x363)** — but ONLY
+  after the power-up sequence grew SENSOR_CUSTOM_REG1+2 (DT rails
+  cam_v_custom1 1.8V, cam_v_custom2 1.1V — the latter is the sensor's
+  DVDD from the slg51000 camera PMIC; without them the module never
+  powers and every address NACKs).
+- slot 1 rear-uw /dev/v4l-subdev12: **IMX481 (0x481)** — VIO/VANA/VDIG
+  sequence suffices.
+- slot 2 front /dev/v4l-subdev13: **IMX355 (0x355)** — VIO +
+  CUSTOM_GPIO1 (PM8150L gpio2) + RESET + MCLK.
+
+Full CCI read cycle (power-up → chip-id read → power-down) driven
+purely by our userspace packet; no kernel mods. Benign kmsg noise:
+slg51000 "No IRQ configured", CCI probe Device Type 0/1, "No clk data
+for ife_dsp_clk", repeated cam_req_mgr_close WARNs from fd closes.
+Next: real probe with matching expected id (0x363/0x481/0x355, mask 0)
+→ CAM_SENSOR_INIT, then IFE RDI capture (session/link/config → frame).
+
+## M19 camera: rear-main slot 0 solved — IMX363 answers at 0x20; real probe success all three slots (2026-09-01)
+
+Continuation of the 2026-08-31 session. Slot 0 (rear-main) would read
+its chip id exactly once and then NACK forever, eventually wedging CCI
+(-110, FIFO buf_lvl 0x0). Chain of investigation, all observed:
+
+1. **Rear module rail map (DT phandles resolved on device).**
+   sensor@0 and eeprom@0 share one rail list; actuator@0 only cam_vaf:
+   - cam_vio → slg51000 ldo7 (1.8V)   [sysfs regulator.80]
+   - cam_vana → slg51000 ldo3         [regulator.76]
+   - cam_vdig → slg51000 ldo1         [regulator.74]
+   - cam_v_custom1 → slg51000 ldo4    [regulator.77]
+   - cam_v_custom2 → slg51000 ldo6    [regulator.79]
+   - cam_vaf → /soc/gpio-regulator@0 "camera_ldo", fixed 2.85V,
+     pm8150l gpio8 (camera_rear_vcm_en) [regulator.9]
+   - cam_clk → camss GDSC
+   slg51000 sits at i2c@98c000 slave 0x75.
+
+2. **Kernel executor has no rail fallback.** cam_sensor_core_power_up
+   (cam_sensor_util.c:1898+) enables ONLY rails that appear in the
+   power-settings array. The vendor Chromatix power-up array decoded
+   from com.qti.sensormodule.metric_imx363_lito2.bin (factory image,
+   the only imx363 module bin — /lib64/camera/ has exactly one)
+   deliberately contains no VIO and no MCLK step; driving that exact
+   sequence from our userspace NACKs. With no VIO step the sensor's
+   I2C/DOVDD (ldo7) is simply never powered.
+
+3. **Working slot-0 sequence** (added VIO first, MCLK before XCLR):
+   up: VIO(1) VANA(1) VAF(0) VDIG(1) custom1(1) custom2(1) MCLK(1)
+   RESET=1(5); down: MCLK(1) RESET=0(1) custom2 custom1 VDIG VAF VANA
+   VIO. Power-up succeeds kernel-side either way — match_id still ran
+   and NACKed at 0x34, i.e. a NACK does NOT mean power-up failed.
+
+4. **Full-bus sweep (new `cam-shot --sweep 0`)** walks every even
+   8-bit address 0x02..0xFE on the slot's CCI master, one full power
+   cycle per address, classifying each from kmsg (ACK prints nonzero
+   `read id`). Result on cci0/master0 (rear module bus: sensor@0 +
+   eeprom@0 + actuator@0 + ois@0): **exactly one address answers —
+   0x20, id 0x0363.** No eeprom/actuator/ois ack anywhere (they stay
+   silent even with our full rail set; unresolved, noted).
+   IMX3xx latches one of two slave addresses from INCK/XCLR power-on
+   timing; with MCLK running before XCLR release our timing latches
+   0x20. The single historical 0x34 success was the other latch.
+   (Cam-shot kmsg classifier must filter to `CAM-` lines: an adbd
+   watchdog line contains the word "timeout" and false-triggers.)
+
+5. **Real probe result (observed):** pinning slot 0 → addr 0x20,
+   `--real 0` returns rc=0 on try 1; three rounds × three slots =
+   **9/9 first-try successes** (`Probe success,slot:N` in kmsg, 14
+   total this boot). No CCI wedging since probing the right address;
+   the -110 storm was a symptom of hammering 0x34, not a bus fault.
+
+Device state: patched vendor_boot still flashed, camera stack loads
+via rcS (camera-bringup), /bin/cam-shot = sweep-capable build.
+Remaining for M19: IFE RDI capture — cam_req_mgr CREATE_SESSION,
+link csiphy→csid→vfe, CAM_CONFIG_DEV, SCHED_REQ, plus sensor init
+register tables (regSetting array in the metric_imx363 blob,
+169040 bytes @0x01bcb0, holds the streamon register lists).
