@@ -38,6 +38,9 @@ ffmpeg    https://github.com/yinnho/aginxos/releases/download/ffmpeg-v7.0.2/ffmp
 ffprobe   https://github.com/yinnho/aginxos/releases/download/ffprobe-v7.0.2/ffprobe-v7.0.2-aarch64-unknown-linux-musl d17ae9b4c297d48e2521ba14e417bb0537c6ff77c584cdbcd6bb0d8d0307a2e8
 typst     https://github.com/yinnho/aginxos/releases/download/typst-v0.15.1/typst-v0.15.1-aarch64-unknown-linux-musl 3088dd985a891d804a98c69db24dfca77a35878e45d40e38c79cf36d72bcd4c1
 pandoc    https://github.com/yinnho/aginxos/releases/download/pandoc-3.11/pandoc-3.11-aarch64-unknown-linux-musl 80e7b7b04282e6fb5dfd245c6be5957c204a398aece6935b43c9f3ac1fe38dff
+
+# --- 自建档（自有仓 release，同 aginx 形制，无需镜像）---
+xlsx      https://github.com/yinnho/xlsx/releases/download/v0.1.0/xlsx-aarch64-unknown-linux-musl 78a6bf454b453a68880d00ea860d0725fa2cf137dedb62a4526a1580fc1f083f
 ```
 
 ## 镜像上传操作（一条循环跑完）
