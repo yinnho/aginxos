@@ -14,6 +14,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::process::ExitCode;
+use std::time::Duration;
 
 fn main() -> ExitCode {
     // agdl [-X METHOD] [-H "k: v"]... [-d @file] <url> [output-file]
@@ -83,8 +84,17 @@ fn fetch(
     out: &str,
 ) -> Result<(u16, u64), Box<dyn std::error::Error>> {
     // Non-2xx must not error: probes want the response body either way.
+    // Timeouts (2026-08-31 grok stall): a GitHub direct GET can hang with
+    // the connection open and zero bytes flowing — a blocking read without
+    // a timeout never errors, so agpkg's mirror fallback never triggers
+    // and the download stalls forever (observed: .part idle for minutes
+    // until the agdl process was killed by hand). 60 s of dead air on any
+    // single body read now fails the fetch. No timeout_global: a slow but
+    // flowing 233 MB pull is legitimate.
     let config = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_body(Some(Duration::from_secs(60)))
         .build();
     let agent = ureq::Agent::new_with_config(config);
     let m = method.to_ascii_uppercase();
