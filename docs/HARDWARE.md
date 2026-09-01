@@ -3129,3 +3129,77 @@ Remaining for M19: IFE RDI capture — cam_req_mgr CREATE_SESSION,
 link csiphy→csid→vfe, CAM_CONFIG_DEV, SCHED_REQ, plus sensor init
 register tables (regSetting array in the metric_imx363 blob,
 169040 bytes @0x01bcb0, holds the streamon register lists).
+
+## M19 camera: FIRST FRAME — IFE/RDI pipeline proven via CSID TPG, no sensor data needed (2026-09-01)
+
+Result first: `/bin/cam-shot --stream --tpg --wait 3000 --out
+/tmp/tpg.raw` on a fresh boot returns rc=0 with a full 2,525,600 B
+frame (1640x1232 RAW10, stride 2050) DMA-written by the IFE RDI path,
+fence signaled, no IRQ storm. The userspace-driven IFE route is proven
+end to end: CREATE_SESSION -> ACQUIRE (sensor+csiphy+isp) -> LINK ->
+sensor INIT/CONFIG -> ISP INIT/CONFIG/UPDATE (fence) -> SCHED_REQ ->
+START -> SYNC_WAIT signaled. Everything below is what stood between
+the old "sync timeout" runs and this frame.
+
+1. **--tpg mode** (new cam-shot flag): in_port->res_type =
+   CAM_ISP_IFE_IN_RES_TPG (0x4000) at IFE ACQUIRE_HW. The kernel then
+   skips csi2_rx_cfg.phy_sel, arms the CSID's internal test generator
+   (cam_ife_csid_config_tpg: VC 0xA / DT 0x2B fixed, width<<16|height
+   from in_port, split color bar), and RDI0's CID is (0xA, 0x2B).
+   Sensor/csiphy are never streamed. First TPG attempt on the old
+   8-hour boot timed out with the familiar storm signature (RX
+   0x1100033 = ECC+UNBOUNDED+DL0/DL1 SOT, RDI0 0x1000, evt "idx 2
+   err 5 phy 2"). Decode of that signature (cam_ife_csid_core.h):
+   RDI0 0x1000 is CSID_PATH_INFO_INPUT_SOF — NOT an error: RDI0 was
+   already receiving frame starts. The RX bits are expected noise:
+   the RX block is configured and its IRQs enabled unconditionally,
+   even in TPG mode, against a stale phy_sel with a powered-but-idle
+   sensor on it (the kernel powers the sensor up inside ACQUIRE_DEV).
+
+2. **Fresh-boot trap: sensor ACQUIRE_DEV EINVAL.** On a clean boot
+   --tpg died at `sensor ACQUIRE_DEV: Invalid argument`. Kernel:
+   cam_sensor_core.c CAM_ACQUIRE_DEV rejects while is_probe_succeed
+   == 0 — the old boot had earlier sensor-mode runs that had probed;
+   a fresh boot has not. Fix: --tpg still runs the real I2C probe
+   (unchanged code); only regs-after-probe stay mode-dependent.
+
+3. **The actual deadlock — per-frame NOP dropped by state, Skip
+   Frame forever.** With probe+acquire fixed, streaming still timed
+   out but the log now said, at every SOF:
+   `Skip Frame: req: 1 not ready on link 0x3c0304 for pd: 2 dev:
+   cam-sensor open_req count: 1`. Kernel chain: the NOP opcode
+   handler (cam_sensor_i2c_pkt_parse) silently drops our req-1 nop
+   while sensor_state is INIT/ACQUIRE ("Rxed NOP packets without
+   linking"), so cam_sensor_update_req_mgr never registers req 1 for
+   cam-sensor; the req mgr then refuses to apply req 1 to ANY device
+   on the link — including the ISP request that carries our fence.
+   Sensor state only reaches CAM_SENSOR_CONFIG when a CONFIG packet
+   with real i2c settings is applied. Fix: --tpg now runs the same
+   global-INIT + mode-CONFIG packets as sensor mode (harmless,
+   already-exercised writes); only the STREAMON packet, csiphy
+   config/start and sensor START stay skipped. Next run: fence
+   signaled, buffer nonzero, frame dumped. This very likely explains
+   the sensor-mode timeouts too (there the state was CONFIG, but the
+   sensor never emitted — the missing register tables remain the
+   sensor-mode blocker, now the ONLY one left).
+
+4. **Frame content (observed, decoded on host):** static split color
+   bar exactly as the kernel's TPG config programs it — pixel levels
+   clean 10-bit 1020/0 (white/black, no noise), rows 0–615 begin with
+   410 white pixels, rows 616–1231 begin with 410 black (halves
+   inverted), a 1-pixel alternating band between, row N identical
+   across the frame (static). 1,010,240 nonzero bytes = 820 nonzero
+   pixels/row exactly. csid-lite IRQ line: 12 interrupts total for
+   the whole run (the old storm was 1.9M+ per boot).
+
+5. **IRQ baseline reset:** the 1,924,669 accumulated csid-lite count
+   was boot-lifetime accumulation of teardown storms on the old
+   8-hour boot, not a live fault — fresh boot shows 0 before, 12
+   after the TPG capture.
+
+Device state: our rootfs on patched vendor_boot (unchanged this
+session), camera stack via camera-bringup rcS, /bin/cam-shot =
+--tpg-capable build, debug_mdl=0, csiphy_dump=0 (fresh-boot
+defaults, verified). Remaining for M19 real capture: the sensor
+register tables (rear imx363 metric bin holds them — decode the
+Parameter Parser V2 blob — or capture stock-Android I2C traffic).
