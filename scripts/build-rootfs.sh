@@ -188,6 +188,8 @@ fi
 mkdir -p "${TREE}/bin" "${TREE}/sbin" "${TREE}/aginxos"
 cp "${RECIPE}/busybox" "${TREE}/bin/busybox"
 cp -R "${RECIPE}/etc/." "${TREE}/etc/"
+# version stamp (M14): what the running image is, for agupd status/compare.
+{ git -C "${ROOT}" log -1 --format="aginxos %h %cd" --date=short 2>/dev/null || echo "aginxos unknown"; } > "${TREE}/etc/aginx-version"
 mkdir -p "${TREE}/usr/bin"
 cp -R "${RECIPE}/usr/bin/." "${TREE}/usr/bin/"
 # agdl (M10) — the only working HTTPS fetcher on the phone; agpkg sync and
@@ -203,6 +205,10 @@ cp "${TARGET}/wifi-wizard" "${TREE}/usr/bin/wifi-wizard"
 # /run/svc/ctl.sock, and agboot-ok which marks the slot boot-successful
 # so ABL's retry counter stops draining us into fastboot.
 cp "${TARGET}/agsvc" "${TARGET}/agctl" "${TARGET}/agboot-ok" "${TREE}/usr/bin/"
+# updater (M14) — A/B self-update: pulls a manifest, writes the inactive
+# slot, flips it active (agboot-ok set-active), reboots; rollback rides on
+# ABL's tries counter as above.
+cp "${TARGET}/agupd" "${TREE}/usr/bin/agupd"
 chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/touch-bringup" "${TREE}/etc/init.d/battery-bringup" \
   "${TREE}/etc/init.d/radio-bringup" "${TREE}/etc/init.d/audio-bringup" \
@@ -212,7 +218,8 @@ chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/camera-bringup" "${TREE}/etc/init.d/cell-bringup" \
   "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdl" "${TREE}/usr/bin/aterm" \
   "${TREE}/usr/bin/wifi-wizard" "${TREE}/usr/bin/agsvc" \
-  "${TREE}/usr/bin/agctl" "${TREE}/usr/bin/agboot-ok"
+  "${TREE}/usr/bin/agctl" "${TREE}/usr/bin/agboot-ok" \
+  "${TREE}/usr/bin/agupd"
 # NB: wifi.conf.example rides along in ${RECIPE}/etc — the real
 # /etc/wifi.conf (with the passphrase) is pushed by hand, never committed.
 cp "${TARGET}/aginxos-init" "${TARGET}/aginxos-agent" "${TREE}/aginxos/"

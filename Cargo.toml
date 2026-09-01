@@ -6,6 +6,7 @@ members = [
     "crates/aginxos-init",
     "crates/agdl",
     "crates/agsvc",
+    "crates/agupd",
     "crates/aterm",
     "crates/wifi-wizard",
 ]
