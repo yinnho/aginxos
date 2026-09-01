@@ -258,8 +258,17 @@ struct cam_isp_sensor_config_blob {
 #define CAM_ISP_IFE_IN_RES_BASE 0x4000
 #define CAM_ISP_IFE_IN_RES_PHY_2  0x4003  /* = BASE+3: phy idx 2 (front) */
 #define CAM_ISP_IFE_OUT_RES_RDI_0 0x3006
+#define CAM_ISP_IFE_OUT_RES_FULL 0x3000
+#define CAM_ISP_IFE_OUT_RES_RAW_DUMP 0x3003
 /* ISP packet meta / blob types — cam_isp.h */
 #define CAM_ISP_PACKET_META_BASE              0
+/* raw CDM command payload, appended verbatim as a CDM BL entry
+ * (cam_isp_add_command_buffers: META_COMMON -> hw_update_entry, CAM_ISP_IQ_BL).
+ * This is the only way userspace reaches the VFE ISP modules (BLS/demosaic/
+ * gamma/CCM/CSC and the module CGC overrides) — the kernel never programs
+ * them itself. Payload must carry its own ChangeBase (base = the acquired
+ * IFE's camera-SS-relative reg base, e.g. IFE1 = 0xB6000). */
+#define CAM_ISP_PACKET_META_COMMON            3
 #define CAM_ISP_PACKET_META_GENERIC_BLOB_COMMON 12
 #define CAM_ISP_GENERIC_BLOB_TYPE_HFR_CONFIG            0
 #define CAM_ISP_GENERIC_BLOB_TYPE_CLOCK_CONFIG          1
@@ -267,6 +276,8 @@ struct cam_isp_sensor_config_blob {
 #define CAM_ISP_GENERIC_BLOB_TYPE_SENSOR_DIMENSION_CONFIG 11
 /* formats — cam_defs.h */
 #define CAM_FORMAT_MIPI_RAW_10 3
+#define CAM_FORMAT_PLAIN16_10 14
+#define CAM_FORMAT_NV12 32
 
 /* cam_sync — uapi cam_sync.h (video4). NB: _IOWR('V',192,24) encodes to the
  * same nr as VIDIOC_CAM_CONTROL; the sync node reads cam_private_ioctl_arg. */
@@ -1971,6 +1982,31 @@ static int g_bw;
  * UNMAPPED_VC_DT and drops every line → STREAM_UNDERFLOW, zero buffer. */
 static uint32_t g_vc = 0;
 static uint32_t g_dt = 0x2B;   /* RAW10 */
+/* --pix: IFE PIX processing path instead of the RDI raw dump. Out res
+ * CAM_ISP_IFE_OUT_RES_FULL + NV12 (two write masters: Y w x h, C w x h/2)
+ * makes the hw mgr acquire the CSID IPP (preprocess_port: any non-RDI,
+ * non-2PD/LCR out counts as ipp) -> VFE CAMIF -> the hardware ISP module
+ * chain. The kernel wires CAMIF/top/bus only — cam_vfe_top_ver2.c and
+ * cam_vfe_camif_ver2.c contain NO module programming (no black level, WB,
+ * demosaic, gamma, CCM writes anywhere), and the hw-mgr blob list has no
+ * module-setting blobs: the module register config is expected as raw CDM
+ * command payloads from userspace (CAM_ISP_PACKET_META_COMMON cmd bufs,
+ * what stock CHI ships from Chromatix). First light runs kernel-config
+ * only and observes what an unconfigured module chain does. */
+static int g_pix;
+/* --pix-raw: PIX context (CSID IPP -> CAMIF -> CGC unlock) but the bus out
+ * is RAW_DUMP + PLAIN16_10 — a tap upstream of the demosaic/gamma/CCM/CSC
+ * chain. Diagnostic bisect: if RAW_DUMP lands a frame while FULL/NV12 stays
+ * silent, the blocker is the unconfigured module chain, not the CAMIF link. */
+static int g_pixraw;
+/* camera-SS-relative reg base of the IFE the hw mgr actually acquired, for
+ * the ChangeBase word in userspace CDM payloads. Verified from the kernel's
+ * own kmd CDM dump: PIX lands on IFE1 (acquire print "Acquired single
+ * IFE[1 -1]"), whose changebase word is 0x08_0B6000. Overridable for
+ * --force-ife experiments once IFE0's base is measured. */
+static uint32_t g_ife_base = 0x0B6000u;
+/* pix-mode geometry (run_stream sets; fill_out_io reads) */
+static uint32_t g_pw, g_ph, g_pstride, g_pcoff;
 
 /* per (mclk, lanes) PLL tuple: [mpy, prediv, sysck, link_total, lane_sel] */
 static void pll_params(uint32_t *m19)
@@ -2426,6 +2462,24 @@ static size_t process_frame(const uint8_t *map, size_t len,
 {
     char fpath[512];
     frame_path(fpath, sizeof fpath, out_path, frameno, total);
+    if (g_pix && !g_pixraw) {
+        /* first light: dump the NV12 raw and report Y/C coverage — the
+         * PNG/JPEG paths assume RAW10 geometry. Decode on host until the
+         * PIX output is trusted. */
+        size_t nz = inspect_buf(map, len, fpath, "pix");
+        if (nz) {
+            size_t yn = (size_t)g_pstride * g_ph, cn = (size_t)g_pstride * (g_ph / 2);
+            double sum = 0;
+            for (size_t i = 0; i < yn; i++) sum += map[i];
+            size_t cs = 0;
+            const uint8_t *c = map + g_pcoff;
+            for (size_t i = 0; i < cn; i++)
+                if (c[i]) cs++;
+            printf("pix frame %d/%d: Y mean %.1f, C nonzero %zu/%zu\n",
+                   frameno, total, sum / (double)yn, cs, cn);
+        }
+        return nz;
+    }
     size_t nz = inspect_buf(map, len, dump_raw ? fpath : NULL, "frame");
     if (nz && g_png) {
         char ppath[512];
@@ -2479,15 +2533,19 @@ static int sensor_nop(int video_fd, int sd_fd, struct shot_bufs *b,
 }
 
 /* IFE packet builder. num_cmd = 1 (kmd only, length 0 => whole buf is KMD
- * scratch for CDM commands) or 2 (kmd + generic-blob cmd, meta 12).
+ * scratch for CDM commands), 2 (kmd + generic-blob cmd, meta 12) or 3 (kmd +
+ * blob + raw CDM payload cmd, meta 3 — the userspace ISP-module programming
+ * channel; only the INIT packet uses it). The CDM payload words sit right
+ * after the blob in the [0, half) region.
  * io_cfg: optional output port entry. */
 static int isp_config(int video_fd, int isp_fd, struct shot_bufs *b,
                       uint32_t session, uint32_t dev_hdl, uint32_t op,
-                      int64_t req_id, size_t blob_len, int n_io,
-                      const struct cam_buf_io_cfg *io)
+                      int64_t req_id, size_t blob_len,
+                      const uint32_t *cdm, uint32_t cdm_words,
+                      int n_io, const struct cam_buf_io_cfg *io)
 {
     memset(b->p_pkt, 0, 1024);
-    int ndesc = blob_len ? 2 : 1;
+    int ndesc = 1 + (blob_len ? 1 : 0) + (cdm_words ? 1 : 0);
     struct cam_packet *pk = b->p_pkt;
     pk->header.op_code = op;
     pk->header.request_id = (uint64_t)req_id;
@@ -2498,9 +2556,10 @@ static int isp_config(int video_fd, int isp_fd, struct shot_bufs *b,
     pk->kmd_cmd_buf_index = 0;
     pk->kmd_cmd_buf_offset = 0;
     struct cam_cmd_buf_desc *d = (void *)pk->payload;
-    /* cmd buffer layout: [0, half) carries the blob payload (desc 1),
-     * [half, cap) is kmd scratch where the hw mgr builds CDM commands.
-     * desc 0 (kmd) has length 0 -> add_command_buffers skips it. */
+    /* cmd buffer layout: [0, half) carries the blob payload (desc 1) and the
+     * raw CDM payload (desc 2), [half, cap) is kmd scratch where the hw mgr
+     * builds CDM commands. desc 0 (kmd) has length 0 -> add_command_buffers
+     * skips it. */
     uint32_t half = (uint32_t)(b->cmd_cap / 2);
     d[0].mem_handle = (int32_t)b->cmd.out.buf_handle;
     d[0].offset = half;
@@ -2512,6 +2571,18 @@ static int isp_config(int video_fd, int isp_fd, struct shot_bufs *b,
         d[1].size = half;
         d[1].length = (uint32_t)blob_len;
         d[1].meta_data = CAM_ISP_PACKET_META_GENERIC_BLOB_COMMON;
+    }
+    if (cdm_words) {
+        int di = blob_len ? 2 : 1;
+        d[di].mem_handle = (int32_t)b->cmd.out.buf_handle;
+        d[di].offset = (uint32_t)blob_len;  /* right after the blob */
+        d[di].size = half - (uint32_t)blob_len;
+        d[di].length = cdm_words * 4;
+        d[di].meta_data = CAM_ISP_PACKET_META_COMMON;
+        /* the desc points into the mapped cmd buffer — the payload itself
+         * must live there (first run left it on the stack: the CDM fetched
+         * zeros at the BL iova and raised Invalid-command, 2026-09-02). */
+        memcpy((uint8_t *)b->p_cmd + blob_len, cdm, cdm_words * 4);
     }
     if (n_io) {
         pk->io_configs_offset =
@@ -2537,6 +2608,62 @@ static size_t blob_add(uint8_t *p, uint32_t type, const void *payload,
     size_t pad = (4 - (len & 3)) & 3;
     memset(p + 4 + len, 0, pad);
     return 4 + len + pad;
+}
+
+/* output io config for one request. RDI: single-plane RAW10. PIX: NV12 with
+ * Y and C declared as two planes of the same buffer (the kernel's plane loop
+ * breaks at mem_handle 0; same handle twice = two planes). bus_ver2 takes
+ * each plane's stride/slice_height from here and checks the stride is
+ * 16-aligned (cam_vfe_bus_ver2_update_wm). */
+static void fill_out_io(struct cam_buf_io_cfg *io, uint32_t buf_handle,
+                        uint32_t fence, uint32_t width, uint32_t height,
+                        uint32_t raw_stride)
+{
+    memset(io, 0, sizeof(*io));
+    io->fence = (int32_t)fence;
+    io->direction = CAM_BUF_OUTPUT;
+    io->subsample_pattern = 1;
+    io->subsample_period = 1;
+    io->framedrop_pattern = 1;
+    io->framedrop_period = 1;
+    if (g_pixraw) {
+        /* RAW_DUMP tap: single plane, 2 B/px, upstream of the YUV chain */
+        io->mem_handle[0] = (int32_t)buf_handle;
+        io->offsets[0] = 0;
+        io->planes[0].width = width;
+        io->planes[0].height = height;
+        io->planes[0].plane_stride = g_pstride;
+        io->planes[0].slice_height = height;
+        io->format = CAM_FORMAT_PLAIN16_10;
+        io->bpp = 16;
+        io->resource_type = CAM_ISP_IFE_OUT_RES_RAW_DUMP;
+    } else if (g_pix) {
+        io->mem_handle[0] = (int32_t)buf_handle;
+        io->mem_handle[1] = (int32_t)buf_handle;
+        io->offsets[0] = 0;
+        io->offsets[1] = g_pcoff;
+        io->planes[0].width = width;
+        io->planes[0].height = height;
+        io->planes[0].plane_stride = g_pstride;
+        io->planes[0].slice_height = height;
+        io->planes[1].width = width;
+        io->planes[1].height = height / 2;
+        io->planes[1].plane_stride = g_pstride;
+        io->planes[1].slice_height = height / 2;
+        io->format = CAM_FORMAT_NV12;
+        io->bpp = 8;
+        io->resource_type = CAM_ISP_IFE_OUT_RES_FULL;
+    } else {
+        io->mem_handle[0] = (int32_t)buf_handle;
+        io->offsets[0] = 0;
+        io->planes[0].width = width;
+        io->planes[0].height = height;
+        io->planes[0].plane_stride = raw_stride;
+        io->planes[0].slice_height = height;
+        io->format = CAM_FORMAT_MIPI_RAW_10;
+        io->bpp = 10;
+        io->resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
+    }
 }
 
 static int run_stream(int slot, const char *out_path, int wait_ms,
@@ -2604,7 +2731,20 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
         }
     }
     const uint32_t dt = g_dt;
-    const uint64_t pixbuf_len = (uint64_t)stride * height;
+    /* pix-mode geometry first (NV12 in one buffer: Y plane w x h at offset 0,
+     * C plane w x ceil(h/2) at a 4K-aligned offset after Y — bus_ver2 takes
+     * both plane addresses from the io config and halves the C-plane WM
+     * height itself, cam_vfe_bus_ver2_get_res: PLANE_C height /= 2). */
+    g_pw = width; g_ph = height;
+    /* pix-mode plane stride: NV12 Y stride (1 B/px) or RAW_DUMP PLAIN16_10
+     * (2 B/px). ALIGNUP 16 — kernel warns otherwise. */
+    g_pstride = g_pixraw ? ((width * 2 + 15) & ~15u) : ((width + 15) & ~15u);
+    g_pcoff = (g_pstride * height + 4095u) & ~4095u;
+    const uint64_t pixbuf_len = g_pixraw
+        ? (uint64_t)g_pstride * height
+        : g_pix
+        ? (uint64_t)g_pcoff + (uint64_t)g_pstride * ((height + 1) / 2)
+        : (uint64_t)stride * height;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     video_fd = open("/dev/video3", O_RDWR);
@@ -2613,8 +2753,10 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     if (kmsg >= 0)
         kt = kmsg_drain(kmsg, 0);
 
-    printf("== stream slot %d (%s), %ux%u RAW10 (stride %u) ==\n",
-        slot, slots[slot].name, width, height, stride);
+    printf("== stream slot %d (%s), %ux%u %s (stride %u) ==\n",
+        slot, slots[slot].name, width, height,
+        g_pix ? (g_pixraw ? "PLAIN16 via PIX RAW_DUMP" : "NV12 via IFE PIX")
+              : "RAW10 RDI", g_pix ? g_pstride : stride);
 
     /* locate the three nodes: sensor by slot; its querycap says which
      * csiphy index serves that slot; isp by entity type */
@@ -2802,7 +2944,9 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     port->vc = g_vc;
     port->dt = dt;                    /* RAW10 */
     port->format = CAM_FORMAT_MIPI_RAW_10;
-    port->test_pattern = 0;           /* TPG: incremental data */
+    port->test_pattern = 0;           /* PIX: Bayer phase RGRGRG = RGGB
+                                       * (CAM_ISP_PATTERN_BAYER_RGRGRG;
+                                       * feeds core_cfg's pixel_pattern) */
     port->usage_type = 0;             /* single IFE */
     port->left_start = 0;
     port->left_stop = width - 1;
@@ -2812,8 +2956,13 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     port->height = height;
     port->pixel_clk = pixel_clk;      /* imx363 208M / imx355 177.6M */
     port->num_out_res = 1;
-    port->data[0].res_type = CAM_ISP_IFE_OUT_RES_RDI_0;
-    port->data[0].format = CAM_FORMAT_MIPI_RAW_10;
+    port->data[0].res_type = g_pix
+        ? (g_pixraw ? CAM_ISP_IFE_OUT_RES_RAW_DUMP
+                    : CAM_ISP_IFE_OUT_RES_FULL)
+        : CAM_ISP_IFE_OUT_RES_RDI_0;
+    port->data[0].format = g_pix
+        ? (g_pixraw ? CAM_FORMAT_PLAIN16_10 : CAM_FORMAT_NV12)
+        : CAM_FORMAT_MIPI_RAW_10;
     port->data[0].width = width;
     port->data[0].height = height;
 
@@ -3217,6 +3366,15 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
          * fifo starves when the core clock can't keep up with the incoming
          * byte stream. Real-PHY modes run 800M csid / 600M rdi. */
         cc.rdi_hz[0] = g_tpg ? 400000000 : 600000000;
+        if (g_pix) {
+            /* PIX path clock vote: cam_isp_blob_clock_update applies
+             * left_pix_hz to the CAMIF src resource; 0 would leave the
+             * processing chain under-clocked (first guess 600M — the
+             * sdm845-class vendor PIX vote; kmsg cam_ife_clock lines will
+             * tell if the apply path disagrees). */
+            cc.left_pix_hz = 600000000;
+            cc.num_rdi = 0;
+        }
         bl += blob_add(blob + bl, CAM_ISP_GENERIC_BLOB_TYPE_CLOCK_CONFIG,
                        &cc, sizeof(cc));
         struct cam_isp_csid_clock_config sc;
@@ -3249,7 +3407,10 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
         struct cam_isp_resource_hfr_config hfr;
         memset(&hfr, 0, sizeof(hfr));
         hfr.num_ports = 1;
-        hfr.port[0].resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
+        hfr.port[0].resource_type = g_pix
+            ? (g_pixraw ? CAM_ISP_IFE_OUT_RES_RAW_DUMP
+                        : CAM_ISP_IFE_OUT_RES_FULL)
+            : CAM_ISP_IFE_OUT_RES_RDI_0;
         hfr.port[0].subsample_pattern = 1;
         /* subsample_period MUST be 0 for per-request buffers. RDI write
          * masters (wm index < 3) take loop_size = irq_subsample_period + 1
@@ -3267,15 +3428,69 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
         memset(&dim, 0, sizeof(dim));
         dim.rdi_path[0].width = width;
         dim.rdi_path[0].height = height;
+        if (g_pix) {
+            /* PIX context reads the ipp path dims for the CSID timing model
+             * (same blob, different member than the RDI path). */
+            dim.ipp_path.width = width;
+            dim.ipp_path.height = height;
+        }
         dim.hbi = hbi;
         dim.vbi = vbi;
         bl += blob_add(blob + bl,
                        CAM_ISP_GENERIC_BLOB_TYPE_SENSOR_DIMENSION_CONFIG,
                        &dim, sizeof(dim));
     }
+    /* PIX mode: userspace CDM payload filling what the techpack kernel never
+     * programs. (a) VFE module CGC: camif start only un-gates STATS, so
+     * LENS/COLOR/ZOOM/bus stay gated (demosaic/gamma/CCM/write masters).
+     * (b) CAMIF geometry + io format: the techpack camif start writes only
+     * core_cfg/epoch/RUP — msm_vfe47_cfg_camif (camera_v2/isp, same register
+     * layout) additionally programs 0x484 pixels_per_line/lines_per_frame,
+     * 0x488/0x48C first/last pixel/line, 0x494/0x498/0x49C subsample
+     * period/patterns and 0x88 io_format (camif raw output pack = PLAIN16).
+     * Without 0x484 the CAMIF has no frame geometry at reset 0: no SOF, no
+     * data forward, zero IPP/CAMIF IRQs — the silent PIX death (observed
+     * 2026-09-01). CAMX sends this same set as CDM IQ commands; this is our
+     * equivalent through the META_COMMON BL channel. */
+    uint32_t cdm_cgc[40];
+    uint32_t ncdm = 0;
+    if (g_pix) {
+        cdm_cgc[ncdm++] = (8u << 24) | (g_ife_base & 0xFFFFFFu);
+        cdm_cgc[ncdm++] = (4u << 24) | 16u; /* RegRandom, 16 pairs */
+        cdm_cgc[ncdm++] = 0x2C; cdm_cgc[ncdm++] = 0xFFFFFFFF; /* LENS cgc  */
+        cdm_cgc[ncdm++] = 0x30; cdm_cgc[ncdm++] = 0xFFFFFFFF; /* STATS cgc */
+        cdm_cgc[ncdm++] = 0x34; cdm_cgc[ncdm++] = 0xFFFFFFFF; /* COLOR cgc */
+        cdm_cgc[ncdm++] = 0x38; cdm_cgc[ncdm++] = 0xFFFFFFFF; /* ZOOM cgc  */
+        cdm_cgc[ncdm++] = 0x3C; cdm_cgc[ncdm++] = 0xFFFFFFFF; /* bus cgc   */
+        /* CAMIF program (msm_vfe47_cfg_camif reference) */
+        cdm_cgc[ncdm++] = 0x088; cdm_cgc[ncdm++] = 0xA00;    /* io_format: PLAIN16(5)<<9 */
+        cdm_cgc[ncdm++] = 0x484;
+        cdm_cgc[ncdm++] = ((height - 1) << 16) | (width - 1);
+        cdm_cgc[ncdm++] = 0x488; cdm_cgc[ncdm++] = width - 1;
+        cdm_cgc[ncdm++] = 0x48C; cdm_cgc[ncdm++] = height - 1;
+        cdm_cgc[ncdm++] = 0x494; cdm_cgc[ncdm++] = 0x1F1F;
+        cdm_cgc[ncdm++] = 0x498; cdm_cgc[ncdm++] = 0xFFFFFFFF;
+        cdm_cgc[ncdm++] = 0x49C; cdm_cgc[ncdm++] = 0xFFFFFFFF;
+        /* input select + enable: msm_vfe47_update_camif_state(ENABLE) writes
+         * 0x4 then 0x1 to camif_cmd; 0x46C selects the MIPI/CSID pixel input
+         * (enum msm_vfe_camif_input CAMIF_MIPI_INPUT=3). Nobody in the
+         * techpack writes either register — without input enable the CAMIF
+         * counts lines (we saw one teardown EOF) but never raises SOF nor
+         * feeds the downstream modules. */
+        cdm_cgc[ncdm++] = 0x46C; cdm_cgc[ncdm++] = 3;
+        cdm_cgc[ncdm++] = 0x478; cdm_cgc[ncdm++] = 0x4;
+        cdm_cgc[ncdm++] = 0x478; cdm_cgc[ncdm++] = 0x1;
+        /* COLOR group master enable (vfe170 top module_ctrl.color.enable):
+         * reset default 0 keeps the whole color pipe off, so the frame dies
+         * after CAMIF and the FULL/DS WMs never write. All-ones turns on
+         * every submodule with their reset-default (unity/bypass) configs. */
+        cdm_cgc[ncdm++] = 0x048; cdm_cgc[ncdm++] = 0xFFFFFFFF;
+    }
     t0 = kt;
     if (isp_config(video_fd, isp_fd, &ib, session, isp_hdl,
-                   0 /* INIT: ((op+1)&0xf)==1 */, 0, bl, 0, NULL) < 0) {
+                   0 /* INIT: ((op+1)&0xf)==1 */, 0, bl,
+                   g_pix ? cdm_cgc : NULL, g_pix ? ncdm : 0,
+                   0, NULL) < 0) {
         fprintf(stderr, "isp INIT packet: %s\n", strerror(errno));
         kt = stream_kmsg(kmsg, t0);
         goto out;
@@ -3319,25 +3534,11 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
             goto out;
         }
         struct cam_buf_io_cfg io;
-        memset(&io, 0, sizeof(io));
-        io.mem_handle[0] = (int32_t)pix[rq - 1].out.buf_handle;
-        io.offsets[0] = 0;
-        io.planes[0].width = width;
-        io.planes[0].height = height;
-        io.planes[0].plane_stride = stride;
-        io.planes[0].slice_height = height;
-        io.format = CAM_FORMAT_MIPI_RAW_10;
-        io.bpp = 10;
-        io.resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
-        io.fence = (int32_t)sync_obj[rq - 1];
-        io.direction = CAM_BUF_OUTPUT;
-        io.subsample_pattern = 1;
-        io.subsample_period = 1;
-        io.framedrop_pattern = 1;
-        io.framedrop_period = 1;
+        fill_out_io(&io, pix[rq - 1].out.buf_handle, sync_obj[rq - 1],
+                    width, height, stride);
         t0 = kt;
         if (isp_config(video_fd, isp_fd, &ub[rq - 1], session, isp_hdl,
-                       1 /* UPDATE */, rq, 0, 1, &io) < 0) {
+                       1 /* UPDATE */, rq, 0, NULL, 0, 1, &io) < 0) {
             fprintf(stderr, "isp UPDATE packet %d: %s\n", rq, strerror(errno));
             kt = stream_kmsg(kmsg, t0);
             goto out;
@@ -3473,26 +3674,12 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
                 goto out;
             }
             struct cam_buf_io_cfg io;
-            memset(&io, 0, sizeof(io));
-            io.mem_handle[0] = (int32_t)pix[rslot].out.buf_handle;
-            io.offsets[0] = 0;
-            io.planes[0].width = width;
-            io.planes[0].height = height;
-            io.planes[0].plane_stride = stride;
-            io.planes[0].slice_height = height;
-            io.format = CAM_FORMAT_MIPI_RAW_10;
-            io.bpp = 10;
-            io.resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
-            io.fence = (int32_t)sync_obj[rslot];
-            io.direction = CAM_BUF_OUTPUT;
-            io.subsample_pattern = 1;
-            io.subsample_period = 1;
-            io.framedrop_pattern = 1;
-            io.framedrop_period = 1;
+            fill_out_io(&io, pix[rslot].out.buf_handle, sync_obj[rslot],
+                        width, height, stride);
             printf("[t=%.3f] req %d: UPDATE packet\n", mono(), rq);
             t0 = kt;
             if (isp_config(video_fd, isp_fd, &ub[rslot], session, isp_hdl,
-                           1 /* UPDATE */, rq, 0, 1, &io) < 0) {
+                           1 /* UPDATE */, rq, 0, NULL, 0, 1, &io) < 0) {
                 fprintf(stderr, "isp UPDATE packet %d: %s\n", rq,
                         strerror(errno));
                 kt = stream_kmsg(kmsg, t0);
@@ -3557,25 +3744,11 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
                 goto out;
             }
             struct cam_buf_io_cfg io;
-            memset(&io, 0, sizeof(io));
-            io.mem_handle[0] = (int32_t)pix[slot].out.buf_handle;
-            io.offsets[0] = 0;
-            io.planes[0].width = width;
-            io.planes[0].height = height;
-            io.planes[0].plane_stride = stride;
-            io.planes[0].slice_height = height;
-            io.format = CAM_FORMAT_MIPI_RAW_10;
-            io.bpp = 10;
-            io.resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
-            io.fence = (int32_t)sync_obj[slot];
-            io.direction = CAM_BUF_OUTPUT;
-            io.subsample_pattern = 1;
-            io.subsample_period = 1;
-            io.framedrop_pattern = 1;
-            io.framedrop_period = 1;
+            fill_out_io(&io, pix[slot].out.buf_handle, sync_obj[slot],
+                        width, height, stride);
             t0 = kt;
             if (isp_config(video_fd, isp_fd, &ub[slot], session, isp_hdl,
-                           1 /* UPDATE */, rq, 0, 1, &io) < 0) {
+                           1 /* UPDATE */, rq, 0, NULL, 0, 1, &io) < 0) {
                 fprintf(stderr, "isp UPDATE packet %d: %s\n", rq,
                         strerror(errno));
                 kt = stream_kmsg(kmsg, t0);
@@ -3823,6 +3996,8 @@ int main(int argc, char **argv)
                 return 2;
             }
         }
+        else if (strcmp(argv[i], "--ife-base") == 0 && i + 1 < argc)
+            g_ife_base = (uint32_t)strtoul(argv[++i], 0, 0);
         else if (strcmp(argv[i], "--lanes") == 0 && i + 1 < argc) {
             g_lanes = atoi(argv[++i]);
             if (g_lanes != 2 && g_lanes != 4) {
@@ -3832,6 +4007,12 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--rb") == 0)
             rb = 1;
+        else if (strcmp(argv[i], "--pix") == 0)
+            g_pix = 1;
+        else if (strcmp(argv[i], "--pix-raw") == 0) {
+            g_pix = 1;
+            g_pixraw = 1;
+        }
         else if (strcmp(argv[i], "--verify") == 0)
             g_verify = 1;
         else if (strcmp(argv[i], "--bw") == 0)
