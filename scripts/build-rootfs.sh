@@ -86,6 +86,12 @@ mkdir -p "${TREE}/bin"
   -o "${TREE}/bin/qrtr-lookup" "${RECIPE}/src/qrtr-lookup.c"
 "${ZIG}" cc -target aarch64-linux-musl -static -O2 \
   -o "${TREE}/bin/qmi-req" "${RECIPE}/src/qmi-req.c"
+# cam-shot (M19) — the IFE/RDI stills capture tool. Vendor sensor register
+# tables are decoded into the source; vendor module bins stay local and
+# gitignored. Default flags for a rear shot: --stream --rear --slowrear
+# --rawvendor [--gain N] [--png].
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/cam-shot" "${RECIPE}/src/cam-shot.c"
 
 # Bionic LD_PRELOAD helpers (M3d). These load into vendor binaries, so they
 # must be NDK/bionic shared objects, not musl. trace_open.so mirrors file
@@ -199,6 +205,7 @@ chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/net-bringup" \
   "${TREE}/etc/init.d/app-registry" "${TREE}/etc/init.d/provision" \
   "${TREE}/etc/init.d/aterm-handoff" \
+  "${TREE}/etc/init.d/camera-bringup" "${TREE}/etc/init.d/cell-bringup" \
   "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdl" "${TREE}/usr/bin/aterm" \
   "${TREE}/usr/bin/wifi-wizard" "${TREE}/usr/bin/agsvc" \
   "${TREE}/usr/bin/agctl" "${TREE}/usr/bin/agboot-ok"
