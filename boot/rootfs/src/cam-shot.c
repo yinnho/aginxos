@@ -1914,6 +1914,11 @@ static int g_png;             /* also write /tmp/frame.png (gray8) */
  * path with .raw swapped for .jpg. */
 static int g_jpeg_q;
 static int g_jpeg_color = 1;
+/* white balance: gray-world auto by default (imx363 measures G/R=1.58,
+ * G/B=1.51 with no WB — the RGGB G-double-sample cast, 2026-09-01);
+ * --wb r,g,b takes over manually, --wb off disables */
+static int g_wb_auto = 1;
+static float g_wb_r = 1.0f, g_wb_g = 1.0f, g_wb_b = 1.0f;
 static const char *g_jpeg_out;
 /* --frames N: queue N requests back-to-back before START (burst). Each
  * frame gets its own pixel buffer + fence; fences are waited in order
@@ -2266,7 +2271,38 @@ static uint8_t cs_at(const uint8_t *g, uint32_t w, uint32_t h,
     return g[(size_t)y * w + (size_t)x];
 }
 
-static uint8_t *cs_debayer(const uint8_t *g, uint32_t w, uint32_t h)
+/* gray-world white balance: per-site means of the RGGB pattern (R at
+ * even/even, B at odd/odd, G on the cross), gains normalizing all three
+ * to the brightest site mean — brightness is preserved (gains >= 1) so
+ * this never darkens the exposure we tuned with --gain/--dgain */
+static void wb_measure(const uint8_t *g, uint32_t w, uint32_t h, float wb[3])
+{
+    double sr = 0, sg = 0, sb = 0;
+    uint64_t nr = 0;
+    for (uint32_t y = 0; y + 1 < h; y += 2)
+        for (uint32_t x = 0; x + 1 < w; x += 2) {
+            size_t i0 = (size_t)y * w + x;
+            sr += g[i0];
+            sg += g[i0 + 1] + g[i0 + w];   /* 2 G samples per quad */
+            sb += g[i0 + w + 1];
+            nr++;
+        }
+    if (!nr) { wb[0] = wb[1] = wb[2] = 1.0f; return; }
+    double mr = sr / nr, mg = sg / (2.0 * nr), mb = sb / nr;
+    if (mr < 1.0 || mg < 1.0 || mb < 1.0) {
+        wb[0] = wb[1] = wb[2] = 1.0f;      /* black frame — nothing to balance */
+        return;
+    }
+    double top = mr > mg ? (mr > mb ? mr : mb) : (mg > mb ? mg : mb);
+    wb[0] = (float)(top / mr);
+    wb[1] = (float)(top / mg);
+    wb[2] = (float)(top / mb);
+    for (int k = 0; k < 3; k++)
+        if (wb[k] > 4.0f) wb[k] = 4.0f;    /* keep tinted scenes sane */
+}
+
+static uint8_t *cs_debayer(const uint8_t *g, uint32_t w, uint32_t h,
+                           const float wb[3])
 {
     uint8_t *rgb = malloc((size_t)w * h * 3);
     if (!rgb) return NULL;
@@ -2296,8 +2332,13 @@ static uint8_t *cs_debayer(const uint8_t *g, uint32_t w, uint32_t h)
                 B = (l + r) / 2;
                 R = (u + d) / 2;
             }
+            int Rc = (int)(R * wb[0] + 0.5f);
+            int Gc = (int)(G * wb[1] + 0.5f);
+            int Bc = (int)(B * wb[2] + 0.5f);
             uint8_t *p = rgb + ((size_t)y * w + x) * 3;
-            p[0] = (uint8_t)R; p[1] = (uint8_t)G; p[2] = (uint8_t)B;
+            p[0] = (uint8_t)(Rc > 255 ? 255 : Rc);
+            p[1] = (uint8_t)(Gc > 255 ? 255 : Gc);
+            p[2] = (uint8_t)(Bc > 255 ? 255 : Bc);
         }
     return rgb;
 }
@@ -2324,7 +2365,12 @@ static void dump_jpeg(const uint8_t *rdi, uint32_t w, uint32_t h,
     if (!out) { fprintf(stderr, "jpeg: no mem for %zu B out\n", cap); free(g); return; }
     ssize_t n;
     if (g_jpeg_color) {
-        uint8_t *rgb = cs_debayer(g, w, h);
+        float wb[3] = { g_wb_r, g_wb_g, g_wb_b };
+        if (g_wb_auto) {
+            wb_measure(g, w, h, wb);
+            printf("wb: auto r=%.2f g=%.2f b=%.2f\n", wb[0], wb[1], wb[2]);
+        }
+        uint8_t *rgb = cs_debayer(g, w, h, wb);
         free(g);
         if (!rgb) { fprintf(stderr, "jpeg: no mem for rgb\n"); free(out); return; }
         n = jpeg_encode_rgb24(rgb, (int)w, (int)h, (int)w * 3, g_jpeg_q,
@@ -3829,6 +3875,24 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--jpeg-out") == 0 && i + 1 < argc)
             g_jpeg_out = argv[++i];
+        else if (strcmp(argv[i], "--wb") == 0 && i + 1 < argc) {
+            const char *s = argv[++i];
+            if (!strcmp(s, "auto")) {
+                g_wb_auto = 1;
+            } else if (!strcmp(s, "off")) {
+                g_wb_auto = 0;
+                g_wb_r = g_wb_g = g_wb_b = 1.0f;
+            } else {
+                float r, gg, b;
+                if (sscanf(s, "%f,%f,%f", &r, &gg, &b) != 3 ||
+                    r <= 0 || gg <= 0 || b <= 0) {
+                    fprintf(stderr, "--wb: auto | off | r,g,b\n");
+                    return 2;
+                }
+                g_wb_auto = 0;
+                g_wb_r = r; g_wb_g = gg; g_wb_b = b;
+            }
+        }
         else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             g_frames = atoi(argv[++i]);
             if (g_frames < 1 || g_frames > 999) {
