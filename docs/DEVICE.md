@@ -195,6 +195,19 @@ crates/periph/
   2. **解锁 + root**（Pixel 解锁最松，`fastboot flashing unlock`
      一条命令）：完整 rootfs 常驻、开机自启、功耗曲线；再往上可
      刷 pmOS（sm7250 mainline 支持好）体验裸 Linux 形态
+- **proot/chroot 分层铁律**（seg6 CMF Phone 1 手机服务器实战课，
+  2026-09）：proot 的用户态 syscall 翻译开销对进程启动频繁/文件
+  访问密集的负载会成为瓶颈（其场景 Chrome 失真明显），同一套
+  文件系统 root 后换真 chroot 性能即恢复。落到我们：
+  **proot 层只测功能正确性**（流程跑通与否），**一切性能/功耗
+  数字（ffmpeg 转码、whisper 推理耗时）必须在 chroot 层测**才可
+  外推 RK3576——文件系统同一个，只换挂载方式
+- **pmOS 降级为条件项**：同篇实测 CMF Phone 1 刷 pmOS 后 Wi-Fi/
+  蓝牙/硬加速全废且黑砖一次——mainline 支持质量逐机型差异巨大，
+  Pixel 5（sm7250）须先确认社区成熟度再动，非默认步骤
+- **Tailscale 做 SSH 运维通道**：阶段 -1 手机在家 NAT 后面，
+  ssh 进不去就没法远程调试；真机上等价物是 relay 长连接，但
+  阶段 -1 调试期 Tailscale 最省事
 - **五官不在旧手机上测**：摄像头/音频驱动是 RK3576 平台的事，
   旧手机验证不了；要测走 USB 外设（OTG）顶，正式验证在阶段 0
 - 两个坑：插电常驻配 ACC 限充 80% 防鼓包；Termux 被杀后台用
