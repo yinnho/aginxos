@@ -1447,6 +1447,14 @@ static int find_sensor_nodes(int sd_slot_fd[MAX_SUBDEV], int sd_slot[MAX_SUBDEV]
 
 /* ============ v1: one RAW frame through cam_req_mgr / IFE RDI ============ */
 
+/* monotonic seconds — kmsg ts is the same clock in us, so prints align */
+static double mono(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
 /* kmsg tail for streaming: print every camera-stack line */
 static double stream_kmsg(int fd, double since_us)
 {
@@ -1470,7 +1478,7 @@ static double stream_kmsg(int fd, double since_us)
             continue;
         char *semi = strchr(buf, ';');
         if (semi && strstr(semi, "CAM-"))
-            printf("    kmsg: %s", semi + 1);
+            printf("    kmsg[%9.3f]: %s", ts / 1e6, semi + 1);
     }
     return max;
 }
@@ -1907,6 +1915,14 @@ static int g_png;             /* also write /tmp/frame.png (gray8) */
 static int g_jpeg_q;
 static int g_jpeg_color = 1;
 static const char *g_jpeg_out;
+/* --frames N: queue N requests back-to-back before START (burst). Each
+ * frame gets its own pixel buffer + fence; fences are waited in order
+ * (frames land at sensor frame rate). Outputs gain a -<i> suffix. */
+static int g_frames = 1;
+/* --roll: queue req i+1 only after fence i signals (rolling submission)
+ * instead of pre-queueing all N before START. Default 0 — rolling loses
+ * the SOF race (see the queue-section note). */
+static int g_roll;
 
 /* replace-or-append one byte register in a CONFIG table (cfg_regs is sized
  * 128; callers stay far below that) */
@@ -2337,6 +2353,26 @@ static void dump_jpeg(const uint8_t *rdi, uint32_t w, uint32_t h,
            (double)n * 8 / ((double)w * h), t, path);
 }
 
+/* dump the kernel-built CDM command region of an UPDATE packet's kmd
+ * scratch: the RDI write-master base address lives in there. Scan u32s for
+ * IOVA-looking values plus a raw prefix for eyeballing. */
+static void dump_kmd(struct shot_bufs *b, int req)
+{
+    uint32_t half = (uint32_t)(b->cmd_cap / 2);
+    uint32_t *k = (uint32_t *)((uint8_t *)b->p_cmd + half);
+    printf("    kmd[%d] aligned iova-like:", req);
+    for (uint32_t i = 0; i < 64; i++)
+        if (k[i] >= 0xd0000000u && k[i] < 0xf0000000u && (k[i] & 0xfff) == 0)
+            printf(" [%u]=0x%x", i, k[i]);
+    printf(" | near:");
+    for (uint32_t i = 0; i < 64; i++)
+        if (k[i] >= 0xd0000000u && k[i] < 0xf0000000u && (k[i] & 0xfff))
+            printf(" [%u]=0x%x", i, k[i]);
+    printf("\n    kmd[%d] words 0..31:", req);
+    for (uint32_t i = 0; i < 32; i++) printf(" %08x", k[i]);
+    printf("\n");
+}
+
 /* sensor NOP packet for req_id — registers the request with the req mgr
  * (every linked device must add a request before it can be applied). */
 static int sensor_nop(int video_fd, int sd_fd, struct shot_bufs *b,
@@ -2417,18 +2453,33 @@ static size_t blob_add(uint8_t *p, uint32_t type, const void *payload,
 }
 
 static int run_stream(int slot, const char *out_path, int wait_ms,
-                      uint32_t settle_cnt, uint32_t tp, int rb)
+                      uint32_t settle_cnt, uint32_t tp, int rb, int nframes)
 {
     int rc = 1, video_fd = -1, sync_fd = -1, kmsg = -1;
     int sensor_fd = -1, csiphy_fd = -1, isp_fd = -1;
     int rail_fd = -1;
     int out_fd = -1;
     uint32_t session = 0, sensor_hdl = 0, csiphy_hdl = 0, isp_hdl = 0,
-             link_hdl = 0, sync_obj = 0, rail_hdl = 0;
-    struct shot_bufs sb = {0}, ib = {0}, ub = {0};
-    struct cam_mem_mgr_alloc_cmd pix = {0};
-    void *pix_map = MAP_FAILED;
-    int pix_mfd = -1;
+             link_hdl = 0, rail_hdl = 0;
+    struct shot_bufs sb = {0}, ib = {0};
+    /* per-frame pixel buffers + fences (--frames N) */
+    enum { MAXF = 16 };
+    /* per-request UPDATE packets: the IFE hw mgr builds CDM commands into
+     * the packet's own kmd scratch at submit and derefs them at SOF apply
+     * — sharing one buffer across queued requests made req 2 apply fail
+     * with rc -5 (observed 2026-09-01). One shot_bufs per request. */
+    struct shot_bufs ub[MAXF];
+    struct cam_mem_mgr_alloc_cmd pix[MAXF];
+    void *pix_map[MAXF];
+    int pix_mfd[MAXF];
+    uint32_t sync_obj[MAXF];
+    for (int fi = 0; fi < MAXF; fi++) {
+        memset(&pix[fi], 0, sizeof(pix[fi]));
+        memset(&ub[fi], 0, sizeof(ub[fi]));
+        pix_map[fi] = MAP_FAILED;
+        pix_mfd[fi] = -1;
+        sync_obj[fi] = 0;
+    }
     double kt = 0;
     /* mode dims: slot 0 (rear imx363) = vendor-bin 2016x1136 binned mode
      * (2.86 MB RAW10); slot 1 (UW imx481) = vendor-bin mode #1301
@@ -3012,40 +3063,45 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     printf("isp iommu: img %d (sec %d), cdm %d\n",
         qisp.device_iommu.non_secure, qisp.device_iommu.secure,
         qisp.cdm_iommu.non_secure);
-    memset(&pix, 0, sizeof(pix));
-    pix.len = pixbuf_len;
-    pix.align = 4096;
-    pix.mmu_hdls[0] = qisp.device_iommu.non_secure;
-    pix.num_hdl = 1;
-    pix.flags = 0x81;  /* CAM_MEM_FLAG_HW_READ_WRITE|CAM_MEM_FLAG_PIXEL_BUF_TYPE */
-    if (cam_ioctl(video_fd, CAM_REQ_MGR_ALLOC_BUF, &pix,
-                  CAM_HANDLE_USER_POINTER, sizeof(pix)) < 0) {
-        fprintf(stderr, "pixel ALLOC_BUF: %s\n", strerror(errno));
-        goto out;
+    for (int fi = 0; fi < nframes; fi++) {
+        pix[fi].len = pixbuf_len;
+        pix[fi].align = 4096;
+        pix[fi].mmu_hdls[0] = qisp.device_iommu.non_secure;
+        pix[fi].num_hdl = 1;
+        pix[fi].flags = 0x81;  /* CAM_MEM_FLAG_HW_READ_WRITE|CAM_MEM_FLAG_PIXEL_BUF_TYPE */
+        if (cam_ioctl(video_fd, CAM_REQ_MGR_ALLOC_BUF, &pix[fi],
+                      CAM_HANDLE_USER_POINTER, sizeof(pix[fi])) < 0) {
+            fprintf(stderr, "pixel ALLOC_BUF[%d]: %s\n", fi, strerror(errno));
+            goto out;
+        }
+        pix_mfd[fi] = pix[fi].out.fd;
+        pix_map[fi] = map_fd(pix_mfd[fi], pixbuf_len);
+        if (pix_map[fi] == MAP_FAILED)
+            goto out;
+        memset(pix_map[fi], 0, pixbuf_len);
+        printf("pixel buf[%d/%d] hdl 0x%x iova 0x%llx (%llu B)\n", fi + 1,
+            nframes, pix[fi].out.buf_handle,
+            (unsigned long long)pix[fi].out.vaddr,
+            (unsigned long long)pixbuf_len);
     }
-    pix_mfd = pix.out.fd;
-    pix_map = map_fd(pix_mfd, pixbuf_len);
-    if (pix_map == MAP_FAILED)
-        goto out;
-    memset(pix_map, 0, pixbuf_len);
-    printf("pixel buf hdl 0x%x (%llu B)\n", pix.out.buf_handle,
-        (unsigned long long)pixbuf_len);
 
-    /* 8. sync fence (frame-done signal) */
+    /* 8. per-frame sync fences (frame-done signals) */
     struct cam_sync_info sinfo;
     struct cam_private_ioctl_arg sarg;
-    memset(&sinfo, 0, sizeof(sinfo));
-    strcpy(sinfo.name, "cam-shot-rdi0");
-    memset(&sarg, 0, sizeof(sarg));
-    sarg.id = CAM_SYNC_CREATE;
-    sarg.size = sizeof(sinfo);
-    sarg.ioctl_ptr = (uint64_t)(uintptr_t)&sinfo;
-    if (sync_fd < 0 || ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg) < 0) {
-        fprintf(stderr, "CAM_SYNC_CREATE: %s\n", strerror(errno));
-        goto out;
+    for (int fi = 0; fi < nframes; fi++) {
+        memset(&sinfo, 0, sizeof(sinfo));
+        snprintf(sinfo.name, sizeof(sinfo.name), "cam-shot-rdi0-%d", fi + 1);
+        memset(&sarg, 0, sizeof(sarg));
+        sarg.id = CAM_SYNC_CREATE;
+        sarg.size = sizeof(sinfo);
+        sarg.ioctl_ptr = (uint64_t)(uintptr_t)&sinfo;
+        if (sync_fd < 0 || ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg) < 0) {
+            fprintf(stderr, "CAM_SYNC_CREATE[%d]: %s\n", fi, strerror(errno));
+            goto out;
+        }
+        sync_obj[fi] = (uint32_t)sinfo.sync_obj;
+        printf("sync obj[%d/%d] %d\n", fi + 1, nframes, sync_obj[fi]);
     }
-    sync_obj = (uint32_t)sinfo.sync_obj;
-    printf("sync obj %d\n", sync_obj);
 
     /* 9. IFE INIT packet (op 0): clock + csid clock + hfr + sensor dim */
     if (shot_alloc(video_fd, &ib, 8192, qisp.cdm_iommu.non_secure) < 0)  /* blobs + kmd */
@@ -3099,7 +3155,14 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
         hfr.num_ports = 1;
         hfr.port[0].resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
         hfr.port[0].subsample_pattern = 1;
-        hfr.port[0].subsample_period = 1;
+        /* subsample_period MUST be 0 for per-request buffers. RDI write
+         * masters (wm index < 3) take loop_size = irq_subsample_period + 1
+         * image_addr writes per request (cam_vfe_bus_ver2_update_wm) and
+         * the WM hardware auto-advances by frame_inc (whole frame) within
+         * that cycle: period 1 => frame N+1 lands at buf+size, past the
+         * mapping — the burst2/3 overrun (faults at round_up(pix[0] end),
+         * RDI Error STATUS_1=0x4, frame 2 zero). Observed/fixed 2026-09-01. */
+        hfr.port[0].subsample_period = 0;
         hfr.port[0].framedrop_pattern = 1;
         hfr.port[0].framedrop_period = 1;
         bl += blob_add(blob + bl, CAM_ISP_GENERIC_BLOB_TYPE_HFR_CONFIG,
@@ -3123,59 +3186,74 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     }
     printf("isp INIT packet ok (blobs %zu B)\n", bl);
 
-    /* 10. SCHED_REQ FIRST: it inserts req 1 into the req mgr's in_q;
-     * each device's per-request packet then calls add_req, which fails
-     * with ENOENT ("req not found in in_q") if the id was never
-     * scheduled (observed on device). */
-    struct cam_req_mgr_sched_request sr;
-    memset(&sr, 0, sizeof(sr));
-    sr.session_hdl = (int32_t)session;
-    sr.link_hdl = (int32_t)link_hdl;
-    sr.sync_mode = 0;
-    sr.req_id = 1;
-    t0 = kt;
-    if (cam_ioctl(video_fd, CAM_REQ_MGR_SCHED_REQ, &sr,
-                  CAM_HANDLE_USER_POINTER, sizeof(sr)) < 0) {
-        fprintf(stderr, "SCHED_REQ: %s\n", strerror(errno));
-        kt = stream_kmsg(kmsg, t0);
-        goto out;
-    }
-    printf("req 1 scheduled\n");
-
-    /* 11. IFE UPDATE packet (op 1, req 1): RDI_0 output + fence */
-    if (shot_alloc(video_fd, &ub, 8192, qisp.cdm_iommu.non_secure) < 0)
-        goto out;
-    struct cam_buf_io_cfg io;
-    memset(&io, 0, sizeof(io));
-    io.mem_handle[0] = (int32_t)pix.out.buf_handle;
-    io.offsets[0] = 0;
-    io.planes[0].width = width;
-    io.planes[0].height = height;
-    io.planes[0].plane_stride = stride;
-    io.planes[0].slice_height = height;
-    io.format = CAM_FORMAT_MIPI_RAW_10;
-    io.bpp = 10;
-    io.resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
-    io.fence = (int32_t)sync_obj;
-    io.direction = CAM_BUF_OUTPUT;
-    io.subsample_pattern = 1;
-    io.subsample_period = 1;
-    io.framedrop_pattern = 1;
-    io.framedrop_period = 1;
-    t0 = kt;
-    if (isp_config(video_fd, isp_fd, &ub, session, isp_hdl,
-                   1 /* UPDATE */, 1, 0, 1, &io) < 0) {
-        fprintf(stderr, "isp UPDATE packet: %s\n", strerror(errno));
-        kt = stream_kmsg(kmsg, t0);
-        goto out;
-    }
-    printf("isp UPDATE req 1 queued (fence %d)\n", sync_obj);
-
-    /* sensor must also register req 1 -> NOP packet */
-    if (sensor_nop(video_fd, sensor_fd, &sb, session, sensor_hdl, 1) < 0) {
-        fprintf(stderr, "sensor NOP req1: %s\n", strerror(errno));
-        kt = stream_kmsg(kmsg, kt);
-        goto out;
+    /* 10/11. request queueing. SCHED_REQ first: it inserts the id into the
+     * req mgr's in_q; each device's per-request packet then calls add_req,
+     * which fails with ENOENT ("req not found in in_q") if the id was never
+     * scheduled (observed on device). Then the IFE UPDATE packet (own
+     * buffer + fence — one shot_bufs per request; the hw mgr keeps built
+     * CDM commands in the packet's kmd scratch) and the sensor NOP.
+     * DEFAULT (pre-queue): all N requests go in before START. Rolling
+     * submission (queue req i+1 only after fence i signals) loses the race:
+     * fence signal is EOF-ish, userspace wakeup + 3 ioctls + CRM apply take
+     * ~17 ms while EOF->next SOF is only ~10-18 ms (vbi is 31-54% of the
+     * frame), so no request is pending at SOF+1, the RDI write master keeps
+     * its end-of-frame address register and writes the next frame past the
+     * buffer end (SMMU PF at round_up(pix_end) + CAMNOC decode error +
+     * RDI Error STATUS_1=0x4, observed 2026-09-01 burst3). --roll restores
+     * the rolling variant for A/B. */
+    for (int rq = 1; rq <= nframes; rq++) {
+        if (shot_alloc(video_fd, &ub[rq - 1], 8192,
+                       qisp.cdm_iommu.non_secure) < 0)
+            goto out;
+        if (g_roll && rq > 1)
+            continue;   /* rolling: queued later, at fence i-1 */
+        struct cam_req_mgr_sched_request sr;
+        memset(&sr, 0, sizeof(sr));
+        sr.session_hdl = (int32_t)session;
+        sr.link_hdl = (int32_t)link_hdl;
+        sr.sync_mode = 0;
+        sr.req_id = rq;
+        printf("[t=%.3f] queueing req %d (SCHED_REQ)\n", mono(), rq);
+        t0 = kt;
+        if (cam_ioctl(video_fd, CAM_REQ_MGR_SCHED_REQ, &sr,
+                      CAM_HANDLE_USER_POINTER, sizeof(sr)) < 0) {
+            fprintf(stderr, "SCHED_REQ %d: %s\n", rq, strerror(errno));
+            kt = stream_kmsg(kmsg, t0);
+            goto out;
+        }
+        struct cam_buf_io_cfg io;
+        memset(&io, 0, sizeof(io));
+        io.mem_handle[0] = (int32_t)pix[rq - 1].out.buf_handle;
+        io.offsets[0] = 0;
+        io.planes[0].width = width;
+        io.planes[0].height = height;
+        io.planes[0].plane_stride = stride;
+        io.planes[0].slice_height = height;
+        io.format = CAM_FORMAT_MIPI_RAW_10;
+        io.bpp = 10;
+        io.resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
+        io.fence = (int32_t)sync_obj[rq - 1];
+        io.direction = CAM_BUF_OUTPUT;
+        io.subsample_pattern = 1;
+        io.subsample_period = 1;
+        io.framedrop_pattern = 1;
+        io.framedrop_period = 1;
+        t0 = kt;
+        if (isp_config(video_fd, isp_fd, &ub[rq - 1], session, isp_hdl,
+                       1 /* UPDATE */, rq, 0, 1, &io) < 0) {
+            fprintf(stderr, "isp UPDATE packet %d: %s\n", rq, strerror(errno));
+            kt = stream_kmsg(kmsg, t0);
+            goto out;
+        }
+        dump_kmd(&ub[rq - 1], rq);
+        /* sensor must also register req N -> NOP packet */
+        if (sensor_nop(video_fd, sensor_fd, &sb, session, sensor_hdl, rq) < 0) {
+            fprintf(stderr, "sensor NOP req%d: %s\n", rq, strerror(errno));
+            kt = stream_kmsg(kmsg, kt);
+            goto out;
+        }
+        printf("req %d/%d queued (buf 0x%x, fence %d)\n", rq, nframes,
+               pix[rq - 1].out.buf_handle, sync_obj[rq - 1]);
     }
 
     /* 11. start: csiphy -> ife (arms CSID/IFE, no data yet) -> sensor
@@ -3218,6 +3296,7 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     }
     printf(g_tpg ? "tpg: ife armed, generator runs from CSID\n"
                  : "sensor started (MODE_SELECT=1 written)\n");
+    printf("[t=%.3f] streaming\n", mono());
     kt = stream_kmsg(kmsg, kt);
 
     if (rb && !g_tpg)
@@ -3226,49 +3305,140 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
         verify_cfg_table(sensor_fd, &sb, session, sensor_hdl, cfg_regs, n_cfg,
                          "post-START");
 
-    /* 14. wait on the fence for the frame */
-    printf("waiting for frame (fence %d, %d ms)...\n", sync_obj, wait_ms);
-    struct cam_sync_wait sw;
-    memset(&sw, 0, sizeof(sw));
-    sw.sync_obj = (int32_t)sync_obj;
-    sw.timeout_ms = (uint64_t)wait_ms;
-    memset(&sarg, 0, sizeof(sarg));
-    sarg.id = CAM_SYNC_WAIT;
-    sarg.size = sizeof(sw);
-    sarg.ioctl_ptr = (uint64_t)(uintptr_t)&sw;
-    int wrc = ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg);
-    /* cam_sync_wait reports its own status through sarg.result even when
-     * the ioctl returns 0 (observed: rc=0, result=-110 ETIMEDOUT together
-     * with CAM_ERR "timed out for sync obj" in dmesg). */
-    int32_t wres = (int32_t)sarg.result;
-    printf("SYNC_WAIT rc=%d result=%d (%s)\n", wrc, wres,
-        wrc ? strerror(errno)
-            : (wres ? "timed out" : "signaled"));
-    kt = stream_kmsg(kmsg, kt);
-    if (wrc < 0 || wres < 0) {
-        /* RX has gone silent by now (observed: CSID fatal-halts its csi2
-         * rx ~48 ms after stream start). Read the sensor again AFTER the
-         * silence: MODE_SELECT still 1 = sensor alive and (as far as it
-         * knows) transmitting -> the receiver side died, not the sensor. */
-        if (rb && !g_tpg)
-            sensor_readback(sensor_fd, &sb, session, sensor_hdl,
-                            "post-WAIT (after silence)");
-        /* The RDI path may still have written partial bytes before the fatal
-         * halt — the byte pattern of that partial data is direct evidence of
-         * the scrambling mode (lane swap -> structured repeats, analog noise
-         * -> spread corruption, zero -> path never wrote). */
-        inspect_buf(pix_map, (size_t)pixbuf_len, out_path, "partial");
-        rc = 2;
-        goto out;
+    /* 14. wait on each fence in order (frame i signals as it lands) */
+    int frames_ok = 0, frames_empty = 0;
+    for (int fi = 0; fi < nframes; fi++) {
+        printf("[t=%.3f] waiting for frame %d/%d (fence %d, %d ms)...\n",
+               mono(), fi + 1, nframes, sync_obj[fi], wait_ms);
+        struct cam_sync_wait sw;
+        memset(&sw, 0, sizeof(sw));
+        sw.sync_obj = (int32_t)sync_obj[fi];
+        sw.timeout_ms = (uint64_t)wait_ms;
+        memset(&sarg, 0, sizeof(sarg));
+        sarg.id = CAM_SYNC_WAIT;
+        sarg.size = sizeof(sw);
+        sarg.ioctl_ptr = (uint64_t)(uintptr_t)&sw;
+        int wrc = ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg);
+        /* cam_sync_wait reports its own status through sarg.result even
+         * when the ioctl returns 0 (observed: rc=0, result=-110 ETIMEDOUT
+         * together with CAM_ERR "timed out for sync obj" in dmesg). */
+        int32_t wres = (int32_t)sarg.result;
+        printf("[t=%.3f] SYNC_WAIT[%d] rc=%d result=%d (%s)\n", mono(), fi + 1, wrc, wres,
+            wrc ? strerror(errno)
+                : (wres ? "timed out" : "signaled"));
+        kt = stream_kmsg(kmsg, kt);
+        if (wrc < 0 || wres < 0) {
+            /* RX has gone silent by now (observed: CSID fatal-halts its
+             * csi2 rx ~48 ms after stream start). Read the sensor again
+             * AFTER the silence: MODE_SELECT still 1 = sensor alive and
+             * (as far as it knows) transmitting -> the receiver side
+             * died, not the sensor. */
+            if (rb && !g_tpg)
+                sensor_readback(sensor_fd, &sb, session, sensor_hdl,
+                                "post-WAIT (after silence)");
+            /* The RDI path may still have written partial bytes before
+             * the fatal halt — the byte pattern of that partial data is
+             * direct evidence of the scrambling mode (lane swap ->
+             * structured repeats, analog noise -> spread corruption,
+             * zero -> path never wrote). */
+            inspect_buf(pix_map[fi], (size_t)pixbuf_len, out_path, "partial");
+            rc = 2;
+            goto out;
+        }
+        frames_ok++;
+
+        /* rolling mode only: queue the next request NOW, while the sensor
+         * is between frames (pre-queue mode already has every request in) */
+        if (g_roll && fi + 1 < nframes) {
+            int rq = fi + 2;
+            printf("[t=%.3f] queueing req %d (SCHED_REQ)\n", mono(), rq);
+            struct cam_req_mgr_sched_request sr;
+            memset(&sr, 0, sizeof(sr));
+            sr.session_hdl = (int32_t)session;
+            sr.link_hdl = (int32_t)link_hdl;
+            sr.sync_mode = 0;
+            sr.req_id = rq;
+            t0 = kt;
+            if (cam_ioctl(video_fd, CAM_REQ_MGR_SCHED_REQ, &sr,
+                          CAM_HANDLE_USER_POINTER, sizeof(sr)) < 0) {
+                fprintf(stderr, "SCHED_REQ %d: %s\n", rq, strerror(errno));
+                kt = stream_kmsg(kmsg, t0);
+                rc = 2;
+                goto out;
+            }
+            struct cam_buf_io_cfg io;
+            memset(&io, 0, sizeof(io));
+            io.mem_handle[0] = (int32_t)pix[rq - 1].out.buf_handle;
+            io.offsets[0] = 0;
+            io.planes[0].width = width;
+            io.planes[0].height = height;
+            io.planes[0].plane_stride = stride;
+            io.planes[0].slice_height = height;
+            io.format = CAM_FORMAT_MIPI_RAW_10;
+            io.bpp = 10;
+            io.resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
+            io.fence = (int32_t)sync_obj[rq - 1];
+            io.direction = CAM_BUF_OUTPUT;
+            io.subsample_pattern = 1;
+            io.subsample_period = 1;
+            io.framedrop_pattern = 1;
+            io.framedrop_period = 1;
+            printf("[t=%.3f] req %d: UPDATE packet\n", mono(), rq);
+            t0 = kt;
+            if (isp_config(video_fd, isp_fd, &ub[rq - 1], session, isp_hdl,
+                           1 /* UPDATE */, rq, 0, 1, &io) < 0) {
+                fprintf(stderr, "isp UPDATE packet %d: %s\n", rq,
+                        strerror(errno));
+                kt = stream_kmsg(kmsg, t0);
+                rc = 2;
+                goto out;
+            }
+            dump_kmd(&ub[rq - 1], rq);
+            if (sensor_nop(video_fd, sensor_fd, &sb, session, sensor_hdl,
+                           rq) < 0) {
+                fprintf(stderr, "sensor NOP req%d: %s\n", rq, strerror(errno));
+                kt = stream_kmsg(kmsg, kt);
+                rc = 2;
+                goto out;
+            }
+            printf("[t=%.3f] req %d/%d queued (buf 0x%x, fence %d)\n",
+                   mono(), rq, nframes,
+                   pix[rq - 1].out.buf_handle, sync_obj[rq - 1]);
+        }
     }
 
-    /* 14. inspect + dump */
-    size_t nz = inspect_buf(pix_map, (size_t)pixbuf_len, out_path, "frame");
-    if (nz && g_png)
-        dump_png(pix_map, width, height, stride, "/tmp/frame.png");
-    if (nz && g_jpeg_q > 0)
-        dump_jpeg(pix_map, width, height, stride, out_path);
-    rc = nz ? 0 : 3;   /* fence signaled but empty buffer = no frame */
+    /* 15. heavy pass: all frames have landed in their buffers; inspect +
+     * dump + JPEG each (suffix -i when bursting). Kept out of the wait
+     * loop so encode time never throttles the burst. */
+    for (int fi = 0; fi < nframes; fi++) {
+        char fpath[512];
+        if (nframes == 1) {
+            snprintf(fpath, sizeof fpath, "%s", out_path);
+        } else {
+            const char *dot = strrchr(out_path, '.');
+            if (dot)
+                snprintf(fpath, sizeof fpath, "%.*s-%d%s",
+                         (int)(dot - out_path), out_path, fi + 1, dot);
+            else
+                snprintf(fpath, sizeof fpath, "%s-%d", out_path, fi + 1);
+        }
+        size_t nz = inspect_buf(pix_map[fi], (size_t)pixbuf_len, fpath,
+                                "frame");
+        if (nz && g_png) {
+            char ppath[512];
+            if (nframes == 1)
+                snprintf(ppath, sizeof ppath, "/tmp/frame.png");
+            else
+                snprintf(ppath, sizeof ppath, "/tmp/frame-%d.png", fi + 1);
+            dump_png(pix_map[fi], width, height, stride, ppath);
+        }
+        if (nz && g_jpeg_q > 0)
+            dump_jpeg(pix_map[fi], width, height, stride, fpath);
+        if (!nz)
+            frames_empty++;
+    }
+    rc = frames_empty == 0 ? 0 : (frames_empty == nframes ? 3 : 4);
+    goto out;
 
 out:
     /* teardown: streamoff -> stop (isp, csiphy, sensor) -> unlink -> release
@@ -3342,21 +3512,28 @@ out:
         cam_ioctl(video_fd, CAM_REQ_MGR_DESTROY_SESSION, &ds,
                   CAM_HANDLE_USER_POINTER, sizeof(ds));
     }
-    if (sync_obj) {
-        memset(&sarg, 0, sizeof(sarg));
-        sarg.id = CAM_SYNC_DESTROY;
-        sarg.size = sizeof(sinfo);
-        sarg.ioctl_ptr = (uint64_t)(uintptr_t)&sinfo;
-        ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg);
+    for (int fi = 0; fi < MAXF; fi++) {
+        if (sync_obj[fi]) {
+            memset(&sinfo, 0, sizeof(sinfo));
+            sinfo.sync_obj = (int32_t)sync_obj[fi];
+            memset(&sarg, 0, sizeof(sarg));
+            sarg.id = CAM_SYNC_DESTROY;
+            sarg.size = sizeof(sinfo);
+            sarg.ioctl_ptr = (uint64_t)(uintptr_t)&sinfo;
+            ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg);
+        }
     }
     shot_free(video_fd, &sb);
     shot_free(video_fd, &rail_sb);
     shot_free(video_fd, &ib);
-    shot_free(video_fd, &ub);
-    if (pix.out.buf_handle)
-        release_buf(video_fd, pix.out.buf_handle);
-    if (pix_map != MAP_FAILED) munmap(pix_map, pixbuf_len);
-    if (pix_mfd > 0) close(pix_mfd);
+    for (int fi = 0; fi < MAXF; fi++)
+        shot_free(video_fd, &ub[fi]);
+    for (int fi = 0; fi < MAXF; fi++) {
+        if (pix[fi].out.buf_handle)
+            release_buf(video_fd, pix[fi].out.buf_handle);
+        if (pix_map[fi] != MAP_FAILED) munmap(pix_map[fi], pixbuf_len);
+        if (pix_mfd[fi] > 0) close(pix_mfd[fi]);
+    }
     if (out_fd >= 0) close(out_fd);
     if (sensor_fd >= 0) close(sensor_fd);
     if (rail_fd >= 0) close(rail_fd);
@@ -3463,6 +3640,15 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--jpeg-out") == 0 && i + 1 < argc)
             g_jpeg_out = argv[++i];
+        else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+            g_frames = atoi(argv[++i]);
+            if (g_frames < 1 || g_frames > 16) {
+                fprintf(stderr, "--frames: 1..16\n");
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--roll") == 0)
+            g_roll = 1;
         else if (strcmp(argv[i], "--cit") == 0 && i + 1 < argc)
             g_cit = (unsigned)strtoul(argv[++i], 0, 0);
         else if (strcmp(argv[i], "--gain") == 0 && i + 1 < argc)
@@ -3488,7 +3674,7 @@ int main(int argc, char **argv)
     }
     if (stream)   /* default front camera (slot 2, imx355) */
         return run_stream(only_slot >= 0 ? only_slot : 2, out_path, wait_ms,
-                          settle_cnt, tp, rb);
+                          settle_cnt, tp, rb, g_frames);
 
     int video_fd = open("/dev/video3", O_RDWR);
     if (video_fd < 0) {
