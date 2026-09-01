@@ -579,6 +579,375 @@ static const struct wreg imx355_vcfg[] = {
     {0x020e, 0x01, 8}, {0x020f, 0x00, 8},   /* digital gain 1.0x */
 };
 
+/* ---- imx481 register lists (vendor bin) ----
+ * Rear ultra-wide, slot 1, slave 0x34, chip id 0x481 @ reg 0x0016.
+ * Source: the device's /vendor/lib64/camera/com.qti.sensormodule.
+ * metric_imx481_lito2.bin, same decoder as the imx363/imx355 tables
+ * (Parameter Parser V2 TOC; init = the bin's 209-write initSettings).
+ * mode3 = regSetting#1301, the ~30fps binned 2328x1310 mode:
+ * fll 0x0760=1888, llp 0x1400=5120, crop (0,438)-(4655,3057), 4 lanes
+ * (0x0114=3). PLL (Sony rule proven on this device's imx355+imx363:
+ * lane Mbps = INCK/0x030d * (0x030e<<8|0x030f)) = 24/15*439 = 702.4
+ * Mbps/lane -> pck = 702.4M*4/10 = 281 MHz, fps = 281M/(5120*1888)
+ * = 29.1. Mode[4] (2016x1136) computes to ~120 fps with its PLL
+ * (24/3*230 = 1840 Mbps/lane) — the vendor's fast mode; mode0 full-
+ * res cross-checks the rule exactly (24/4*218 = 1308 = 523.2 MHz
+ * pck x 10 / 4, the rate the bin's own resolutionData declares).
+ * The bin never writes 0x0820 REQ_LINK or 0x0136 INCK — verbatim, like
+ * the rear --rawvendor path. Exposure 0x0202=0x0494 lines, gain 1x. */
+
+static const struct wreg imx481_init[] = {
+    {0x0137, 0x00, 8},
+    {0x3c7e, 0x01, 8},
+    {0x3c7f, 0x06, 8},
+    {0x0101, 0x03, 8},
+    {0x3f7f, 0x01, 8},
+    {0x531c, 0x01, 8},
+    {0x531d, 0x02, 8},
+    {0x531e, 0x04, 8},
+    {0x5928, 0x00, 8},
+    {0x5929, 0x2f, 8},
+    {0x592a, 0x00, 8},
+    {0x592b, 0x85, 8},
+    {0x592c, 0x00, 8},
+    {0x592d, 0x32, 8},
+    {0x592e, 0x00, 8},
+    {0x592f, 0x88, 8},
+    {0x5930, 0x00, 8},
+    {0x5931, 0x3d, 8},
+    {0x5932, 0x00, 8},
+    {0x5933, 0x93, 8},
+    {0x5938, 0x00, 8},
+    {0x5939, 0x24, 8},
+    {0x593a, 0x00, 8},
+    {0x593b, 0x7a, 8},
+    {0x593c, 0x00, 8},
+    {0x593d, 0x24, 8},
+    {0x593e, 0x00, 8},
+    {0x593f, 0x7a, 8},
+    {0x5940, 0x00, 8},
+    {0x5941, 0x2f, 8},
+    {0x5942, 0x00, 8},
+    {0x5943, 0x85, 8},
+    {0x5e12, 0x00, 8},
+    {0x5e13, 0x23, 8},
+    {0x5f06, 0x08, 8},
+    {0x5f07, 0x81, 8},
+    {0x5f0b, 0xeb, 8},
+    {0x5f0c, 0xae, 8},
+    {0x5f0d, 0x15, 8},
+    {0x5f0e, 0x6e, 8},
+    {0x5f0f, 0x03, 8},
+    {0x5f10, 0xa5, 8},
+    {0x5f11, 0xc6, 8},
+    {0x5f12, 0x92, 8},
+    {0x5f13, 0xb9, 8},
+    {0x5f14, 0x5e, 8},
+    {0x5f17, 0x5e, 8},
+    {0x5f18, 0xdc, 8},
+    {0x5f19, 0x23, 8},
+    {0x5f1a, 0xdb, 8},
+    {0x5f1b, 0xc7, 8},
+    {0x5f1c, 0x5b, 8},
+    {0x5f1d, 0x7e, 8},
+    {0x5f1e, 0x20, 8},
+    {0x5f1f, 0x51, 8},
+    {0x5f20, 0xa2, 8},
+    {0x5f21, 0x46, 8},
+    {0x5f22, 0x87, 8},
+    {0x5f23, 0x2c, 8},
+    {0x5f24, 0x1d, 8},
+    {0x5f25, 0x10, 8},
+    {0x5f26, 0x76, 8},
+    {0x5f27, 0xa1, 8},
+    {0x5f28, 0xc6, 8},
+    {0x5f29, 0x07, 8},
+    {0x5f2a, 0x1a, 8},
+    {0x5f2b, 0x1c, 8},
+    {0x5f2c, 0xa8, 8},
+    {0x5f2d, 0x76, 8},
+    {0x5f2e, 0x61, 8},
+    {0x5f2f, 0xc6, 8},
+    {0x5f30, 0x87, 8},
+    {0x5f31, 0x2c, 8},
+    {0x5f32, 0x1d, 8},
+    {0x5f33, 0x10, 8},
+    {0x5f34, 0x76, 8},
+    {0x5f35, 0xa1, 8},
+    {0x5f36, 0xc6, 8},
+    {0x5f37, 0x07, 8},
+    {0x5f38, 0x1a, 8},
+    {0x5f39, 0x1c, 8},
+    {0x5f3a, 0xa8, 8},
+    {0x5f3b, 0x76, 8},
+    {0x5f3c, 0xa1, 8},
+    {0x5f3d, 0xc6, 8},
+    {0x5f3e, 0x87, 8},
+    {0x5f3f, 0x2c, 8},
+    {0x5f40, 0x1d, 8},
+    {0x5f41, 0x10, 8},
+    {0x5f42, 0x76, 8},
+    {0x5f43, 0xa1, 8},
+    {0x5f44, 0xc6, 8},
+    {0x5f45, 0x07, 8},
+    {0x5f46, 0x2a, 8},
+    {0x5f47, 0x1d, 8},
+    {0x5f48, 0x08, 8},
+    {0x5f49, 0x76, 8},
+    {0x5f4a, 0x81, 8},
+    {0x5f4b, 0xc0, 8},
+    {0x5f75, 0x27, 8},
+    {0x5f76, 0xee, 8},
+    {0x5f77, 0xee, 8},
+    {0x5f78, 0xee, 8},
+    {0x5f79, 0xe5, 8},
+    {0x7990, 0x01, 8},
+    {0x7993, 0x5d, 8},
+    {0x7994, 0x5d, 8},
+    {0x7995, 0xa1, 8},
+    {0x799a, 0x01, 8},
+    {0x799d, 0x00, 8},
+    {0x8169, 0x01, 8},
+    {0x8359, 0x01, 8},
+    {0x88c7, 0x00, 8},
+    {0x88d4, 0x03, 8},
+    {0x9300, 0x2a, 8},
+    {0x9301, 0x24, 8},
+    {0x9302, 0x1e, 8},
+    {0x9304, 0x2c, 8},
+    {0x9305, 0x23, 8},
+    {0x9306, 0x1f, 8},
+    {0x9308, 0x2d, 8},
+    {0x9309, 0x28, 8},
+    {0x930a, 0x26, 8},
+    {0x930c, 0x2e, 8},
+    {0x930d, 0x2c, 8},
+    {0x930e, 0x23, 8},
+    {0x9310, 0x2e, 8},
+    {0x9311, 0x28, 8},
+    {0x9312, 0x23, 8},
+    {0x9314, 0x31, 8},
+    {0x9315, 0x31, 8},
+    {0x9316, 0x2c, 8},
+    {0x9317, 0x19, 8},
+    {0x9960, 0x00, 8},
+    {0x9963, 0x64, 8},
+    {0x9964, 0x50, 8},
+    {0xa391, 0x04, 8},
+    {0xb046, 0x01, 8},
+    {0xb048, 0x01, 8},
+    {0x42b0, 0x00, 8},
+    {0x4bd7, 0x14, 8},
+    {0x42aa, 0xff, 8},
+    {0x428a, 0x00, 8},
+    {0x510c, 0x01, 8},
+    {0x8145, 0x00, 8},
+    {0x8146, 0x04, 8},
+    {0x8341, 0x00, 8},
+    {0x8343, 0x08, 8},
+    {0xa801, 0x00, 8},
+    {0xa802, 0x00, 8},
+    {0xa903, 0x00, 8},
+    {0xa905, 0x00, 8},
+    {0xa909, 0x00, 8},
+    {0xa90b, 0x00, 8},
+    {0xa925, 0x02, 8},
+    {0xa927, 0x02, 8},
+    {0xa929, 0x02, 8},
+    {0xa92b, 0x00, 8},
+    {0xa92d, 0x00, 8},
+    {0xa92f, 0x00, 8},
+    {0xa933, 0x00, 8},
+    {0xa935, 0x00, 8},
+    {0xa939, 0x00, 8},
+    {0xa93b, 0x00, 8},
+    {0xa955, 0x02, 8},
+    {0xa957, 0x02, 8},
+    {0xa959, 0x02, 8},
+    {0xa95b, 0x00, 8},
+    {0xa95d, 0x00, 8},
+    {0xa95f, 0x00, 8},
+    {0xa963, 0x00, 8},
+    {0xa965, 0x00, 8},
+    {0xa969, 0x00, 8},
+    {0xa96b, 0x00, 8},
+    {0xa985, 0x02, 8},
+    {0xa987, 0x02, 8},
+    {0xa989, 0x02, 8},
+    {0xa98b, 0x00, 8},
+    {0xa98d, 0x00, 8},
+    {0xa98f, 0x00, 8},
+    {0xaa06, 0x3f, 8},
+    {0xaa07, 0x05, 8},
+    {0xaa08, 0x04, 8},
+    {0xaa12, 0x3f, 8},
+    {0xaa13, 0x04, 8},
+    {0xaa14, 0x03, 8},
+    {0xab55, 0x02, 8},
+    {0xab57, 0x01, 8},
+    {0xab59, 0x01, 8},
+    {0xabb4, 0x00, 8},
+    {0xabb5, 0x01, 8},
+    {0xabb6, 0x00, 8},
+    {0xabb7, 0x01, 8},
+    {0xabb8, 0x00, 8},
+    {0xabb9, 0x01, 8},
+    {0xae08, 0x00, 8},
+    {0xae0b, 0x00, 8},
+    {0xae0e, 0x00, 8},
+    {0xae11, 0x00, 8},
+    {0xae14, 0x00, 8},
+    {0xae1a, 0x00, 8},
+    {0xae2e, 0x00, 8},
+    {0xae31, 0x00, 8},
+    {0xae37, 0x00, 8},
+    {0xae40, 0x00, 8},
+    {0xae54, 0x00, 8},
+    {0xae57, 0x00, 8},
+    {0xae5d, 0x00, 8},
+    {0xae66, 0x00, 8},
+};
+static const struct wreg imx481_mode3[] = {
+    {0x0113, 0x0a, 8},
+    {0x0114, 0x03, 8},
+    {0x0342, 0x14, 8},
+    {0x0343, 0x00, 8},
+    {0x0340, 0x07, 8},
+    {0x0341, 0x60, 8},
+    {0x0344, 0x00, 8},
+    {0x0345, 0x00, 8},
+    {0x0346, 0x01, 8},
+    {0x0347, 0xb6, 8},
+    {0x0348, 0x12, 8},
+    {0x0349, 0x2f, 8},
+    {0x034a, 0x0b, 8},
+    {0x034b, 0xf1, 8},
+    {0x0381, 0x01, 8},
+    {0x0383, 0x01, 8},
+    {0x0385, 0x01, 8},
+    {0x0387, 0x01, 8},
+    {0x0900, 0x01, 8},
+    {0x0901, 0x22, 8},
+    {0x0902, 0x0a, 8},
+    {0x3f4c, 0x05, 8},
+    {0x3f4d, 0x03, 8},
+    {0x0408, 0x00, 8},
+    {0x0409, 0x00, 8},
+    {0x040a, 0x00, 8},
+    {0x040b, 0x00, 8},
+    {0x040c, 0x09, 8},
+    {0x040d, 0x18, 8},
+    {0x040e, 0x05, 8},
+    {0x040f, 0x1e, 8},
+    {0x034c, 0x09, 8},
+    {0x034d, 0x18, 8},
+    {0x034e, 0x05, 8},
+    {0x034f, 0x1e, 8},
+    {0x0301, 0x06, 8},
+    {0x0303, 0x02, 8},
+    {0x0305, 0x04, 8},
+    {0x0306, 0x01, 8},
+    {0x0307, 0x22, 8},
+    {0x030b, 0x01, 8},
+    {0x030d, 0x0f, 8},
+    {0x030e, 0x01, 8},
+    {0x030f, 0xb7, 8},
+    {0x0310, 0x01, 8},
+    {0x3e20, 0x01, 8},
+    {0x3e37, 0x01, 8},
+    {0x3e3b, 0x00, 8},
+    {0x38a3, 0x02, 8},
+    {0x38ac, 0x01, 8},
+    {0x38ad, 0x01, 8},
+    {0x38ae, 0x01, 8},
+    {0x38af, 0x01, 8},
+    {0x38b0, 0x01, 8},
+    {0x38b1, 0x01, 8},
+    {0x38b2, 0x01, 8},
+    {0x38b3, 0x01, 8},
+    {0x38b4, 0x03, 8},
+    {0x38b5, 0xa4, 8},
+    {0x38b6, 0x02, 8},
+    {0x38b7, 0x0c, 8},
+    {0x38b8, 0x05, 8},
+    {0x38b9, 0x76, 8},
+    {0x38ba, 0x03, 8},
+    {0x38bb, 0x12, 8},
+    {0x38bc, 0x03, 8},
+    {0x38bd, 0x6a, 8},
+    {0x38be, 0x01, 8},
+    {0x38bf, 0xec, 8},
+    {0x38c0, 0x05, 8},
+    {0x38c1, 0xb0, 8},
+    {0x38c2, 0x03, 8},
+    {0x38c3, 0x34, 8},
+    {0x38c4, 0x03, 8},
+    {0x38c5, 0x2e, 8},
+    {0x38c6, 0x01, 8},
+    {0x38c7, 0xca, 8},
+    {0x38c8, 0x05, 8},
+    {0x38c9, 0xe8, 8},
+    {0x38ca, 0x03, 8},
+    {0x38cb, 0x54, 8},
+    {0x38cc, 0x02, 8},
+    {0x38cd, 0xba, 8},
+    {0x38ce, 0x01, 8},
+    {0x38cf, 0x8a, 8},
+    {0x38d0, 0x06, 8},
+    {0x38d1, 0x5e, 8},
+    {0x38d2, 0x03, 8},
+    {0x38d3, 0x96, 8},
+    {0x38d4, 0x03, 8},
+    {0x38d5, 0x2e, 8},
+    {0x38d6, 0x01, 8},
+    {0x38d7, 0xe4, 8},
+    {0x38d8, 0x05, 8},
+    {0x38d9, 0x3a, 8},
+    {0x38da, 0x03, 8},
+    {0x38db, 0x12, 8},
+    {0x38dc, 0x03, 8},
+    {0x38dd, 0xc6, 8},
+    {0x38de, 0x01, 8},
+    {0x38df, 0xe4, 8},
+    {0x38e0, 0x05, 8},
+    {0x38e1, 0xd2, 8},
+    {0x38e2, 0x03, 8},
+    {0x38e3, 0x12, 8},
+    {0x38e4, 0x03, 8},
+    {0x38e5, 0x2e, 8},
+    {0x38e6, 0x02, 8},
+    {0x38e7, 0x0c, 8},
+    {0x38e8, 0x05, 8},
+    {0x38e9, 0x3a, 8},
+    {0x38ea, 0x03, 8},
+    {0x38eb, 0x3a, 8},
+    {0x38ec, 0x03, 8},
+    {0x38ed, 0xc6, 8},
+    {0x38ee, 0x02, 8},
+    {0x38ef, 0x0c, 8},
+    {0x38f0, 0x05, 8},
+    {0x38f1, 0xea, 8},
+    {0x38f2, 0x03, 8},
+    {0x38f3, 0x3a, 8},
+    {0x3f78, 0x02, 8},
+    {0x3f79, 0x0b, 8},
+    {0x3ffe, 0x00, 8},
+    {0x3fff, 0x14, 8},
+    {0x5f0a, 0xb2, 8},
+    {0xa828, 0x03, 8},
+    {0xa829, 0x03, 8},
+    {0xa84f, 0x01, 8},
+    {0xa850, 0x01, 8},
+    {0xb2df, 0x12, 8},
+    {0xb2e5, 0x06, 8},
+    {0x0202, 0x07, 8},
+    {0x0203, 0x4e, 8},
+    {0x0204, 0x00, 8},
+    {0x0205, 0x00, 8},
+    {0x020e, 0x01, 8},
+    {0x020f, 0x00, 8},
+};
+
 /* ---- imx363 register lists (vendor bin, NOT mainline) ----
  * Rear camera, slot 0, slave 0x20 (INCK/XCLR latch, observed), chip id
  * 0x363 @ reg 0x0016. Source: the device's own vendor chromatix bin
@@ -1934,11 +2303,20 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     int pix_mfd = -1;
     double kt = 0;
     /* mode dims: slot 0 (rear imx363) = vendor-bin 2016x1136 binned mode
-     * (2.86 MB RAW10); slot 2 (front imx355) = vendor-bin 1640x925
-     * binned, pck 144 MHz (fll 2614 x llp 1836 x 30 fps). */
+     * (2.86 MB RAW10); slot 1 (UW imx481) = vendor-bin mode #1301
+     * 2328x1310 binned (3.81 MB RAW10, pck 281 MHz); slot 2 (front imx355)
+     * = vendor-bin 1640x925 binned, pck 144 MHz (fll 2614 x llp 1836 x
+     * 30 fps). */
     g_slot = slot;
     uint32_t width = 1640, height = 925, stride = 2050;
     uint32_t pixel_clk = 144000000, hbi = 1836, vbi = 2614;
+    if (slot == 1) {
+        width = 2328; height = 1310; stride = 2910;
+        /* 24/15*439 = 702.4 Mbps/lane over 4 lanes -> pck 280.96 MHz;
+         * fll 1888 x llp 5120 -> 29.1 fps (timing model must match the
+         * applied mode table, see the imx481_mode3 note) */
+        pixel_clk = 280960000; hbi = 5120; vbi = 1888;
+    }
     if (slot == 0) {
         width = 2016; height = 1136; stride = 2520;
         /* timing model must match the applied mode table: #544 fll=1652
@@ -2208,12 +2586,17 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
      * IFE's req 1 (with our fence) never applies (observed 2026-09-01:
      * "Skip Frame: req: 1 not ready ... dev: cam-sensor" at every SOF).
      * Only the STREAMON packet (sensor emitting) stays sensor-mode-only. */
-    if (shot_alloc(video_fd, &sb, 16 * 80 + 256, 0) < 0)
+    /* cmd buffer sized for the biggest table: imx481_init is a single
+     * 209-write group = 8 B header + 209 x 8 B = 1680 B (the old
+     * 16*80+256 = 1536 would truncate it) */
+    if (shot_alloc(video_fd, &sb, 4096, 0) < 0)
         goto out;
-    const struct wreg *init_tbl = slot == 0 ? imx363_init : imx355_vinit;
+    const struct wreg *init_tbl = slot == 0 ? imx363_init
+        : (slot == 1 ? imx481_init : imx355_vinit);
     size_t n_init = slot == 0
         ? sizeof(imx363_init) / sizeof(imx363_init[0])
-        : sizeof(imx355_vinit) / sizeof(imx355_vinit[0]);
+        : (slot == 1 ? sizeof(imx481_init) / sizeof(imx481_init[0])
+                     : sizeof(imx355_vinit) / sizeof(imx355_vinit[0]));
     if (slot == 0 && !g_keep0112) {
         /* 2026-09-01 exact register diff vs the vendor bin: our INIT = the
          * bin's 29-write initSettings plus this prepended 0x0112=0x0a — the
@@ -2237,7 +2620,7 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     /* tp: force the sensor's built-in test pattern (reg 0x0600) — makes it
      * emit MIPI regardless of the array, separating "sensor transmits" from
      * "sensor exposes". */
-    struct wreg cfg_regs[128];
+    struct wreg cfg_regs[192];   /* imx481_mode3 alone is 138 writes */
     size_t n_cfg;
     if (slot == 0) {
         if (g_slowrear) {
@@ -2349,6 +2732,46 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
             n_cfg++;
             printf("test pattern 0x0600<-0x%04x appended\n", tp);
         }
+    } else if (slot == 1) {
+        memcpy(cfg_regs, imx481_mode3, sizeof(imx481_mode3));
+        n_cfg = sizeof(imx481_mode3) / sizeof(imx481_mode3[0]);
+        printf("uw imx481: vendor-bin mode 2328x1310 4-lane (verbatim, "
+               "702 Mbps/lane, ~29 fps)\n");
+        /* exposure/gain: same imx355-family register set as the rear */
+        if (g_cit) {
+            cfg_override(cfg_regs, &n_cfg, 0x0202, (uint8_t)(g_cit >> 8));
+            cfg_override(cfg_regs, &n_cfg, 0x0203, (uint8_t)(g_cit & 0xff));
+            printf("exposure: CIT=%u lines\n", g_cit);
+        }
+        if (g_gain > 1.0) {
+            double m = g_gain > 16.0 ? 16.0 : g_gain;
+            unsigned gv = (unsigned)(1024.0 - 1024.0 / m + 0.5);
+            if (gv > 960) gv = 960;
+            cfg_override(cfg_regs, &n_cfg, 0x0204, (uint8_t)(gv >> 8));
+            cfg_override(cfg_regs, &n_cfg, 0x0205, (uint8_t)(gv & 0xff));
+            printf("analog gain: %.2fx (reg 0x%03x)\n",
+                   1024.0 / (1024.0 - (double)gv), gv);
+        }
+        if (g_dgain > 1.0) {
+            double m = g_dgain > 16.0 ? 16.0 : g_dgain;
+            unsigned dv = (unsigned)(m * 256.0 + 0.5);
+            if (dv > 4095) dv = 4095;
+            cfg_override(cfg_regs, &n_cfg, 0x3070, 0x01);
+            cfg_override(cfg_regs, &n_cfg, 0x020e, (uint8_t)(dv >> 8));
+            cfg_override(cfg_regs, &n_cfg, 0x020f, (uint8_t)(dv & 0xff));
+            printf("digital gain: %.2fx (reg 0x%03x)\n", dv / 256.0, dv);
+        }
+        if (tp) {
+            cfg_regs[n_cfg].addr = 0x0600;
+            cfg_regs[n_cfg].val = 0;
+            cfg_regs[n_cfg].width = 8;
+            n_cfg++;
+            cfg_regs[n_cfg].addr = 0x0601;
+            cfg_regs[n_cfg].val = (uint16_t)tp;
+            cfg_regs[n_cfg].width = 8;
+            n_cfg++;
+            printf("test pattern 0x0600<-0x%04x appended\n", tp);
+        }
     } else {
         memcpy(cfg_regs, imx355_vcfg, sizeof(imx355_vcfg));
         n_cfg = sizeof(imx355_vcfg) / sizeof(imx355_vcfg[0]);
@@ -2416,7 +2839,9 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
             ? (g_rear564 ? 564000000ULL :
                (g_slowrear ? 1128000000ULL :
                (g_halfrate ? 918000000ULL : 1836000000ULL)))
-            : (g_halfrate ? 180000000ULL : 360000000ULL);
+            : (slot == 1
+               ? 702400000ULL   /* 24/15*439, see imx481_mode3 note */
+               : (g_halfrate ? 180000000ULL : 360000000ULL));
         uint64_t ui = 1000000000000ULL / dr;      /* ps */
         uint32_t cnt = (uint32_t)((115000 + 8 * ui) / 5000) - 1;
         if (settle_cnt)
@@ -2901,6 +3326,8 @@ int main(int argc, char **argv)
             real = 1;
         else if (strcmp(argv[i], "--rear") == 0)
             only_slot = 0;   /* rear imx363: vendor-bin tables, 4-lane */
+        else if (strcmp(argv[i], "--uw") == 0)
+            only_slot = 1;   /* rear ultra-wide imx481: vendor-bin mode3 */
         else if (strcmp(argv[i], "--tpg") == 0)
             g_tpg = 1;
         else if (strcmp(argv[i], "--railhelper") == 0)
