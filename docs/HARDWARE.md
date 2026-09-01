@@ -3693,3 +3693,13 @@ camera HAL .so). No kernel-side shortcut exists in any public techpack.
 Device state: baked #4, stock vendor_boot, debug_mdl=0, binary
 /data/local/tmp/cam-shot-pix (md5 4dbdada2b4de8456e96ddfb264c02928).
 Flags: --pix (NV12), --pix-raw (RAW_DUMP), --ife-base.
+
+Addendum (same session): one more blind experiment, recorded so it is not
+retried — the 4.7 YUV-path module program (mainline camss-vfe-4-7.c:
+LENS_EN 0x40 bits demux|chroma_upsample, ZOOM_EN 0x4C bits scale|crop|
+realign, demux cfg/gains/patterns 0x560-0x578, scale 0x91C-0x964 1:1 with
+halved chroma, crop 0x974-0x980, clamp 0x984/0x988) appended to the CDM
+payload: NV12 still silent (147 SOF/EOF, fence -110). Titan 170 did NOT
+inherit the 4.7 IQ-module offsets, or the Bayer color pipe needs its own
+config regardless. Payload reverted to the committed 16-pair version
+(binary md5 4dbdada2b4de8456e96ddfb264c02928 = repo = device).
