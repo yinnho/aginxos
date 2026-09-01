@@ -138,7 +138,9 @@ Android 与跑裸 Linux 待机差一个量级，语言没变，OS 形态变了�
   调，不包 FFI
 
 新 crate `periph`（五官各一模块，对外全安全 API；Termux 阶段 -1
-五官模块 stub 掉，系统层照跑——不依赖具体硬件形态）：
+五官模块 stub 掉，系统层照跑——不依赖具体硬件形态；crate 形状与
+平台分文件参照 [OPENLOGI-STUDY.md](OPENLOGI-STUDY.md)——18k★
+生产级同类实证）：
 
 ```
 crates/periph/
