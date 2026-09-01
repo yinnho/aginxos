@@ -3626,3 +3626,70 @@ Note for the next bake: the WB binary is /tmp/cam-shot-wb on the device
 the pre-WB cam-shot — fold with the ring-mode change.
 
 Commit: 6557bab (cam-shot.c; jpegenc.h was already tracked by 2f48c3f).
+
+## M19d: IFE PIX path unlocked from userspace — CAMIF program via CDM BL, RAW_DUMP frames on device (tenth session)
+
+Goal: hardware-ISP YUV (route 3). Status after this session: the PIX input
+side is fully alive and RAW_DUMP (unprocessed Bayer through the PIX path)
+lands real frames from both TPG and the rear sensor. NV12 is blocked at the
+color-module stage — the demosaic/CCM/CSC register programs are CAMX-
+proprietary and no public kernel programs them (verified across redbull
+techpack vfe_top/vfe_bus/vfe17x: no module drivers exist; `module_ctrl.color
+.enable = 0x48` is dead code in-kernel).
+
+Root cause of the silent PIX death (carried over): the techpack kernel's
+camif start writes only core_cfg/epoch/RUP/STATS-cgc. CAMX normally programs
+the rest via CDM IQ commands. We replicated that from userspace:
+
+Channel: cmd_buf desc with `meta_data = CAM_ISP_PACKET_META_COMMON (3)` is
+appended verbatim as a CDM BL by cam_isp_add_command_buffers
+(`Meta_Common num_ent=2 handle=.. len=128 offset=168` in kmsg proves it
+executed). BL payload must be memcpy'd into the mapped cmd buffer — a stack
+payload reads as zeros and raises CDM "Invalid command IRQ" (observed).
+Encodings: ChangeBase word0=(8<<24)|base24 (IFE1 base 0xB6000); RegRandom
+word0=(4<<24)|npairs, then (offset,value) pairs.
+
+The payload that woke the CAMIF up (INIT packet, ordered):
+- 0x2C/0x30/0x34/0x38/0x3C = 0xFFFFFFFF — LENS/STATS/COLOR/ZOOM/bus cgc_ovd
+  (camif start only un-gates STATS). Not sufficient alone (tested: still
+  silent).
+- 0x088 = 0xA00 — io_format, PLAIN16(5)<<9 camif raw pack.
+- 0x484 = (h-1)<<16|(w-1) — pixels_per_line/lines_per_frame. THE key write:
+  with it the CAMIF starts counting lines (first EOF appeared).
+- 0x488 = w-1, 0x48C = h-1 — first/last pixel/line.
+- 0x494 = 0x1F1F, 0x498/0x49C = 0xFFFFFFFF — subsample period/patterns.
+- 0x46C = 3 — camif_input = CAMIF_MIPI_INPUT (enum msm_vfe_camif_input,
+  msmb_isp.h). Inherited VFE4.7 semantic; harmless per RAW_DUMP success.
+- 0x478 = 0x4 then 0x1 — camif_cmd clear+set input enable
+  (msm_vfe47_update_camif_state ENABLE). Nobody in the techpack writes
+  0x478 at all. THIS is what turns on SOF/EPOCH/EOF IRQs.
+- 0x048 = 0xFFFFFFFF — COLOR group master enable (vfe170 top
+  module_ctrl.color.enable; dead code in-kernel). Did NOT unlock NV12 by
+  itself; kept as best-known state.
+
+Reference for all of the above: msm_vfe47.c (wahoo lineage-17.0
+camera_v2/isp) — same register layout for the CAMIF block on Titan 170.
+
+Observed on device (debug_mdl=8, restored to 0 after):
+- TPG+PIX NV12 after payload v2 (geometry): first CAMIF activity ever —
+  one EOF at teardown. After v3 (+input select/enable): 147 SOF + 147
+  EPOCH + 147 EOF over the run window, clean 30 fps cadence, zero CSID/
+  VFE errors, but fence still -110: frame dies inside the color pipe.
+- TPG+PIX RAW_DUMP after v3: `SYNC_WAIT rc=0 result=0 (signaled)`,
+  /tmp/tpg_pixraw3.raw = 3034000 B (1640x925x2), content 0x03FC color
+  bars. First PIX-path frame on device.
+- Real rear sensor (slot 0 imx363 2016x1136, --gain 16 --dgain 2):
+  fence signaled in 119 ms; /tmp/real_pixraw.raw = 4580352 B = 4032x1136
+  PLAIN16_10, live Bayer values (~0x3C-0x47 at those gains, per-pixel
+  noise). PIX RAW_DUMP works with the real sensor.
+- CSID PXL-path PPP IRQ silence during PIX streaming is expected: its
+  IRQ mask (init_config_pxl_path) arms only RST_DONE/FIFO_OVERFLOW/
+  CCIF_VIOLATION.
+
+What remains for NV12 (next session): the color-pipe module programs
+(demosaic dimensions/config, CSC mode, CCM/gamma). Sources: camx userspace
+(not public), or RE of redfin's vendor camera blobs (chromatix bins /
+camera HAL .so). No kernel-side shortcut exists in any public techpack.
+Device state: baked #4, stock vendor_boot, debug_mdl=0, binary
+/data/local/tmp/cam-shot-pix (md5 4dbdada2b4de8456e96ddfb264c02928).
+Flags: --pix (NV12), --pix-raw (RAW_DUMP), --ife-base.
