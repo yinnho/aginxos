@@ -29,7 +29,14 @@ ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null
 # power cuts exactly because a kmsg follower was running (last line:
 # "PMIC input: code=116"). Heartbeat stamps uptime every 5s — where it
 # stops vs when USB died discriminates hang-vs-power on the next death.
-(cat /dev/kmsg > /var/kmsg-follow.log 2>/dev/null) &
+# Bounded: 387 MB of kmsg filled the 2 GB rootfs on 2026-09-01 (adb push
+# ENOSPC). head -c caps each file at 32 MB (cat dies on SIGPIPE), the
+# loop rotates to .old — the record is always the most recent ~64 MB.
+(while :; do
+  mv -f /var/kmsg-follow.log /var/kmsg-follow.old 2>/dev/null
+  cat /dev/kmsg 2>/dev/null | head -c 33554432 > /var/kmsg-follow.log
+  sleep 5
+done) &
 (while :; do
   echo "$(date +%H%M%S) up=$(cut -d. -f1 /proc/uptime)" >> /var/heartbeat.log
   sleep 5
