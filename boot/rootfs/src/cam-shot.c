@@ -39,7 +39,10 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
+
+#include "jpegenc.h"
 
 /* ---- cam_defs.h ---- */
 struct cam_control {
@@ -1898,6 +1901,12 @@ static unsigned g_cit;        /* coarse integration lines, 0 = mode default */
 static double g_gain = 1.0;   /* analog gain multiplier 1..16 */
 static double g_dgain = 1.0;  /* digital gain multiplier 1..16 */
 static int g_png;             /* also write /tmp/frame.png (gray8) */
+/* --jpeg [q]: also encode the frame as JPEG (default color, q85).
+ * --jpeg-gray / --jpeg-out override. Output path defaults to the raw dump
+ * path with .raw swapped for .jpg. */
+static int g_jpeg_q;
+static int g_jpeg_color = 1;
+static const char *g_jpeg_out;
 
 /* replace-or-append one byte register in a CONFIG table (cfg_regs is sized
  * 128; callers stay far below that) */
@@ -2207,6 +2216,125 @@ static void dump_png(const uint8_t *rdi, uint32_t w, uint32_t h, uint32_t stride
         return;
     }
     printf("png: %ux%u gray8, %zu B payload -> %s\n", w, h, raw_len, path);
+}
+
+/* ---- JPEG path (M19c) ----
+ * RAW10 RDI -> gray8 (bits[9:2]) -> optional bilinear debayer (RGGB —
+ * verified correct phase for imx363 and imx481 on device 2026-09-01;
+ * imx355 unverifiable, lens was blocked) -> jpegenc.h. */
+static uint8_t *cs_raw10_gray(const uint8_t *raw, uint32_t w, uint32_t h,
+                              uint32_t stride)
+{
+    uint8_t *g = malloc((size_t)w * h);
+    if (!g) return NULL;
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *r = raw + (size_t)y * stride;
+        for (uint32_t x = 0; x + 4 <= w; x += 4) {
+            const uint8_t *p = r + (size_t)(x / 4) * 5;
+            g[(size_t)y * w + x + 0] = p[0];
+            g[(size_t)y * w + x + 1] = p[1];
+            g[(size_t)y * w + x + 2] = p[2];
+            g[(size_t)y * w + x + 3] = p[3];
+        }
+    }
+    return g;
+}
+
+static uint8_t cs_at(const uint8_t *g, uint32_t w, uint32_t h,
+                     int64_t x, int64_t y)
+{
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= (int64_t)w) x = w - 1;
+    if (y >= (int64_t)h) y = h - 1;
+    return g[(size_t)y * w + (size_t)x];
+}
+
+static uint8_t *cs_debayer(const uint8_t *g, uint32_t w, uint32_t h)
+{
+    uint8_t *rgb = malloc((size_t)w * h * 3);
+    if (!rgb) return NULL;
+    for (uint64_t y = 0; y < h; y++)
+        for (uint64_t x = 0; x < w; x++) {
+            /* RGGB: even row = R G, odd row = G B */
+            int site = !(y & 1) ? (!(x & 1) ? 0 : 1) : (!(x & 1) ? 1 : 2);
+            int R, G, B;
+            int l = cs_at(g, w, h, x - 1, y), r = cs_at(g, w, h, x + 1, y);
+            int u = cs_at(g, w, h, x, y - 1), d = cs_at(g, w, h, x, y + 1);
+            int ul = cs_at(g, w, h, x - 1, y - 1), ur = cs_at(g, w, h, x + 1, y - 1);
+            int dl = cs_at(g, w, h, x - 1, y + 1), dr = cs_at(g, w, h, x + 1, y + 1);
+            if (site == 0) {          /* R site */
+                R = g[(size_t)y * w + x];
+                G = (l + r + u + d) / 4;
+                B = (ul + ur + dl + dr) / 4;
+            } else if (site == 2) {   /* B site */
+                B = g[(size_t)y * w + x];
+                G = (l + r + u + d) / 4;
+                R = (ul + ur + dl + dr) / 4;
+            } else if (!(y & 1)) {    /* G on R row: R left/right */
+                G = g[(size_t)y * w + x];
+                R = (l + r) / 2;
+                B = (u + d) / 2;
+            } else {                  /* G on B row: B left/right */
+                G = g[(size_t)y * w + x];
+                B = (l + r) / 2;
+                R = (u + d) / 2;
+            }
+            uint8_t *p = rgb + ((size_t)y * w + x) * 3;
+            p[0] = (uint8_t)R; p[1] = (uint8_t)G; p[2] = (uint8_t)B;
+        }
+    return rgb;
+}
+
+static void dump_jpeg(const uint8_t *rdi, uint32_t w, uint32_t h,
+                      uint32_t stride, const char *raw_path)
+{
+    char def[512];
+    const char *path = g_jpeg_out;
+    if (!path) {
+        snprintf(def, sizeof def, "%s", raw_path);
+        char *dot = strrchr(def, '.');
+        if (dot && !strcmp(dot, ".raw")) strcpy(dot, ".jpg");
+        else strcat(def, ".jpg");
+        path = def;
+    }
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+
+    uint8_t *g = cs_raw10_gray(rdi, w, h, stride);
+    if (!g) { fprintf(stderr, "jpeg: no mem for gray\n"); return; }
+    size_t cap = (size_t)w * h * 3 + 65536;
+    uint8_t *out = malloc(cap);
+    if (!out) { fprintf(stderr, "jpeg: no mem for %zu B out\n", cap); free(g); return; }
+    ssize_t n;
+    if (g_jpeg_color) {
+        uint8_t *rgb = cs_debayer(g, w, h);
+        free(g);
+        if (!rgb) { fprintf(stderr, "jpeg: no mem for rgb\n"); free(out); return; }
+        n = jpeg_encode_rgb24(rgb, (int)w, (int)h, (int)w * 3, g_jpeg_q,
+                              out, cap);
+        free(rgb);
+    } else {
+        n = jpeg_encode_gray8(g, (int)w, (int)h, (int)w, g_jpeg_q,
+                              out, (size_t)w * h + 65536);
+        free(g);
+    }
+    if (n < 0) { fprintf(stderr, "jpeg: encode overflow\n"); free(out); return; }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        free(out);
+        return;
+    }
+    int bad = wr_all(fd, out, (size_t)n) < 0;
+    close(fd);
+    free(out);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    double t = (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
+    if (bad) { fprintf(stderr, "jpeg: write failed\n"); return; }
+    printf("jpeg: %ux%u %s q%d -> %zd B (%.2f bpp) in %.3f s -> %s\n",
+           w, h, g_jpeg_color ? "color" : "gray", g_jpeg_q, n,
+           (double)n * 8 / ((double)w * h), t, path);
 }
 
 /* sensor NOP packet for req_id — registers the request with the req mgr
@@ -3138,6 +3266,8 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     size_t nz = inspect_buf(pix_map, (size_t)pixbuf_len, out_path, "frame");
     if (nz && g_png)
         dump_png(pix_map, width, height, stride, "/tmp/frame.png");
+    if (nz && g_jpeg_q > 0)
+        dump_jpeg(pix_map, width, height, stride, out_path);
     rc = nz ? 0 : 3;   /* fence signaled but empty buffer = no frame */
 
 out:
@@ -3314,6 +3444,25 @@ int main(int argc, char **argv)
             g_keep0112 = 1;
         else if (strcmp(argv[i], "--png") == 0)
             g_png = 1;
+        else if (strcmp(argv[i], "--jpeg") == 0) {
+            g_jpeg_q = 85;
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                g_jpeg_q = atoi(argv[++i]);
+            if (g_jpeg_q < 1 || g_jpeg_q > 100) {
+                fprintf(stderr, "--jpeg: q 1..100\n");
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--jpeg-color") == 0) {
+            g_jpeg_color = 1;
+            if (!g_jpeg_q) g_jpeg_q = 85;
+        }
+        else if (strcmp(argv[i], "--jpeg-gray") == 0) {
+            g_jpeg_color = 0;
+            if (!g_jpeg_q) g_jpeg_q = 85;
+        }
+        else if (strcmp(argv[i], "--jpeg-out") == 0 && i + 1 < argc)
+            g_jpeg_out = argv[++i];
         else if (strcmp(argv[i], "--cit") == 0 && i + 1 < argc)
             g_cit = (unsigned)strtoul(argv[++i], 0, 0);
         else if (strcmp(argv[i], "--gain") == 0 && i + 1 < argc)

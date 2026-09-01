@@ -92,6 +92,10 @@ mkdir -p "${TREE}/bin"
 # --rawvendor [--gain N] [--png].
 "${ZIG}" cc -target aarch64-linux-musl -static -O2 \
   -o "${TREE}/bin/cam-shot" "${RECIPE}/src/cam-shot.c"
+# raw2jpg (M19c) — RAW10 dump -> JPEG converter, companion to cam-shot's
+# native --jpeg (for converting already-captured dumps).
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/raw2jpg" "${RECIPE}/src/raw2jpg.c"
 
 # Bionic LD_PRELOAD helpers (M3d). These load into vendor binaries, so they
 # must be NDK/bionic shared objects, not musl. trace_open.so mirrors file
