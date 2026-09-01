@@ -1525,6 +1525,26 @@ static int g_rawvendor;
 static int g_slowrear;
 static int g_rear564;
 static int g_keep0112;
+static unsigned g_cit;        /* coarse integration lines, 0 = mode default */
+static double g_gain = 1.0;   /* analog gain multiplier 1..16 */
+static double g_dgain = 1.0;  /* digital gain multiplier 1..16 */
+static int g_png;             /* also write /tmp/frame.png (gray8) */
+
+/* replace-or-append one byte register in a CONFIG table (cfg_regs is sized
+ * 128; callers stay far below that) */
+static void cfg_override(struct wreg *r, size_t *n, uint16_t addr, uint8_t val)
+{
+    for (size_t i = 0; i < *n; i++) {
+        if (r[i].addr == addr) {
+            r[i].val = val;
+            return;
+        }
+    }
+    r[*n].addr = addr;
+    r[*n].val = val;
+    r[*n].width = 8;
+    (*n)++;
+}
 /* --tpg: arm the CSID's built-in test pattern generator instead of the PHY
  * RX (CAM_ISP_IFE_IN_RES_TPG). The whole sensor side (probe, power, register
  * lists, csiphy) is skipped, so a frame proves the IFE/RDI pipeline alone —
@@ -1690,6 +1710,134 @@ static size_t inspect_buf(const uint8_t *p8, size_t n, const char *path,
         }
     }
     return nz;
+}
+
+/* ---- minimal grayscale PNG writer ----
+ * 8-bit gray, zlib stored (uncompressed) DEFLATE blocks: no zlib dependency,
+ * output ~width*height + 0.03% overhead. Fine for pulling a frame off the
+ * phone; swap in a real compressor when upload bandwidth matters.
+ * bitwise crc32 (continuable) + adler32, ~20 MB/s — fine for one frame. */
+static uint32_t crc32_upd(const uint8_t *d, size_t n, uint32_t crc)
+{
+    crc = ~crc;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= d[i];
+        for (int k = 0; k < 8; k++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
+    }
+    return ~crc;
+}
+
+static int wr_all(int fd, const void *buf, size_t n)
+{
+    const uint8_t *p = buf;
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w <= 0) return -1;
+        p += w;
+        n -= (size_t)w;
+    }
+    return 0;
+}
+
+static int png_chunk(int fd, const char type[4], const uint8_t *data, size_t n)
+{
+    uint8_t hdr[8] = {
+        (uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n,
+        (uint8_t)type[0], (uint8_t)type[1], (uint8_t)type[2], (uint8_t)type[3],
+    };
+    uint32_t crc = crc32_upd(data, n, crc32_upd(hdr + 4, 4, 0));
+    uint8_t tail[4] = {
+        (uint8_t)(crc >> 24), (uint8_t)(crc >> 16), (uint8_t)(crc >> 8), (uint8_t)crc,
+    };
+    if (wr_all(fd, hdr, 8) < 0 || (n && wr_all(fd, data, n) < 0) ||
+        wr_all(fd, tail, 4) < 0)
+        return -1;
+    return 0;
+}
+
+/* RAW10 RDI buffer (stride bytes/row, 5-byte groups = 4 px, MSB byte carries
+ * bits[9:2] so gray8 = first 4 bytes of each group) -> PNG. */
+static void dump_png(const uint8_t *rdi, uint32_t w, uint32_t h, uint32_t stride,
+                     const char *path)
+{
+    size_t raw_len = (size_t)(w + 1) * h;   /* filter byte 0 per row */
+    uint8_t *rows = malloc(raw_len);
+    if (!rows) {
+        fprintf(stderr, "png: no mem for %zu B\n", raw_len);
+        return;
+    }
+    for (uint32_t r = 0; r < h; r++) {
+        uint8_t *out = rows + (size_t)r * (w + 1);
+        *out++ = 0;   /* filter none */
+        const uint8_t *in = rdi + (size_t)r * stride;
+        for (uint32_t xb = 0; xb + 4 < stride; xb += 5) {
+            *out++ = in[xb];
+            *out++ = in[xb + 1];
+            *out++ = in[xb + 2];
+            *out++ = in[xb + 3];
+        }
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        free(rows);
+        return;
+    }
+    static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    uint8_t ihdr[13];
+    ihdr[0] = (uint8_t)(w >> 24); ihdr[1] = (uint8_t)(w >> 16);
+    ihdr[2] = (uint8_t)(w >> 8);  ihdr[3] = (uint8_t)w;
+    ihdr[4] = (uint8_t)(h >> 24); ihdr[5] = (uint8_t)(h >> 16);
+    ihdr[6] = (uint8_t)(h >> 8);  ihdr[7] = (uint8_t)h;
+    ihdr[8] = 8;    /* bit depth */
+    ihdr[9] = 0;    /* gray */
+    ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    int bad = wr_all(fd, sig, 8) || png_chunk(fd, "IHDR", ihdr, 13);
+    /* zlib stream in one IDAT chunk: 0x78 0x01 + stored blocks + adler32 */
+    size_t nblk = (raw_len + 65534) / 65535;
+    size_t idat_len = 2 + nblk * 5 + raw_len + 4;
+    uint8_t *idat = malloc(idat_len);
+    if (!idat) {
+        fprintf(stderr, "png: no mem for %zu B idat\n", idat_len);
+        close(fd);
+        free(rows);
+        return;
+    }
+    size_t io = 0;
+    idat[io++] = 0x78;
+    idat[io++] = 0x01;
+    uint32_t adler_a = 1, adler_b = 0;
+    size_t off = 0;
+    while (off < raw_len) {
+        size_t chunk = raw_len - off > 65535 ? 65535 : raw_len - off;
+        idat[io++] = (uint8_t)(off + chunk >= raw_len ? 1 : 0);
+        idat[io++] = (uint8_t)chunk;
+        idat[io++] = (uint8_t)(chunk >> 8);
+        idat[io++] = (uint8_t)~chunk;
+        idat[io++] = (uint8_t)(~chunk >> 8);
+        memcpy(idat + io, rows + off, chunk);
+        for (size_t i = 0; i < chunk; i++) {
+            adler_a = (adler_a + rows[off + i]) % 65521;
+            adler_b = (adler_b + adler_a) % 65521;
+        }
+        io += chunk;
+        off += chunk;
+    }
+    idat[io++] = (uint8_t)(adler_b >> 8);
+    idat[io++] = (uint8_t)adler_b;
+    idat[io++] = (uint8_t)(adler_a >> 8);
+    idat[io++] = (uint8_t)adler_a;
+    bad = bad || png_chunk(fd, "IDAT", idat, io) ||
+          png_chunk(fd, "IEND", NULL, 0);
+    free(idat);
+    close(fd);
+    free(rows);
+    if (bad) {
+        fprintf(stderr, "png: write failed\n");
+        return;
+    }
+    printf("png: %ux%u gray8, %zu B payload -> %s\n", w, h, raw_len, path);
 }
 
 /* sensor NOP packet for req_id — registers the request with the req mgr
@@ -2113,6 +2261,35 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
                     cfg_regs[i].val = 0x5e;
             printf("rear564: OP_MUL 188->94 (564 Mbps/lane)\n");
         }
+        /* exposure/gain (imx355-family formulas, mainline imx355.c):
+         * CIT 0x0202 (<= FLL-10), analog gain 0x0204 multiplier =
+         * 1024/(1024-reg) so reg = 1024-1024/g (max 960 = 16x), digital
+         * gain 0x020e (256 = 1x) with 0x3070=1 selecting global. Mode
+         * #2610 defaults CIT 2474 (FLL 2488) and gain 1x — correct for a
+         * lit room; a dark scene needs --gain/--dgain, not more time. */
+        if (g_cit) {
+            cfg_override(cfg_regs, &n_cfg, 0x0202, (uint8_t)(g_cit >> 8));
+            cfg_override(cfg_regs, &n_cfg, 0x0203, (uint8_t)(g_cit & 0xff));
+            printf("exposure: CIT=%u lines\n", g_cit);
+        }
+        if (g_gain > 1.0) {
+            double m = g_gain > 16.0 ? 16.0 : g_gain;
+            unsigned gv = (unsigned)(1024.0 - 1024.0 / m + 0.5);
+            if (gv > 960) gv = 960;
+            cfg_override(cfg_regs, &n_cfg, 0x0204, (uint8_t)(gv >> 8));
+            cfg_override(cfg_regs, &n_cfg, 0x0205, (uint8_t)(gv & 0xff));
+            printf("analog gain: %.2fx (reg 0x%03x)\n",
+                   1024.0 / (1024.0 - (double)gv), gv);
+        }
+        if (g_dgain > 1.0) {
+            double m = g_dgain > 16.0 ? 16.0 : g_dgain;
+            unsigned dv = (unsigned)(m * 256.0 + 0.5);
+            if (dv > 4095) dv = 4095;
+            cfg_override(cfg_regs, &n_cfg, 0x3070, 0x01);
+            cfg_override(cfg_regs, &n_cfg, 0x020e, (uint8_t)(dv >> 8));
+            cfg_override(cfg_regs, &n_cfg, 0x020f, (uint8_t)(dv & 0xff));
+            printf("digital gain: %.2fx (reg 0x%03x)\n", dv / 256.0, dv);
+        }
         if (g_halfrate) {
             for (size_t i = 0; i < n_cfg; i++)
                 if (cfg_regs[i].addr == 0x0307)
@@ -2534,6 +2711,8 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
 
     /* 14. inspect + dump */
     size_t nz = inspect_buf(pix_map, (size_t)pixbuf_len, out_path, "frame");
+    if (nz && g_png)
+        dump_png(pix_map, width, height, stride, "/tmp/frame.png");
     rc = nz ? 0 : 3;   /* fence signaled but empty buffer = no frame */
 
 out:
@@ -2708,6 +2887,14 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--keep0112") == 0)
             g_keep0112 = 1;
+        else if (strcmp(argv[i], "--png") == 0)
+            g_png = 1;
+        else if (strcmp(argv[i], "--cit") == 0 && i + 1 < argc)
+            g_cit = (unsigned)strtoul(argv[++i], 0, 0);
+        else if (strcmp(argv[i], "--gain") == 0 && i + 1 < argc)
+            g_gain = atof(argv[++i]);
+        else if (strcmp(argv[i], "--dgain") == 0 && i + 1 < argc)
+            g_dgain = atof(argv[++i]);
         else if (strcmp(argv[i], "--halfrate") == 0)
             g_halfrate = 1;
         else if (strcmp(argv[i], "--real") == 0)
