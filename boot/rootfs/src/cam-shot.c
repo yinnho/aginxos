@@ -2353,6 +2353,47 @@ static void dump_jpeg(const uint8_t *rdi, uint32_t w, uint32_t h,
            (double)n * 8 / ((double)w * h), t, path);
 }
 
+/* numbered output path for frame `frameno` of `total` (suffix -<n>
+ * when bursting) */
+static void frame_path(char *out, size_t outsz, const char *base,
+                       int frameno, int total)
+{
+    if (total == 1) {
+        snprintf(out, outsz, "%s", base);
+        return;
+    }
+    const char *dot = strrchr(base, '.');
+    if (dot)
+        snprintf(out, outsz, "%.*s-%d%s",
+                 (int)(dot - base), base, frameno, dot);
+    else
+        snprintf(out, outsz, "%s-%d", base, frameno);
+}
+
+/* heavy pass for one landed frame: buffer stats + optional raw dump +
+ * optional PNG/JPEG. dump_raw==0 keeps the stats but skips the multi-MB
+ * write. Returns nonzero bytes seen. */
+static size_t process_frame(const uint8_t *map, size_t len,
+                            const char *out_path, int frameno, int total,
+                            uint32_t width, uint32_t height, uint32_t stride,
+                            int dump_raw)
+{
+    char fpath[512];
+    frame_path(fpath, sizeof fpath, out_path, frameno, total);
+    size_t nz = inspect_buf(map, len, dump_raw ? fpath : NULL, "frame");
+    if (nz && g_png) {
+        char ppath[512];
+        if (total == 1)
+            snprintf(ppath, sizeof ppath, "/tmp/frame.png");
+        else
+            snprintf(ppath, sizeof ppath, "/tmp/frame-%d.png", frameno);
+        dump_png(map, width, height, stride, ppath);
+    }
+    if (nz && g_jpeg_q > 0)
+        dump_jpeg(map, width, height, stride, fpath);
+    return nz;
+}
+
 /* dump the kernel-built CDM command region of an UPDATE packet's kmd
  * scratch: the RDI write-master base address lives in there. Scan u32s for
  * IOVA-looking values plus a raw prefix for eyeballing. */
@@ -2462,7 +2503,10 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     uint32_t session = 0, sensor_hdl = 0, csiphy_hdl = 0, isp_hdl = 0,
              link_hdl = 0, rail_hdl = 0;
     struct shot_bufs sb = {0}, ib = {0};
-    /* per-frame pixel buffers + fences (--frames N) */
+    /* per-frame pixel buffers + fences (--frames N). The kernel's IFE
+     * UPDATE packet pool tops out ~19 packets (observed 2026-09-01:
+     * "isp UPDATE packet 20: Out of memory" pre-queueing 150), so the
+     * pre-queue window is MAXF and longer runs recycle slots. */
     enum { MAXF = 16 };
     /* per-request UPDATE packets: the IFE hw mgr builds CDM commands into
      * the packet's own kmd scratch at submit and derefs them at SOF apply
@@ -2480,6 +2524,11 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
         pix_mfd[fi] = -1;
         sync_obj[fi] = 0;
     }
+    /* buffers/fences exist for `window` frames; nframes > MAXF runs RING
+     * mode — each slot is recycled for request f+window the moment its
+     * fence signals (see the wait loop). */
+    int window = nframes < (int)MAXF ? nframes : (int)MAXF;
+    int ring = nframes > (int)MAXF;
     double kt = 0;
     /* mode dims: slot 0 (rear imx363) = vendor-bin 2016x1136 binned mode
      * (2.86 MB RAW10); slot 1 (UW imx481) = vendor-bin mode #1301
@@ -3063,7 +3112,7 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     printf("isp iommu: img %d (sec %d), cdm %d\n",
         qisp.device_iommu.non_secure, qisp.device_iommu.secure,
         qisp.cdm_iommu.non_secure);
-    for (int fi = 0; fi < nframes; fi++) {
+    for (int fi = 0; fi < window; fi++) {
         pix[fi].len = pixbuf_len;
         pix[fi].align = 4096;
         pix[fi].mmu_hdls[0] = qisp.device_iommu.non_secure;
@@ -3085,10 +3134,11 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
             (unsigned long long)pixbuf_len);
     }
 
-    /* 8. per-frame sync fences (frame-done signals) */
+    /* 8. per-frame sync fences (frame-done signals) — window of them in
+     * ring mode; a fresh one is created on each slot recycle */
     struct cam_sync_info sinfo;
     struct cam_private_ioctl_arg sarg;
-    for (int fi = 0; fi < nframes; fi++) {
+    for (int fi = 0; fi < window; fi++) {
         memset(&sinfo, 0, sizeof(sinfo));
         snprintf(sinfo.name, sizeof(sinfo.name), "cam-shot-rdi0-%d", fi + 1);
         memset(&sarg, 0, sizeof(sarg));
@@ -3200,8 +3250,9 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
      * its end-of-frame address register and writes the next frame past the
      * buffer end (SMMU PF at round_up(pix_end) + CAMNOC decode error +
      * RDI Error STATUS_1=0x4, observed 2026-09-01 burst3). --roll restores
-     * the rolling variant for A/B. */
-    for (int rq = 1; rq <= nframes; rq++) {
+     * the rolling variant for A/B. Ring mode pre-queues the window (all
+     * MAXF slots); recycling happens at each fence below. */
+    for (int rq = 1; rq <= window; rq++) {
         if (shot_alloc(video_fd, &ub[rq - 1], 8192,
                        qisp.cdm_iommu.non_secure) < 0)
             goto out;
@@ -3305,14 +3356,23 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
         verify_cfg_table(sensor_fd, &sb, session, sensor_hdl, cfg_regs, n_cfg,
                          "post-START");
 
-    /* 14. wait on each fence in order (frame i signals as it lands) */
+    /* 14. wait on each fence in order (frame i signals as it lands).
+     * RING mode (nframes > MAXF): only `window` buffers exist; frame f
+     * lives in slot f%window. The moment its fence signals, the slot is
+     * recycled for request f+window (retire the fired fence, create a
+     * fresh one, SCHED_REQ + UPDATE + NOP), then the heavy pass runs on
+     * the landed frame IN PLACE — the slot is not rewritten until that
+     * request executes at SOF, window frame periods away (0.17 s encode
+     * vs >=1 s margin). Raw dumps are skipped: nframes x 2.86 MB would
+     * fill tmpfs; JPEG/PNG stay per-frame-numbered. */
     int frames_ok = 0, frames_empty = 0;
     for (int fi = 0; fi < nframes; fi++) {
-        printf("[t=%.3f] waiting for frame %d/%d (fence %d, %d ms)...\n",
-               mono(), fi + 1, nframes, sync_obj[fi], wait_ms);
+        int slot = fi % window;
+        printf("[t=%.3f] waiting for frame %d/%d (fence %d, slot %d, %d ms)...\n",
+               mono(), fi + 1, nframes, sync_obj[slot], slot, wait_ms);
         struct cam_sync_wait sw;
         memset(&sw, 0, sizeof(sw));
-        sw.sync_obj = (int32_t)sync_obj[fi];
+        sw.sync_obj = (int32_t)sync_obj[slot];
         sw.timeout_ms = (uint64_t)wait_ms;
         memset(&sarg, 0, sizeof(sarg));
         sarg.id = CAM_SYNC_WAIT;
@@ -3341,7 +3401,7 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
              * direct evidence of the scrambling mode (lane swap ->
              * structured repeats, analog noise -> spread corruption,
              * zero -> path never wrote). */
-            inspect_buf(pix_map[fi], (size_t)pixbuf_len, out_path, "partial");
+            inspect_buf(pix_map[slot], (size_t)pixbuf_len, out_path, "partial");
             rc = 2;
             goto out;
         }
@@ -3350,7 +3410,7 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
         /* rolling mode only: queue the next request NOW, while the sensor
          * is between frames (pre-queue mode already has every request in) */
         if (g_roll && fi + 1 < nframes) {
-            int rq = fi + 2;
+            int rq = fi + 2, rslot = (rq - 1) % window;
             printf("[t=%.3f] queueing req %d (SCHED_REQ)\n", mono(), rq);
             struct cam_req_mgr_sched_request sr;
             memset(&sr, 0, sizeof(sr));
@@ -3368,7 +3428,7 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
             }
             struct cam_buf_io_cfg io;
             memset(&io, 0, sizeof(io));
-            io.mem_handle[0] = (int32_t)pix[rq - 1].out.buf_handle;
+            io.mem_handle[0] = (int32_t)pix[rslot].out.buf_handle;
             io.offsets[0] = 0;
             io.planes[0].width = width;
             io.planes[0].height = height;
@@ -3377,7 +3437,7 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
             io.format = CAM_FORMAT_MIPI_RAW_10;
             io.bpp = 10;
             io.resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
-            io.fence = (int32_t)sync_obj[rq - 1];
+            io.fence = (int32_t)sync_obj[rslot];
             io.direction = CAM_BUF_OUTPUT;
             io.subsample_pattern = 1;
             io.subsample_period = 1;
@@ -3385,7 +3445,7 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
             io.framedrop_period = 1;
             printf("[t=%.3f] req %d: UPDATE packet\n", mono(), rq);
             t0 = kt;
-            if (isp_config(video_fd, isp_fd, &ub[rq - 1], session, isp_hdl,
+            if (isp_config(video_fd, isp_fd, &ub[rslot], session, isp_hdl,
                            1 /* UPDATE */, rq, 0, 1, &io) < 0) {
                 fprintf(stderr, "isp UPDATE packet %d: %s\n", rq,
                         strerror(errno));
@@ -3393,7 +3453,7 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
                 rc = 2;
                 goto out;
             }
-            dump_kmd(&ub[rq - 1], rq);
+            dump_kmd(&ub[rslot], rq);
             if (sensor_nop(video_fd, sensor_fd, &sb, session, sensor_hdl,
                            rq) < 0) {
                 fprintf(stderr, "sensor NOP req%d: %s\n", rq, strerror(errno));
@@ -3403,39 +3463,168 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
             }
             printf("[t=%.3f] req %d/%d queued (buf 0x%x, fence %d)\n",
                    mono(), rq, nframes,
-                   pix[rq - 1].out.buf_handle, sync_obj[rq - 1]);
+                   pix[rslot].out.buf_handle, sync_obj[rslot]);
+        }
+
+        /* ring: recycle this slot for request fi+window+1 (its fence just
+         * fired — retire it, arm a fresh one), then process the landed
+         * frame in place. Requeue BEFORE the encode so the pipeline
+         * refills first; the buffer stays untouched until the request
+         * executes window frames later. */
+        if (ring && fi + window < nframes) {
+            int rq = fi + window + 1;
+            memset(&sinfo, 0, sizeof(sinfo));
+            sinfo.sync_obj = (int32_t)sync_obj[slot];
+            memset(&sarg, 0, sizeof(sarg));
+            sarg.id = CAM_SYNC_DESTROY;
+            sarg.size = sizeof(sinfo);
+            sarg.ioctl_ptr = (uint64_t)(uintptr_t)&sinfo;
+            if (ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg) < 0)
+                fprintf(stderr, "CAM_SYNC_DESTROY[%d]: %s\n", slot,
+                        strerror(errno));
+            memset(&sinfo, 0, sizeof(sinfo));
+            snprintf(sinfo.name, sizeof(sinfo.name), "cam-shot-rdi0-%d", rq);
+            memset(&sarg, 0, sizeof(sarg));
+            sarg.id = CAM_SYNC_CREATE;
+            sarg.size = sizeof(sinfo);
+            sarg.ioctl_ptr = (uint64_t)(uintptr_t)&sinfo;
+            if (sync_fd < 0 ||
+                ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg) < 0) {
+                fprintf(stderr, "CAM_SYNC_CREATE[%d]: %s\n", slot,
+                        strerror(errno));
+                rc = 2;
+                goto out;
+            }
+            sync_obj[slot] = (uint32_t)sinfo.sync_obj;
+            struct cam_req_mgr_sched_request sr;
+            memset(&sr, 0, sizeof(sr));
+            sr.session_hdl = (int32_t)session;
+            sr.link_hdl = (int32_t)link_hdl;
+            sr.sync_mode = 0;
+            sr.req_id = rq;
+            t0 = kt;
+            if (cam_ioctl(video_fd, CAM_REQ_MGR_SCHED_REQ, &sr,
+                          CAM_HANDLE_USER_POINTER, sizeof(sr)) < 0) {
+                fprintf(stderr, "SCHED_REQ %d: %s\n", rq, strerror(errno));
+                kt = stream_kmsg(kmsg, t0);
+                rc = 2;
+                goto out;
+            }
+            struct cam_buf_io_cfg io;
+            memset(&io, 0, sizeof(io));
+            io.mem_handle[0] = (int32_t)pix[slot].out.buf_handle;
+            io.offsets[0] = 0;
+            io.planes[0].width = width;
+            io.planes[0].height = height;
+            io.planes[0].plane_stride = stride;
+            io.planes[0].slice_height = height;
+            io.format = CAM_FORMAT_MIPI_RAW_10;
+            io.bpp = 10;
+            io.resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
+            io.fence = (int32_t)sync_obj[slot];
+            io.direction = CAM_BUF_OUTPUT;
+            io.subsample_pattern = 1;
+            io.subsample_period = 1;
+            io.framedrop_pattern = 1;
+            io.framedrop_period = 1;
+            t0 = kt;
+            if (isp_config(video_fd, isp_fd, &ub[slot], session, isp_hdl,
+                           1 /* UPDATE */, rq, 0, 1, &io) < 0) {
+                fprintf(stderr, "isp UPDATE packet %d: %s\n", rq,
+                        strerror(errno));
+                kt = stream_kmsg(kmsg, t0);
+                rc = 2;
+                goto out;
+            }
+            if (sensor_nop(video_fd, sensor_fd, &sb, session, sensor_hdl,
+                           rq) < 0) {
+                fprintf(stderr, "sensor NOP req%d: %s\n", rq, strerror(errno));
+                kt = stream_kmsg(kmsg, kt);
+                rc = 2;
+                goto out;
+            }
+        }
+        if (ring) {
+            /* spill the frame to disk and move on — the encode pass runs
+             * after the burst (0.17 s/frame would stall this loop past the
+             * 67 ms frame period and drain the in-flight window) */
+            char fpath[512];
+            frame_path(fpath, sizeof fpath, out_path, fi + 1, nframes);
+            int fd = open(fpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) {
+                fprintf(stderr, "spill %s: %s\n", fpath, strerror(errno));
+                frames_empty++;
+            } else {
+                size_t off = 0;
+                while (off < (size_t)pixbuf_len) {
+                    ssize_t w = write(fd, (uint8_t *)pix_map[slot] + off,
+                                      (size_t)pixbuf_len - off);
+                    if (w <= 0)
+                        break;
+                    off += (size_t)w;
+                }
+                close(fd);
+                if (off < (size_t)pixbuf_len) {
+                    fprintf(stderr, "spill %s: short write\n", fpath);
+                    frames_empty++;
+                }
+            }
         }
     }
 
-    /* 15. heavy pass: all frames have landed in their buffers; inspect +
-     * dump + JPEG each (suffix -i when bursting). Kept out of the wait
-     * loop so encode time never throttles the burst. */
-    for (int fi = 0; fi < nframes; fi++) {
-        char fpath[512];
-        if (nframes == 1) {
-            snprintf(fpath, sizeof fpath, "%s", out_path);
-        } else {
-            const char *dot = strrchr(out_path, '.');
-            if (dot)
-                snprintf(fpath, sizeof fpath, "%.*s-%d%s",
-                         (int)(dot - out_path), out_path, fi + 1, dot);
-            else
-                snprintf(fpath, sizeof fpath, "%s-%d", out_path, fi + 1);
+    /* 15. heavy pass (non-ring: every frame sits in its own buffer; ring
+     * spilled each frame to disk). Kept out of the wait loop so encode
+     * time never throttles the burst. */
+    if (!ring) {
+        for (int fi = 0; fi < window; fi++) {
+            size_t nz = process_frame(pix_map[fi], (size_t)pixbuf_len,
+                                      out_path, fi + 1, nframes, width,
+                                      height, stride, 1);
+            if (!nz)
+                frames_empty++;
         }
-        size_t nz = inspect_buf(pix_map[fi], (size_t)pixbuf_len, fpath,
-                                "frame");
-        if (nz && g_png) {
-            char ppath[512];
-            if (nframes == 1)
-                snprintf(ppath, sizeof ppath, "/tmp/frame.png");
-            else
-                snprintf(ppath, sizeof ppath, "/tmp/frame-%d.png", fi + 1);
-            dump_png(pix_map[fi], width, height, stride, ppath);
+    } else {
+        /* ring post-encode from the spilled raws: inspect + JPEG each,
+         * then unlink the raw to hand tmpfs back */
+        uint8_t *rb = malloc((size_t)pixbuf_len);
+        if (!rb) {
+            fprintf(stderr, "post-encode alloc: %s\n", strerror(errno));
+            rc = 2;
+            goto out;
         }
-        if (nz && g_jpeg_q > 0)
-            dump_jpeg(pix_map[fi], width, height, stride, fpath);
-        if (!nz)
-            frames_empty++;
+        printf("== post-encode %d spilled frames ==\n", nframes);
+        for (int f = 1; f <= nframes; f++) {
+            char fpath[512];
+            frame_path(fpath, sizeof fpath, out_path, f, nframes);
+            int fd = open(fpath, O_RDONLY);
+            if (fd < 0) {
+                fprintf(stderr, "post %s: %s\n", fpath, strerror(errno));
+                frames_empty++;
+                continue;
+            }
+            size_t off = 0;
+            while (off < (size_t)pixbuf_len) {
+                ssize_t r = read(fd, rb + off, (size_t)pixbuf_len - off);
+                if (r <= 0)
+                    break;
+                off += (size_t)r;
+            }
+            close(fd);
+            size_t nz = off < (size_t)pixbuf_len
+                          ? 0
+                          : inspect_buf(rb, (size_t)pixbuf_len, NULL, "frame");
+            if (nz && g_png) {
+                char ppath[512];
+                snprintf(ppath, sizeof ppath, "/tmp/frame-%d.png", f);
+                dump_png(rb, width, height, stride, ppath);
+            }
+            if (nz && g_jpeg_q > 0)
+                dump_jpeg(rb, width, height, stride, fpath);
+            if (!nz)
+                frames_empty++;
+            unlink(fpath);
+        }
+        free(rb);
     }
     rc = frames_empty == 0 ? 0 : (frames_empty == nframes ? 3 : 4);
     goto out;
@@ -3642,8 +3831,9 @@ int main(int argc, char **argv)
             g_jpeg_out = argv[++i];
         else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             g_frames = atoi(argv[++i]);
-            if (g_frames < 1 || g_frames > 16) {
-                fprintf(stderr, "--frames: 1..16\n");
+            if (g_frames < 1 || g_frames > 999) {
+                fprintf(stderr, "--frames: 1..999 (<=16 pre-queued, "
+                                ">16 ring mode — see the wait loop note)\n");
                 return 1;
             }
         }

@@ -3555,3 +3555,39 @@ errors, no faults.
 
 Device state at session end: baked rootfs #4 running, /var restored,
 Wi-Fi on the Legrand AP.
+
+## M19c ring mode: sustained real-time burst — UPDATE packet pool cap + raw-spill design (2026-09-01, ninth session cont'd)
+
+Long bursts (--frames > 16) run ring mode: MAXF(16) slots pre-queued,
+each slot recycled for request f+16 at its fence (retire + fresh
+CAM_SYNC_CREATE, SCHED_REQ + UPDATE + NOP on the same buffer/kmd
+packet). Two limits and one pacing fact discovered:
+
+1. **Kernel IFE UPDATE packet pool caps ~19 packets** — pre-queueing
+   150 died at "isp UPDATE packet 20: Out of memory" (CAM_IOCTL
+   failure). The pool is per-context and pre-allocated; pixel buffers
+   themselves alloc fine for 150 (only the kmd UPDATE packets don't).
+   Hence ring recycling is the only path past ~19 requests.
+2. **In-loop JPEG encode stalls the ring**: 0.17 s/frame encode vs the
+   67 ms frame period drains the 16-deep window after ~1 s and the
+   effective capture rate drops to ~3 fps (150 frames over 51 s —
+   observed before the fix). Fix: the wait loop only SPILLS each frame
+   to a numbered raw on tmpfs (~3 ms write); a post-encode pass
+   (inspect + JPEG + unlink) runs after the burst.
+3. With spill, 150 frames take 149 x 66.8 ms = 9.95 s — true real-time
+   15 fps (t2033.640 -> t2043.592), all fences signaled, 150 JPEGs,
+   RC=0.
+
+Exposure sweep for the dark-indoors complaint (rear imx363, mode
+#2610 defaults CIT 2474 = near FLL max, gain 1x): mean YAVG via ffmpeg
+signalstats — default 19/255; --gain 4 -> 22; --gain 8 -> 30; --gain
+16 -> 44; --gain 16 --dgain 2 -> 68 (usable indoor night image, noise
+acceptable). Gain regs 0x0204/0x0205 + dgain 0x020e confirmed working
+on imx363 (not just imx355).
+
+Demo artifacts on the Mac: ~/Desktop/burst10s.gif / burst10s.mp4
+(150 x 2016x1136 color q85, 15 fps real-time).
+
+Device state: baked #4 running; test binary /tmp/cam-shot-ring3
+(md5 = repo build). Ring mode lands to boot/rootfs/src/cam-shot.c;
+next bake folds it.
