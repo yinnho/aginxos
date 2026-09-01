@@ -102,6 +102,55 @@ SoC 选型依据：NPU 现在有三个常驻理由（ASR、离线兜底对话、
 热预算调度进 carrier：读 thermal zone，热则降并发限频；cron 夜轮
 排凌晨限速慢跑（转 30 分钟还是 5 分钟，没人在乎）。
 
+**功耗功劳归属（澄清，防误读）**：省电的是「裸 Linux 无 Android
+框架税 + 精简常驻集」这个形态，**不是 Rust**——语言编译产物与 C
+同档效率，功耗由内核与硬件决定（cpuidle 深浅、cpufreq 策略、
+suspend、WiFi 芯片省电模式、DRAM 自刷新、时钟门控）。Rust 的贡献
+是间接的：无 GC/无 VM → 常驻内存几十 MB（DRAM 自刷新是待机大头）
++ 唤醒源少（无 GC/VM 定时唤醒，CPU 躺得住深 idle），让小而稳的
+常驻集工程成本低。**是使能者，不是功耗来源**——同一颗芯片跑
+Android 与跑裸 Linux 待机差一个量级，语言没变，OS 形态变了。
+
+## 语言分层立法：C 驱动与 Rust 的边界
+
+「驱动」拆两层，**Rust 写到 ioctl 为止**：
+
+```
+┌─ 应用（aginx/carrier/表情渲染）────────── 全 Rust
+├─ 用户态外设访问层（eye/ear/mouth/face）── 全 Rust ← 我们写的
+├─ vendor 库（librockchip_mpp/rga/RKNN）─── C，FFI 包薄绑定
+├─ ioctl /dev 边界（v4l2/pcm/drm/mpp）
+├─ 内核驱动（ISP/VPU/codec/DSI/USB…）───── C，BSP 现成继承
+└─ u-boot / 设备树 ──────────────────────── C + DTS 数据，继承
+```
+
+- **内核层留 C（能改不该改）**：RK3576 钉在 vendor BSP 内核（ISP/
+  VPU/NPU 主线支持不全），该分支无 Rust for Linux 基建，自维护
+  内核 fork 与团队规模不匹配；且 BSP 已把硬件全暴露成 /dev 节点，
+  内核驱动是继承不是开发
+- **用户态访问层全 Rust（本来就该）**：眼=v4l2r、耳嘴=cpal + speex
+  AEC、脸=drm-rs（DRM 本质是 ioctl，rustix 裸写亦可）、GPIO/LED/
+  温控=文件读写原生
+- **三件 vendor 库 FFI 包薄，unsafe 圈死在 ffi/**：librockchip_mpp/
+  librga/RKNN runtime 是 vendor 黑盒（文档不全、magic number 多），
+  重写纯亏；薄绑定 + RAII guard 包 fd/buffer 生命周期（MPP buffer
+  与 DMA-BUF 跨库传递是风险集中点）。ffmpeg 走 MPP 版当 CLI 子进程
+  调，不包 FFI
+
+新 crate `periph`（五官各一模块，对外全安全 API；Termux 阶段 -1
+五官模块 stub 掉，系统层照跑——不依赖具体硬件形态）：
+
+```
+crates/periph/
+  eye.rs      V4L2 拍照 → NV12/JPEG
+  ear.rs      cpal 采集 + speex AEC 前端 → f32 帧
+  mouth.rs    TTS 音频播放队列
+  face.rs     DRM 直绘（表情状态机消费）
+  npu.rs      RKNN FFI（whisper/Qwen 加载与推理调度）
+  thermal.rs  温度读取 + 热预算接口（carrier 调度消费）
+  ffi/        vendor 绑定，unsafe 只出现在这
+```
+
 ## 成本三本账（2026-08-31 估算，立项 RFQ 三家报价校准）
 
 **NRE（ODM 全定制一次性）**：
