@@ -11,7 +11,10 @@
 //      INIT(op0: clock/csid-clock/hfr/sensor-dim blobs) + UPDATE(op1 req1:
 //      io_cfg RDI_0 + cam_sync fence) -> sensor START -> SCHED_REQ(1)
 //      -> cam_sync WAIT on /dev/video4 -> read pixel buffer -> dump.
-//   Register lists are the mainline imx355 1640x1232 2-lane 24MHz mode.
+//   Register lists: default front (slot 2) = mainline imx355 1640x1232
+//   2-lane 24MHz mode; --rear (slot 0) = the device's own vendor-bin imx363
+//   tables (2016x1136 binned, 4-lane, 24MHz MCLK), extracted from the
+//   chromatix module bin — see the imx363 block below for provenance.
 //   All protocol structs mirrored from techpack/camera uapi (LineageOS
 //   redbull) — packed where the kernel structs are packed, natural where not.
 //
@@ -222,6 +225,15 @@ struct cam_isp_clock_config {
 } __attribute__((packed));
 struct cam_isp_csid_clock_config { uint64_t csid_clock; }
     __attribute__((packed));
+/* cam_cpas.h: one AXI path vote; cam_isp.h: V2 wrapper (packed) */
+struct cam_axi_per_path_bw_vote {
+    uint32_t usage_data, transac_type, path_data_type, reserved;
+    uint64_t camnoc_bw, mnoc_ab_bw, mnoc_ib_bw, ddr_ab_bw, ddr_ib_bw;
+} __attribute__((packed));
+struct cam_isp_bw_config_v2 {
+    uint32_t usage_type, num_paths;
+    struct cam_axi_per_path_bw_vote axi_path[1];
+} __attribute__((packed));
 struct cam_isp_port_hfr_config {
     uint32_t resource_type, subsample_pattern, subsample_period,
              framedrop_pattern, framedrop_period, reserved;
@@ -240,7 +252,8 @@ struct cam_isp_sensor_config_blob {
 
 /* IFE resource ids — uapi cam_isp_ife.h */
 #define CAM_ISP_IFE_IN_RES_TPG  0x4000
-#define CAM_ISP_IFE_IN_RES_PHY_2  0x4003
+#define CAM_ISP_IFE_IN_RES_BASE 0x4000
+#define CAM_ISP_IFE_IN_RES_PHY_2  0x4003  /* = BASE+3: phy idx 2 (front) */
 #define CAM_ISP_IFE_OUT_RES_RDI_0 0x3006
 /* ISP packet meta / blob types — cam_isp.h */
 #define CAM_ISP_PACKET_META_BASE              0
@@ -391,12 +404,33 @@ static struct slot_cfg slots[3] = {
         { SENSOR_VDIG,  0, 1 }, { SENSOR_VANA,  0, 1 },
         { SENSOR_VIO,   0, 1 } }, .n_down = 5 },
     [2] = { "front", .addr = 0x34, .up = {
+        /* DT cam-sensor@2 (front imx355, cci1 master 0, csiphy 2, roll 270
+         * / yaw 0). The node carries ONLY cam_vio + cam_clk regulators, so
+         * VANA/VDIG seq entries match nothing in msm_camera_fill_vreg_params
+         * and the kernel skips them silently (INVALID_VREG — confirmed
+         * 2026-08-31: fill printed only "j: 0 cam_vio"; ldo2/ldo5 belong to
+         * the rear ultrawide @1).
+         *
+         * Stock imx355_module.bin power-up (re-decoded 2026-09-01: 2-u64
+         * header, (type, cfg, delay) u64-triples, 1-u64 trailer): GPIO1=1
+         * d1 -> MCLK 24 MHz d1 -> RESET=1 d12; down: MCLK 0 -> GPIO1 0 ->
+         * VIO 0. GPIO1 = CUSTOM_GPIO1 = pm8150l gpio2 (1101), @2's own DT
+         * pin (en_rwcam is gpio10 — NOT this one), the module's master
+         * enable, active high. INCK must be stable BEFORE XCLR releases.
+         *
+         * cap16 caveat: that run flashed a STALE binary — kmsg showed the
+         * old bad table (GPIO1 cfg=0 + junk MCLK cfg=1 before the 24 MHz
+         * entry), so GPIO1=0 was what actually ran: 3 NACKed id reads then
+         * a good 0x355 on the retry, full config applied, still no MIPI.
+         * GPIO1=1 has never actually run — verify the binary's own table
+         * in kmsg "cam_sensor_update_power_settings" before trusting any
+         * result. */
         { SENSOR_VIO,          0, 1 },
-        { SENSOR_CUSTOM_GPIO1, 1, 5 },   /* PM8150L gpio2 */
-        { SENSOR_RESET,        1, 8 },
-        { SENSOR_MCLK,  24000000, 1 } }, .n_up = 4, .down = {
+        { SENSOR_CUSTOM_GPIO1, 1, 1 },
+        { SENSOR_MCLK,  24000000, 1 },
+        { SENSOR_RESET,        1, 12 } }, .n_up = 4, .down = {
         { SENSOR_MCLK,         0, 1 },
-        { SENSOR_RESET,        0, 5 },
+        { SENSOR_RESET,        0, 1 },
         { SENSOR_CUSTOM_GPIO1, 0, 1 },
         { SENSOR_VIO,          0, 1 } }, .n_down = 4 },
 };
@@ -484,6 +518,236 @@ static const struct wreg imx355_cfg[] = {
 
 static const struct wreg imx355_streamon[] = { {0x0100, 1, 8} };
 static const struct wreg imx355_streamoff[] = { {0x0100, 0, 8} };
+
+/* ---- imx355 vendor-bin tables (front, slot 2) ----
+ * Same decoder, the device's own imx355_module.bin: initSettings #704
+ * (50 writes) and mode regSetting #351 = 1640x925 2x2-binned, fll 0x0a36
+ * =2614, llp 0x072c=1836, PLL 0x0305<-2 / 0x0307<-0x78(120) -> VCO
+ * 24/2*120 = 1440 MHz, /10 (0x0301<-5 x 0x030d<-2) = 144 MHz pck; frame
+ * 2614*1836*30fps = 144 MHz — self-consistent at 30 fps. REQ_LINK_BIT_
+ * RATE 0x0820<-0x05a0 = 1440 Mbps TOTAL = 360 Mbps/lane over 4 lanes.
+ * KEY DIFFERENCE vs mainline imx355.c: the vendor bin sets 0x0114<-3 =
+ * 4 data lanes (mainline says 2). This device wires the front sensor on
+ * 4 lanes — the old 2-lane path was misconfigured. Verbatim, no PLL
+ * patching (24 MHz MCLK from DT cam-sensor@2 clock-rates 0x16e3600). */
+static const struct wreg imx355_vinit[] = {
+    {0x0137, 0x00, 8}, {0x304e, 0x03, 8}, {0x4348, 0x16, 8},
+    {0x4350, 0x19, 8}, {0x4408, 0x0a, 8}, {0x440c, 0x0b, 8},
+    {0x4411, 0x5f, 8}, {0x4412, 0x2c, 8}, {0x4623, 0x00, 8},
+    {0x462c, 0x0f, 8}, {0x462d, 0x00, 8}, {0x462e, 0x00, 8},
+    {0x4684, 0x54, 8}, {0x480a, 0x07, 8}, {0x4908, 0x07, 8},
+    {0x4909, 0x07, 8}, {0x490d, 0x0a, 8}, {0x491e, 0x0f, 8},
+    {0x4921, 0x06, 8}, {0x4923, 0x28, 8}, {0x4924, 0x28, 8},
+    {0x4925, 0x29, 8}, {0x4926, 0x29, 8}, {0x4927, 0x1f, 8},
+    {0x4928, 0x20, 8}, {0x4929, 0x20, 8}, {0x492a, 0x20, 8},
+    {0x492c, 0x05, 8}, {0x492d, 0x06, 8}, {0x492e, 0x06, 8},
+    {0x492f, 0x06, 8}, {0x4930, 0x03, 8}, {0x4931, 0x04, 8},
+    {0x4932, 0x04, 8}, {0x4933, 0x05, 8}, {0x595e, 0x01, 8},
+    {0x5963, 0x01, 8}, {0x0101, 0x03, 8}, {0x4010, 0x00, 8},
+    {0x4011, 0x00, 8}, {0x4012, 0x00, 8}, {0x4013, 0x00, 8},
+    {0x68a8, 0xfe, 8}, {0x68a9, 0xff, 8}, {0x6888, 0x00, 8},
+    {0x6889, 0x00, 8}, {0x3058, 0x00, 8}, {0x305a, 0x00, 8},
+    {0x68b0, 0x00, 8}, {0x3044, 0x00, 8},
+};
+
+/* mode #351 (1640x925): byte-split 16-bit regs as the bin writes them */
+static const struct wreg imx355_vcfg[] = {
+    {0x0113, 0x0a, 8},   /* CST_SZ 10-bit */
+    {0x0114, 0x03, 8},   /* LANE_SEL: 4 lanes (vendor; mainline says 2!) */
+    {0x0342, 0x07, 8}, {0x0343, 0x2c, 8},   /* LLP 1836 */
+    {0x0340, 0x0a, 8}, {0x0341, 0x36, 8},   /* FLL 2614 */
+    {0x0344, 0x00, 8}, {0x0345, 0x00, 8},   /* crop X 0 */
+    {0x0346, 0x01, 8}, {0x0347, 0x30, 8},   /* crop Y 304 */
+    {0x0348, 0x0c, 8}, {0x0349, 0xcf, 8},   /* X end 3279 */
+    {0x034a, 0x08, 8}, {0x034b, 0x67, 8},   /* Y end 2151 */
+    {0x0220, 0x00, 8}, {0x0222, 0x01, 8},
+    {0x0900, 0x01, 8}, {0x0901, 0x22, 8}, {0x0902, 0x00, 8},
+    {0x034c, 0x06, 8}, {0x034d, 0x68, 8},   /* X_OUT 1640 */
+    {0x034e, 0x03, 8}, {0x034f, 0x9c, 8},   /* Y_OUT 924 */
+    {0x0301, 0x05, 8}, {0x0303, 0x01, 8}, {0x0305, 0x02, 8},
+    {0x0306, 0x00, 8}, {0x0307, 0x78, 8},   /* PLL mult 120 */
+    {0x030b, 0x01, 8}, {0x030d, 0x02, 8}, {0x030e, 0x00, 8},
+    {0x030f, 0x1e, 8}, {0x0310, 0x00, 8},
+    {0x0700, 0x00, 8}, {0x0701, 0x10, 8},
+    {0x0820, 0x05, 8}, {0x0821, 0xa0, 8},   /* REQ_LINK 1440 Mbps total */
+    {0x3088, 0x02, 8},
+    {0x6813, 0x01, 8},
+    {0x6835, 0x00, 8}, {0x6836, 0x01, 8}, {0x6837, 0x02, 8},
+    {0x684d, 0x00, 8}, {0x684e, 0x01, 8}, {0x684f, 0x02, 8},
+    {0x0202, 0x0a, 8}, {0x0203, 0x2c, 8},   /* exposure 2600 */
+    {0x0204, 0x00, 8}, {0x0205, 0x00, 8},
+    {0x020e, 0x01, 8}, {0x020f, 0x00, 8},   /* digital gain 1.0x */
+};
+
+/* ---- imx363 register lists (vendor bin, NOT mainline) ----
+ * Rear camera, slot 0, slave 0x20 (INCK/XCLR latch, observed), chip id
+ * 0x363 @ reg 0x0016. Source: the device's own vendor chromatix bin
+ * /vendor/lib64/camera/com.qti.sensormodule.*imx363*.bin — a "Parameter
+ * Parser V2.0.0" container decoded by hand (TOC of 72B entries + per-
+ * element u64 streams; pairing rule addr[k] <- value of element k-1,
+ * verified against mainline imx355.c register-for-register). The vendor
+ * bin is this module's own tuning — the borrowed ChromeOS imx355 global
+ * list corrupted the front module's MIPI TX, so vendor tables are the
+ * only trustworthy source.
+ *
+ * MCLK: rear DT cam-sensor@0 clock-rates = 0x16e3600 = 24 MHz, same as
+ * cam-shot's power table. Vendor PLL for this mode: mult 0x0307=207,
+ * prediv 0x0305=4 -> VCO 24/4*207 = 1248 MHz, /sysck(2)/pck(3) = 208 MHz
+ * pixel clock; FLL 0x0674=1652, LLP 0x1050=4176 -> 33.2 ms/frame ~= 30 fps
+ * — the tables are self-consistent for 24 MHz INCK, no retuning needed.
+ * MIPI (Sony rule link/lane = pck*10/lanes, cross-checked on imx355):
+ * 520 Mbps/lane over 4 DPHY lanes. Exposure 0x0666 lines (~32.9 ms). */
+
+/* initSettings #2958 in the bin TOC: 29 single-byte writes, applied in
+ * standby as INITIAL_CONFIG. 0x0112/0x0113 CST_SZ (10-bit) prepended —
+ * the bin's head pair is the 16-bit EXTCLK write whose hi byte 0x0136
+ * falls off the k-1 pairing edge (lo 0x0137<-0x00 matches EXTCLK 0x1800
+ * = 24 MHz in 8.8 fixed point). */
+static const struct wreg imx363_init[] = {
+    {0x0112, 0x0a, 8},
+    {0x0137, 0x00, 8},
+    {0x31a3, 0x00, 8},
+    {0x64d4, 0x01, 8}, {0x64d5, 0xaa, 8}, {0x64d6, 0x01, 8},
+    {0x64d7, 0xa9, 8}, {0x64d8, 0x01, 8}, {0x64d9, 0xa5, 8},
+    {0x64da, 0x01, 8}, {0x64db, 0xa1, 8},
+    {0x720a, 0x24, 8}, {0x720b, 0x89, 8}, {0x720c, 0x85, 8},
+    {0x720d, 0xa1, 8}, {0x720e, 0x6e, 8},
+    {0x729c, 0x59, 8},
+    {0x817c, 0xff, 8}, {0x817d, 0x80, 8},
+    {0x9348, 0x96, 8}, {0x934b, 0x8c, 8}, {0x934c, 0x82, 8},
+    {0x9353, 0xaa, 8}, {0x9354, 0xaa, 8},
+    {0x5872, 0x00, 8}, {0x5873, 0x0c, 8},
+    {0x4b67, 0xff, 8}, {0x4bd0, 0x00, 8},
+    {0x0138, 0x00, 8},
+    {0x5d0c, 0x01, 8},
+};
+
+/* mode regSetting #544: 2016x1136 16:9, 2x2 binning (0x0900<-01/0x0901<-22),
+ * crop (0,376)-(4031,2647) of the 4032x3024 array, RAW10, 4 lanes
+ * (0x0114<-3), PLL mult 207. First real-sensor target: smallest sane
+ * frame (2.86 MB), 30 fps at 24 MHz MCLK. */
+static const struct wreg imx363_cfg[] = {
+    {0x0113, 0x0a, 8},
+    {0x0114, 0x03, 8},    /* LANE_SEL: 4 lanes */
+    {0x0220, 0x00, 8}, {0x0221, 0x11, 8},   /* digital gain 1.06x */
+    {0x0340, 0x06, 8}, {0x0341, 0x74, 8},   /* FLL 1652 */
+    {0x0342, 0x10, 8}, {0x0343, 0x50, 8},   /* LLP 4176 */
+    {0x0381, 0x01, 8}, {0x0383, 0x01, 8},
+    {0x0385, 0x01, 8}, {0x0387, 0x01, 8},
+    {0x0900, 0x01, 8},    /* binning mode */
+    {0x0901, 0x22, 8},    /* binning type 2x2 */
+    {0x30e4, 0x00, 8}, {0x30e8, 0x00, 8}, {0x30ea, 0x09, 8},
+    {0x30f4, 0x01, 8}, {0x30f5, 0xcc, 8},
+    {0x30f6, 0x00, 8}, {0x30f7, 0x14, 8},
+    {0x31a0, 0x03, 8}, {0x31a5, 0x00, 8}, {0x31a6, 0x00, 8},
+    {0x560f, 0xe6, 8},
+    {0x5856, 0x04, 8}, {0x58d0, 0x0e, 8},
+    {0x734a, 0x23, 8}, {0x734f, 0x64, 8}, {0x7441, 0x5a, 8},
+    {0x7914, 0x02, 8}, {0x7928, 0x08, 8}, {0x7929, 0x08, 8},
+    {0x793f, 0x02, 8},
+    {0xbc7b, 0x2c, 8},
+    {0x0344, 0x00, 8}, {0x0345, 0x00, 8},   /* X_ADD_START 0 */
+    {0x0346, 0x01, 8}, {0x0347, 0x78, 8},   /* Y_ADD_START 376 */
+    {0x0348, 0x0f, 8}, {0x0349, 0xbf, 8},   /* X_ADD_END 4031 */
+    {0x034a, 0x0a, 8}, {0x034b, 0x57, 8},   /* Y_ADD_END 2647 */
+    {0x034c, 0x07, 8}, {0x034d, 0xe0, 8},   /* X_OUT_SIZE 2016 */
+    {0x034e, 0x04, 8}, {0x034f, 0x70, 8},   /* Y_OUT_SIZE 1136 */
+    {0x0101, 0x03, 8},
+    {0x0408, 0x00, 8}, {0x0409, 0x00, 8},
+    {0x040a, 0x00, 8}, {0x040b, 0x00, 8},
+    {0x040c, 0x07, 8}, {0x040d, 0xe0, 8},   /* DOL out width 2016 */
+    {0x040e, 0x04, 8}, {0x040f, 0x70, 8},
+    {0x319c, 0x00, 8}, {0x7819, 0x00, 8},
+    {0x8118, 0x00, 8}, {0x8119, 0x02, 8}, {0x811b, 0x01, 8},
+    {0x0301, 0x03, 8},    /* IVT_PCK_DIV */
+    {0x0303, 0x02, 8},    /* IVT_SYSCK_DIV */
+    {0x0305, 0x04, 8},    /* IVT_PREPLLCK_DIV */
+    {0x0306, 0x00, 8}, {0x0307, 0xcf, 8},   /* PLL mult 207 */
+    {0x0309, 0x0a, 8}, {0x030b, 0x01, 8},
+    {0x030d, 0x04, 8}, {0x030e, 0x01, 8}, {0x030f, 0x32, 8},
+    {0x0310, 0x01, 8},
+    {0x0202, 0x06, 8}, {0x0203, 0x66, 8},   /* exposure 1638 lines */
+    {0x0224, 0x01, 8}, {0x0225, 0xf4, 8},
+    {0x0204, 0x00, 8}, {0x0205, 0x00, 8},   /* analog gain 0 */
+    {0x0216, 0x00, 8}, {0x0217, 0x00, 8},
+    {0x020e, 0x01, 8}, {0x020f, 0x00, 8},   /* digital gain */
+    {0x0226, 0x00, 8}, {0x0227, 0x00, 8},
+};
+
+/* Vendor-bin mode #2610 (decoded 2026-09-01): same 2016x1136 output, but the
+ * MIPI lane rate is 24 MHz/0x030d(4)*OP_MUL(0x00bc=188) = 1128 Mbps/lane vs
+ * mode #544's 1836. KEY: 0x0307 is the *pixel-clock* PLL mult (pck check:
+ * 24*78/2/3 = 312 MHz = llp 4176 * fll 2488 * 30 fps exactly) while the lane
+ * rate lives in 0x030e:0x030f — so the earlier --halfrate (0x0307 207->104)
+ * never lowered the MIPI rate and the rate-margin hypothesis was never
+ * actually tested. If headers ECC-clean at 1128 Mbps, corruption is SI at
+ * 1836, not protocol/config. */
+static const struct wreg imx363_mode2610[] = {
+    {0x0113, 0x0a, 8}, {0x0114, 0x03, 8},
+    {0x0220, 0x00, 8}, {0x0221, 0x11, 8},
+    {0x0340, 0x09, 8}, {0x0341, 0xb8, 8},   /* fll 2488 */
+    {0x0342, 0x10, 8}, {0x0343, 0x50, 8},   /* llp 4176 */
+    {0x0381, 0x01, 8}, {0x0383, 0x01, 8},
+    {0x0385, 0x01, 8}, {0x0387, 0x01, 8},
+    {0x0900, 0x01, 8}, {0x0901, 0x22, 8},
+    {0x30e4, 0x00, 8}, {0x30e8, 0x00, 8}, {0x30ea, 0x09, 8},
+    {0x30f4, 0x01, 8}, {0x30f5, 0xcc, 8},
+    {0x30f6, 0x00, 8}, {0x30f7, 0x14, 8},
+    {0x31a0, 0x03, 8}, {0x31a5, 0x00, 8}, {0x31a6, 0x00, 8},
+    {0x560f, 0xe6, 8}, {0x5856, 0x04, 8}, {0x58d0, 0x0e, 8},
+    {0x734a, 0x23, 8}, {0x734f, 0x64, 8}, {0x7441, 0x5a, 8},
+    {0x7914, 0x02, 8}, {0x7928, 0x08, 8}, {0x7929, 0x08, 8},
+    {0x793f, 0x02, 8}, {0xbc7b, 0x2c, 8},
+    {0x0344, 0x00, 8}, {0x0345, 0x00, 8},   /* x start 0 */
+    {0x0346, 0x01, 8}, {0x0347, 0x78, 8},   /* y start 376 */
+    {0x0348, 0x0f, 8}, {0x0349, 0xbf, 8},   /* x end 4031 */
+    {0x034a, 0x0a, 8}, {0x034b, 0x57, 8},   /* y end 2647 */
+    {0x034c, 0x07, 8}, {0x034d, 0xe0, 8},   /* out x 2016 */
+    {0x034e, 0x04, 8}, {0x034f, 0x70, 8},   /* out y 1136 */
+    {0x0101, 0x03, 8},
+    {0x0408, 0x00, 8}, {0x0409, 0x00, 8},
+    {0x040a, 0x00, 8}, {0x040b, 0x00, 8},
+    {0x040c, 0x07, 8}, {0x040d, 0xe0, 8},
+    {0x040e, 0x04, 8}, {0x040f, 0x70, 8},
+    {0x319c, 0x00, 8}, {0x7819, 0x00, 8},
+    {0x8118, 0x00, 8}, {0x8119, 0x02, 8}, {0x811b, 0x01, 8},
+    {0x0301, 0x03, 8}, {0x0303, 0x02, 8},
+    {0x0305, 0x04, 8}, {0x0306, 0x00, 8},
+    {0x0307, 0x4e, 8},                       /* pck VCO mult 78 */
+    {0x0309, 0x0a, 8},
+    {0x030b, 0x02, 8},
+    {0x030d, 0x04, 8},                       /* OP prediv */
+    {0x030e, 0x00, 8}, {0x030f, 0xbc, 8},   /* OP_MUL 188 -> 1128 Mbps/lane */
+    {0x0310, 0x01, 8},
+    {0x0202, 0x09, 8}, {0x0203, 0xaa, 8},   /* exposure 2474 lines */
+    {0x0224, 0x01, 8}, {0x0225, 0xf4, 8},
+    {0x0204, 0x00, 8}, {0x0205, 0x00, 8},
+    {0x0216, 0x00, 8}, {0x0217, 0x00, 8},
+    {0x020e, 0x01, 8}, {0x020f, 0x00, 8},
+    {0x0226, 0x01, 8}, {0x0227, 0x00, 8},
+};
+
+/* masterSettings (bin TOC #2900, decoded 2026-09-01): 8 writes the vendor
+ * applies when @0 runs as sync MASTER — which is its stock role for the
+ * rear trio (slaveSettings differ ONLY in 0x30a1<-0 / 0x5875<-0). Without
+ * them the imx363's external-sync block sits at reset defaults and gates
+ * frame readout: clock lane runs (PLL+PHY up, rx 0xd040ff) but no valid
+ * long packets — the exact pre-master state observed 2026-09-01. The
+ * stream's 9th element (value 9) pairs circularly with dropped head addr
+ * 0x30a0; held back until the 8 proven writes prove insufficient. */
+static const struct wreg imx363_master[] = {
+    {0x30a1, 0x01, 8},
+    {0x5875, 0x01, 8},
+    {0x5879, 0x01, 8},
+    {0x3310, 0x01, 8},
+    {0x5874, 0x01, 8},
+    {0x3316, 0x0c, 8},
+    {0x3317, 0x38, 8},
+    {0x0350, 0x00, 8},
+};
+
+/* IMX363 stream-on/off is the Sony MODE_SELECT 0x0100, same convention
+ * as imx355 — reuse the imx355_streamon/off tables for both sensors. */
 
 /* ---- helpers ---- */
 /* NB: video3 (cam_req_mgr) checks size == sizeof(payload struct), so the
@@ -633,13 +897,14 @@ static void bufs_free(int video_fd, struct bufs *b)
     if (b->c1_fd > 0)  close(b->c1_fd);
 }
 
+static double g_extclk_mhz; /* fwd: defined+initialized at ~line 1400 */
+
 static int probe_once(int video_fd, int sd_fd, int slot, uint32_t slave,
                       uint32_t reg, uint32_t expected)
 {
     struct bufs b;
     memset(&b, 0, sizeof(b));
     int rc = -1;
-
     if (alloc_buf(video_fd, 4096, 4096, &b.pkt) < 0) goto out;
     if (alloc_buf(video_fd, 256, 8, &b.c0) < 0) goto out;
     if (alloc_buf(video_fd, 1024, 8, &b.c1) < 0) goto out;
@@ -660,9 +925,11 @@ static int probe_once(int video_fd, int sd_fd, int slot, uint32_t slave,
     pr->addr_type = I2C_TYPE_WORD;
     pr->cmd_type = CMD_PROBE;
     pr->reg_addr = reg;
-    /* expected=0xFFFF/mask=0: id_by_mask returns the full 16-bit id and the
-     * compare always fails -> kmsg prints the real id (discovery mode).
-     * A matching value here makes the probe genuinely succeed. */
+    /* data_mask=0 lets cam_sensor_id_by_mask apply its ~0 fallback, i.e. a
+     * FULL 16-bit id compare (verified in cam_sensor_core.c:695 — an early
+     * theory that mask=0 made the compare vacuous was wrong). cap16's probe
+     * "rc=0" was real: 3 NACKed id reads, then 0x355 matched on the retry
+     * ("Probe success,slot:2"). */
     pr->expected_data = expected;
     pr->data_mask = 0;
     pr->camera_id = (uint16_t)slot;
@@ -673,10 +940,18 @@ static int probe_once(int video_fd, int sd_fd, int slot, uint32_t slave,
     uint8_t *q = b.p_c1;
     for (int i = 0; i < sc->n_up; i++) {
         struct cam_cmd_power *pw = (void *)q;
+        uint32_t cfg = sc->up[i].cfg;
+        /* --mclk also retargets the power-table MCLK entry (otherwise the
+         * flag only retunes PLL math and the kernel still programs 24 MHz).
+         * Feeding a deliberately wrong INCK is a live-pin discriminator: a
+         * sensor with a working INCK mistimes its PLL and the CSID shows
+         * error IRQs; a dead pad stays rx=0. */
+        if (sc->up[i].seq == SENSOR_MCLK && g_extclk_mhz != 24.0)
+            cfg = (uint32_t)(g_extclk_mhz * 1000000.0);
         pw->count = 1;
         pw->cmd_type = CMD_PWR_UP;
         pw->power_settings[0].power_seq_type = sc->up[i].seq;
-        pw->power_settings[0].config_val_low = sc->up[i].cfg;
+        pw->power_settings[0].config_val_low = cfg;
         q += sizeof(*pw);
         if (sc->up[i].delay) {
             struct cam_cmd_unconditional_wait *w = (void *)q;
@@ -830,6 +1105,8 @@ static double stream_kmsg(int fd, double since_us)
 
 /* find the subdev node for an entity type; want_slot >= 0 also matches the
  * querycap slot_info (sensor/csiphy). Returns fd or -1. */
+static char g_isp_node[32];
+static int g_hold_fds[2];
 static int find_subdev_by_type(uint32_t type, int want_slot, int *out_slot)
 {
     for (int mi = 0; mi < 8; mi++) {
@@ -884,6 +1161,8 @@ static int find_subdev_by_type(uint32_t type, int want_slot, int *out_slot)
                     if (out_slot)
                         *out_slot = (int)cap.slot_info;
                 }
+                if (type == CAM_ISP_DEVICE_TYPE)
+                    snprintf(g_isp_node, sizeof(g_isp_node), "%s", devp);
                 printf("  node %s = %s\n",
                     type == CAM_SENSOR_DEVICE_TYPE ? "sensor" :
                     type == CAM_CSIPHY_DEVICE_TYPE ? "csiphy" : "isp",
@@ -895,6 +1174,80 @@ static int find_subdev_by_type(uint32_t type, int want_slot, int *out_slot)
         close(mfd);
     }
     return -1;
+}
+
+/* --force-ife support: pre-acquire throwaway ISP contexts whose lane_cfg
+ * deliberately mismatches the real one, so the hw mgr's descending CSID scan
+ * (highest free first for single-IFE ctx) skips the occupied CSIDs and lands
+ * the real context on the requested IFE. Each throwaway is a full open() of
+ * the isp node (own ctx) + ACQUIRE_DEV + ACQUIRE_HW; never linked or started. */
+static int hold_higher_csids(uint32_t session, int n, uint32_t res_type,
+    uint32_t lane_num, uint32_t dt, uint32_t width, uint32_t height)
+{
+    static const uint32_t hold_cfg[2] = { 0x5, 0xa };
+    for (int k = 0; k < n; k++) {
+        int fd = open(g_isp_node, O_RDWR);
+        if (fd < 0) {
+            fprintf(stderr, "hold: open %s: %s\n", g_isp_node, strerror(errno));
+            return -1;
+        }
+        struct cam_acquire_dev_cmd iacq;
+        memset(&iacq, 0, sizeof(iacq));
+        iacq.session_handle = (int32_t)session;
+        iacq.handle_type = CAM_HANDLE_USER_POINTER;
+        iacq.num_resources = CAM_API_COMPAT_CONSTANT;
+        if (cam_ioctl(fd, CAM_ACQUIRE_DEV, &iacq,
+                      CAM_HANDLE_USER_POINTER, sizeof(iacq)) < 0) {
+            fprintf(stderr, "hold: ACQUIRE_DEV: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        uint8_t blob[256];
+        memset(blob, 0, sizeof(blob));
+        struct cam_isp_acquire_hw_info *ah = (void *)blob;
+        struct cam_isp_in_port_info *port = (void *)&ah->data;
+        ah->common_info_version = 0x1000;
+        ah->common_info_size = sizeof(*port);
+        ah->num_inputs = 1;
+        ah->input_info_version = 0x2000;
+        ah->input_info_size = sizeof(*port);
+        ah->input_info_offset = 0;
+        port->res_type = res_type;
+        port->lane_type = 0;
+        port->lane_num = lane_num;
+        port->lane_cfg = hold_cfg[k];
+        port->vc = 0;
+        port->dt = dt;
+        port->format = CAM_FORMAT_MIPI_RAW_10;
+        port->usage_type = 0;
+        port->left_width = width;
+        port->height = height;
+        port->pixel_clk = 0;
+        port->num_out_res = 1;
+        port->data[0].res_type = CAM_ISP_IFE_OUT_RES_RDI_0;
+        port->data[0].format = CAM_FORMAT_MIPI_RAW_10;
+        port->data[0].width = width;
+        port->data[0].height = height;
+        struct cam_acquire_hw_cmd_v2 ahw;
+        memset(&ahw, 0, sizeof(ahw));
+        ahw.struct_version = 2;
+        ahw.session_handle = (int32_t)session;
+        ahw.dev_handle = iacq.dev_handle;
+        ahw.handle_type = CAM_HANDLE_USER_POINTER;
+        ahw.data_size = 24 + (uint32_t)sizeof(*port);
+        ahw.resource_hdl = (uint64_t)(uintptr_t)blob;
+        if (cam_ioctl(fd, CAM_ACQUIRE_HW, &ahw,
+                      CAM_HANDLE_USER_POINTER, sizeof(ahw)) < 0) {
+            fprintf(stderr, "hold: ACQUIRE_HW (lane_cfg 0x%x): %s\n",
+                hold_cfg[k], strerror(errno));
+            close(fd);
+            return -1;
+        }
+        printf("hold ctx %d ok (lane_cfg 0x%x, hw id mask 0x%x)\n",
+            k, hold_cfg[k], ahw.hw_info.acquired_hw_id[0]);
+        g_hold_fds[k] = fd;
+    }
+    return 0;
 }
 
 /* build I2C random-write mosaic into buf; returns bytes used */
@@ -1063,6 +1416,59 @@ static const struct rbreg {
     {0x0100, 1,      1, "MODE_SELECT"},
 };
 
+/* imx363 readback (rear, slot 0): expectations straight from the vendor
+ * bin tables — no PLL patching, they are written verbatim. The mode
+ * table splits 16-bit values into byte writes, so read back the byte
+ * registers the table actually wrote (hi,lo of FLL/size, lane sel). */
+static const struct rbreg rbregs363[] = {
+    {0x0112, 0x0a,   1, "CST_SZ 10-bit"},
+    {0x0114, 0x0003, 1, "LANE_SEL 4"},
+    {0x0301, 0x03,  1, "PLL pck div 3"},
+    {0x0303, 0x02,  1, "PLL sysck div 2"},
+    {0x0305, 0x04,  1, "PLL prediv 4"},
+    {0x0306, 0x00,  1, "PLL mult hi"},
+    {0x0307, 0xcf,   1, "PLL mult 207"},
+    {0x0136, 0x18,  1, "INCK freq hi (0x1800=24M)"},
+    {0x0137, 0x00,  1, "INCK freq lo"},
+    {0x0820, 0x13,  1, "REQ_LINK_BIT_RATE hi"},
+    {0x0821, 0x68,  1, "REQ_LINK_BIT_RATE lo"},
+    {0x0309, 0x0a,  1, "PLL 0309"},
+    {0x030b, 0x01,  1, "PLL 030b"},
+    {0x030d, 0x04,  1, "PLL 030d"},
+    {0x030e, 0x01,  1, "PLL 030e"},
+    {0x030f, 0x32,  1, "PLL mipi div"},
+    {0x0310, 0x01,  1, "PLL 0310"},
+    {0x0342, 0x10,  1, "LLP hi"},
+    {0x0343, 0x50,  1, "LLP lo"},
+    {0x0340, 0x06,   1, "FLL hi"},
+    {0x0341, 0x74,   1, "FLL lo"},
+    {0x034c, 0x07,   1, "X_OUT hi"},
+    {0x034d, 0xe0,   1, "X_OUT lo"},
+    {0x034e, 0x04,   1, "Y_OUT hi"},
+    {0x034f, 0x70,   1, "Y_OUT lo"},
+    {0x0901, 0x22,   1, "binning 2x2"},
+    {0x0100, 1,      1, "MODE_SELECT"},
+};
+
+/* imx355 vendor readback (front, slot 2): byte regs the vendor mode
+ * table actually wrote (mirrors rbregs363 style). */
+static const struct rbreg rbregs355v[] = {
+    {0x0113, 0x0a,   1, "CST_SZ 10-bit"},
+    {0x0114, 0x0003, 1, "LANE_SEL 4"},
+    {0x0307, 0x78,   1, "PLL mult 120"},
+    {0x0340, 0x0a,   1, "FLL hi"},
+    {0x0341, 0x36,   1, "FLL lo"},
+    {0x034c, 0x06,   1, "X_OUT hi"},
+    {0x034d, 0x68,   1, "X_OUT lo"},
+    {0x034e, 0x03,   1, "Y_OUT hi"},
+    {0x034f, 0x9c,   1, "Y_OUT lo"},
+    {0x0901, 0x22,   1, "binning 2x2"},
+    {0x0100, 1,      1, "MODE_SELECT"},
+};
+
+/* active sensor slot for table selection (run_stream sets it) */
+static int g_slot = 2;
+
 /* MCLK input actually fed to the sensor: DT asks for 24 MHz (default);
  * --mclk 19 selects the 19.2 MHz parameter set. Chosen before packets are
  * built so both the write tables and the readback expectations follow. */
@@ -1079,6 +1485,26 @@ static double g_extclk_mhz = 24.0;
  * this module runs clk + 4 data lanes, so 4 is the default; the mainline
  * driver's 2-lane set stays reachable with --lanes 2. */
 static int g_lanes = 4;
+
+/* CSID CSI2_RX_CFG0 DL_INPUT_SEL fields, 4 bits per lane (uapi
+ * cam_isp_in_port_info.lane_cfg "4 bits per lane"; kernel writes it
+ * lane_cfg<<4 unmasked): lane_cfg[3:0]=DL0 sel, [7:4]=DL1, [11:8]=DL2,
+ * [15:12]=DL3. 0 is NOT identity — it makes every logical lane read
+ * physical D0 and the striped long-packet headers garble (FS/FE survive:
+ * broadcast shorts are lane-permutation-invariant). Canonical identity is
+ * 0x3210; observed 2026-09-01: with it the link is clean (WARNING_ECC-only,
+ * LONG_PKT VC:0 DT:0x2B WC:2520, RDI0 SOF+EOF per frame, 2860495/2862720
+ * nonzero bytes — first real frame). */
+static uint32_t g_lanecfg = 0x3210;
+/* --force-ife N: land the real context on CSID/IFE N instead of the mgr's
+ * default pick. cam_ife_hw_mgr_acquire_csid_hw walks CSIDs from the HIGHEST
+ * index down for a single-IFE context (is_start_lower_idx=false), so we always
+ * get IFE2 (the highest probed); an occupied CSID is only reused when
+ * lane_cfg/lane_type/lane_num all match, so pre-acquiring throwaway contexts
+ * with a different lane_cfg (0x5 / 0xa) on the higher CSIDs makes the real
+ * acquire fall through to N. Throwaways are never linked/configured/started —
+ * they only hold a CID + RDI reservation. */
+static int g_force_ife = -1;
 /* --noglobal: skip the 70-reg global init (mainline imx355 list, sourced
  * from a ChromeOS module build) and write only the per-mode config. A/B for
  * whether the borrowed global tuning is what corrupts this primax module's
@@ -1086,6 +1512,19 @@ static int g_lanes = 4;
 static int g_noglobal;
 /* --nostarton: see imx355_streamoff above. */
 static int g_nostarton;
+/* --halfrate (rear only): halve the vendor PLL multiplier (0x0307 207->104)
+ * to drop the MIPI lane rate ~2x (260 Mbps/lane, ~15 fps). Discriminates
+ * "rate too high for our CSID clock vote" from "link systematically
+ * corrupt": every packet ECC-fails at the vendor rate (observed
+ * 2026-09-01, ~line-rate error IRQs at the modeled 20us line time). */
+static int g_halfrate;
+/* --rawvendor: apply the rear imx363 tables exactly as the vendor bin
+ * decodes them — skip our appended 0x0136 (INCK) / 0x0820 (REQ_LINK)
+ * writes that the bin never makes (see the block at the rear CONFIG). */
+static int g_rawvendor;
+static int g_slowrear;
+static int g_rear564;
+static int g_keep0112;
 /* --tpg: arm the CSID's built-in test pattern generator instead of the PHY
  * RX (CAM_ISP_IFE_IN_RES_TPG). The whole sensor side (probe, power, register
  * lists, csiphy) is skipped, so a frame proves the IFE/RDI pipeline alone —
@@ -1093,6 +1532,26 @@ static int g_nostarton;
  * sensor's own 0x0600 pattern via --tp still needs PLL+start, so it never
  * exercised this). Kernel fixes TPG traffic at VC 0xA / DT 0x2B. */
 static int g_tpg;
+/* --railhelper: before powering the target slot, acquire the REAR sensor
+ * (slot 0) and hold its INIT in the same session. The front module's analog
+ * supply lives on rails only @0's regulator list references — the SLG51000
+ * camera PMIC (ldo1..6) and the gpio-switched 2.85V "camera_ldo" — so a
+ * front-only session raises nothing but SLG ldo7 (VIO, matrix 0x40) and the
+ * imx355 acks I2C (IF runs on VIO) with a dead PLL/MIPI. A rear session
+ * powers all of it (matrix 0x7f + camera_ldo observed 2026-09-01); holding
+ * the rear's INIT keeps those rails up across the front's own power-up. The
+ * helper device is never linked or started. */
+static int g_railhelper;
+/* --verify: full mode-table readback (every reg written vs read). */
+static int g_verify;
+/* --bw: append BW_CONFIG_V2 blob (IFE_RDI0 WRITE vote) to the INIT packet. */
+static int g_bw;
+/* --vc / --dt: RDI0's mapped virtual channel / data type in the IFE
+ * in_port (default 0 / 0x2B RAW10). Diagnostic sweep: if the sensor's
+ * image packets arrive on a different VC/DT the CSID flags
+ * UNMAPPED_VC_DT and drops every line → STREAM_UNDERFLOW, zero buffer. */
+static uint32_t g_vc = 0;
+static uint32_t g_dt = 0x2B;   /* RAW10 */
 
 /* per (mclk, lanes) PLL tuple: [mpy, prediv, sysck, link_total, lane_sel] */
 static void pll_params(uint32_t *m19)
@@ -1116,39 +1575,121 @@ static uint16_t extclk_reg(void)
 
 static void mclk_expect(uint32_t addr, uint32_t *val)
 {
-    uint32_t p[5];
-    pll_params(p);
-    switch (addr) {
-    case 0x0136: *val = extclk_reg(); break;
-    case 0x030e: *val = p[0]; break;      /* PLL_OP_MUL */
-    case 0x030d: *val = p[1]; break;      /* PLL_OP_PREDIV */
-    case 0x0303: *val = p[2]; break;      /* IVT_SYSCK_DIV */
-    case 0x0820: *val = p[3]; break;      /* REQ_LINK_BIT_RATE */
-    case 0x0114: *val = p[4]; break;      /* LANE_SEL */
-    }
+    (void)addr; (void)val;
+    return;   /* both slots run vendor-bin tables verbatim, no patching */
 }
 
 static void sensor_readback(int sd_fd, struct shot_bufs *b, uint32_t session,
                             uint32_t dev_hdl, const char *when)
-{
+{    const struct rbreg *rbs = g_slot == 0 ? rbregs363 : rbregs355v;
+    const size_t n_rbs = g_slot == 0
+        ? sizeof(rbregs363) / sizeof(rbregs363[0])
+        : sizeof(rbregs355v) / sizeof(rbregs355v[0]);
     printf("== sensor readback (%s) ==\n", when);
-    for (size_t i = 0; i < sizeof(rbregs) / sizeof(rbregs[0]); i++) {
+    for (size_t i = 0; i < n_rbs; i++) {
         uint8_t v[8] = {0xEE, 0xEE, 0xEE, 0xEE};
-        if (sensor_readreg(sd_fd, b, session, dev_hdl, rbregs[i].addr,
-                           rbregs[i].n, v) < 0) {
+        if (sensor_readreg(sd_fd, b, session, dev_hdl, rbs[i].addr,
+                           rbs[i].n, v) < 0) {
             printf("  0x%04x read FAILED (sensor not answering?)\n",
-                rbregs[i].addr);
+                rbs[i].addr);
             break;
         }
-        uint32_t got = rbregs[i].n == 2
+        uint32_t got = rbs[i].n == 2
             ? (uint32_t)((v[0] << 8) | v[1]) : v[0];
-        uint32_t expect = rbregs[i].val;
-        mclk_expect(rbregs[i].addr, &expect);
+        uint32_t expect = rbs[i].val;
+        mclk_expect(rbs[i].addr, &expect);
         printf("  0x%04x %-18s = 0x%0*x (expect 0x%x) %s\n",
-            rbregs[i].addr, rbregs[i].name, rbregs[i].n == 2 ? 4 : 2,
+            rbs[i].addr, rbs[i].name, rbs[i].n == 2 ? 4 : 2,
             got, expect,
             got == expect ? "ok" : "MISMATCH");
     }
+}
+
+/* --verify: read back EVERY register the mode table wrote (the wreg tables
+ * are byte-per-entry, so a 1-byte read at each addr compares exactly). The
+ * curated rb lists above sample 11 of ~51 writes; a single dropped I2C write
+ * in the PLL divider block (0x0301/0x0303/0x0305...) would scramble MIPI TX
+ * timing while every sampled reg still reads back clean. */
+static void verify_cfg_table(int sd_fd, struct shot_bufs *b, uint32_t session,
+                             uint32_t dev_hdl, const struct wreg *t, size_t n,
+                             const char *when)
+{
+    printf("== full mode-table readback (%s): %zu regs ==\n", when, n);
+    int bad = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t v = 0xEE;
+        if (sensor_readreg(sd_fd, b, session, dev_hdl, t[i].addr, 1, &v) < 0) {
+            printf("  0x%04x read FAILED\n", t[i].addr);
+            bad++;
+            break;
+        }
+        if (v != (uint8_t)t[i].val) {
+            printf("  0x%04x = 0x%02x expect 0x%02x MISMATCH\n",
+                t[i].addr, v, t[i].val);
+            bad++;
+        }
+    }
+    printf("verify: %d/%zu mismatch\n", bad, n);
+}
+
+/* dump + pattern analysis of the RDI pixel buffer. On failed runs the partial
+ * content distinguishes scrambling modes: lane-swap leaves structured repeats
+ * (valid bytes every Nth position), analog noise leaves spread corruption,
+ * and an all-zero buffer means the path never wrote. Returns nonzero count. */
+static size_t inspect_buf(const uint8_t *p8, size_t n, const char *path,
+                          const char *what)
+{
+    size_t nz = 0;
+    uint8_t mn = 255, mx = 0;
+    size_t first_nz = SIZE_MAX;
+    for (size_t i = 0; i < n; i++) {
+        if (p8[i]) {
+            nz++;
+            if (first_nz == SIZE_MAX)
+                first_nz = i;
+        }
+        if (p8[i] < mn) mn = p8[i];
+        if (p8[i] > mx) mx = p8[i];
+    }
+    printf("buffer(%s): nonzero %zu/%zu, byte range 0x%02x..0x%02x, first nz @%zu\n",
+        what, nz, n, mn, mx, first_nz == SIZE_MAX ? n : first_nz);
+    printf("first 64 B @0:");
+    for (int i = 0; i < 64; i++)
+        printf(" %02x", p8[i]);
+    printf("\n");
+    if (first_nz != SIZE_MAX) {
+        printf("first 64 B @%zu:", first_nz);
+        for (int i = 0; i < 64 && first_nz + (size_t)i < n; i++)
+            printf(" %02x", p8[first_nz + (size_t)i]);
+        printf("\n");
+        /* mod-5 histogram of nonzero bytes over the first 4 KB of content:
+         * RAW10 packs as 5-byte groups (4 pixels), so peaks at specific
+         * residues = intact groups at a shifted phase. */
+        size_t hist[5] = {0};
+        size_t lim = first_nz + 4096 < n ? first_nz + 4096 : n;
+        for (size_t i = first_nz; i < lim; i++)
+            if (p8[i])
+                hist[(i - first_nz) % 5]++;
+        printf("nonzero mod-5 histogram (first 4KB): %zu %zu %zu %zu %zu\n",
+            hist[0], hist[1], hist[2], hist[3], hist[4]);
+    }
+    if (path && path[0]) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+            size_t off = 0;
+            while (off < n) {
+                ssize_t w = write(fd, p8 + off, n - off);
+                if (w <= 0)
+                    break;
+                off += (size_t)w;
+            }
+            printf("dumped %zu B -> %s\n", off, path);
+            close(fd);
+        } else {
+            fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        }
+    }
+    return nz;
 }
 
 /* sensor NOP packet for req_id — registers the request with the req mgr
@@ -1235,16 +1776,35 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
 {
     int rc = 1, video_fd = -1, sync_fd = -1, kmsg = -1;
     int sensor_fd = -1, csiphy_fd = -1, isp_fd = -1;
+    int rail_fd = -1;
     int out_fd = -1;
     uint32_t session = 0, sensor_hdl = 0, csiphy_hdl = 0, isp_hdl = 0,
-             link_hdl = 0, sync_obj = 0;
+             link_hdl = 0, sync_obj = 0, rail_hdl = 0;
     struct shot_bufs sb = {0}, ib = {0}, ub = {0};
     struct cam_mem_mgr_alloc_cmd pix = {0};
     void *pix_map = MAP_FAILED;
     int pix_mfd = -1;
     double kt = 0;
-    const uint32_t width = 1640, height = 1232, stride = 2050, dt = 0x2B;
-    const uint64_t pixbuf_len = (uint64_t)stride * height;  /* 2,525,600 */
+    /* mode dims: slot 0 (rear imx363) = vendor-bin 2016x1136 binned mode
+     * (2.86 MB RAW10); slot 2 (front imx355) = vendor-bin 1640x925
+     * binned, pck 144 MHz (fll 2614 x llp 1836 x 30 fps). */
+    g_slot = slot;
+    uint32_t width = 1640, height = 925, stride = 2050;
+    uint32_t pixel_clk = 144000000, hbi = 1836, vbi = 2614;
+    if (slot == 0) {
+        width = 2016; height = 1136; stride = 2520;
+        /* timing model must match the applied mode table: #544 fll=1652
+         * pck=208M; #2610 (slowrear/rear564) fll=2488, pck = 4176*2488*30
+         * ~= 312M. Feeding #544 numbers under #2610 told the IFE to expect
+         * EOF a frame and a half early — CCIF-violation-shaped. */
+        if (g_slowrear) {
+            pixel_clk = 312000000; hbi = 4176; vbi = 2488;
+        } else {
+            pixel_clk = 208000000; hbi = 4176; vbi = 1652;
+        }
+    }
+    const uint32_t dt = g_dt;
+    const uint64_t pixbuf_len = (uint64_t)stride * height;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     video_fd = open("/dev/video3", O_RDWR);
@@ -1318,6 +1878,60 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     session = (uint32_t)si.session_hdl;
     printf("session %u\n", session);
 
+    /* 2a. --railhelper: hold the rear sensor's INIT so its rail set stays
+     * up for the target slot's power-up (see g_railhelper note). */
+    struct shot_bufs rail_sb = {0};
+    if (g_railhelper && slot != 0) {
+        rail_fd = find_subdev_by_type(CAM_SENSOR_DEVICE_TYPE, 0, NULL);
+        struct cam_sensor_acquire_dev racq;
+        memset(&racq, 0, sizeof(racq));
+        if (rail_fd < 0) {
+            fprintf(stderr, "railhelper: rear sensor node not found\n");
+            goto out;
+        }
+        /* the kernel rejects ACQUIRE_DEV with EINVAL until a successful
+         * PROBE marked is_probe_succeed=1 for that subdev (fresh boot) */
+        double tr0 = kt;
+        if (probe_once(video_fd, rail_fd, 0, slots[0].addr, 0x0016,
+                       slot_id[0]) != 0) {
+            fprintf(stderr, "railhelper: rear probe failed\n");
+            kt = kmsg_drain(kmsg, tr0);
+            goto out;
+        }
+        kt = kmsg_drain(kmsg, tr0);
+        racq.session_handle = session;
+        racq.handle_type = CAM_HANDLE_USER_POINTER;
+        if (cam_ioctl(rail_fd, CAM_ACQUIRE_DEV, &racq,
+                      CAM_HANDLE_USER_POINTER, sizeof(racq)) < 0) {
+            fprintf(stderr, "railhelper ACQUIRE_DEV: %s\n", strerror(errno));
+            goto out;
+        }
+        rail_hdl = racq.device_handle;
+        if (shot_alloc(video_fd, &rail_sb, 16 * 80 + 256, 0) < 0)
+            goto out;
+        double tr = kt;
+        if (sensor_config(video_fd, rail_fd, &rail_sb, session, rail_hdl,
+                          2 /* INITIAL_CONFIG */, imx363_init,
+                          sizeof(imx363_init) / sizeof(imx363_init[0])) < 0) {
+            fprintf(stderr, "railhelper INIT: %s\n", strerror(errno));
+            kt = stream_kmsg(kmsg, tr);
+            goto out;
+        }
+        kt = kmsg_drain(kmsg, tr);
+        printf("railhelper: rear @0 INIT held — SLG ldo1..7 + camera_ldo up\n");
+    }
+
+    /* 2b. occupy CSIDs above g_force_ife so the real acquire lands on it */
+    if (g_force_ife >= 0 && g_force_ife <= 2) {
+        int nhold = 2 - g_force_ife;
+        if (hold_higher_csids(session, nhold,
+                CAM_ISP_IFE_IN_RES_BASE + 1 + (uint32_t)phy_idx,
+                (uint32_t)g_lanes, dt, width, height) < 0)
+            goto out;
+        printf("holding %d higher csid(s); real acquire should land IFE%d\n",
+            nhold, g_force_ife);
+    }
+
     /* 3a. sensor acquire */
     struct cam_sensor_acquire_dev acq;
     memset(&acq, 0, sizeof(acq));
@@ -1376,10 +1990,16 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     ah->input_info_version = 0x2000;
     ah->input_info_size = sizeof(*port);
     ah->input_info_offset = 0;
-    port->res_type = g_tpg ? CAM_ISP_IFE_IN_RES_TPG : CAM_ISP_IFE_IN_RES_PHY_2;
+    /* in-port = the CSID PHY the sensor's csiphy routes to (PHY_0 for the
+     * rear, PHY_2 for the front); claiming the wrong PHY leaves the IFE
+     * listening on an RDI that never receives (observed: fence -110 with
+     * every other step green). */
+    port->res_type = g_tpg ? CAM_ISP_IFE_IN_RES_TPG
+                           : (CAM_ISP_IFE_IN_RES_BASE + 1 + (uint32_t)phy_idx);
     port->lane_type = 0;              /* DPHY */
-    port->lane_num = 2;
-    port->vc = 0;
+    port->lane_num = (uint32_t)g_lanes;
+    port->lane_cfg = g_lanecfg;
+    port->vc = g_vc;
     port->dt = dt;                    /* RAW10 */
     port->format = CAM_FORMAT_MIPI_RAW_10;
     port->test_pattern = 0;           /* TPG: incremental data */
@@ -1390,7 +2010,7 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     port->line_start = 0;
     port->line_stop = height - 1;
     port->height = height;
-    port->pixel_clk = 177600000;      /* 444MHz*2lane/10bit */
+    port->pixel_clk = pixel_clk;      /* imx363 208M / imx355 177.6M */
     port->num_out_res = 1;
     port->data[0].res_type = CAM_ISP_IFE_OUT_RES_RDI_0;
     port->data[0].format = CAM_FORMAT_MIPI_RAW_10;
@@ -1442,55 +2062,138 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
      * Only the STREAMON packet (sensor emitting) stays sensor-mode-only. */
     if (shot_alloc(video_fd, &sb, 16 * 80 + 256, 0) < 0)
         goto out;
+    const struct wreg *init_tbl = slot == 0 ? imx363_init : imx355_vinit;
+    size_t n_init = slot == 0
+        ? sizeof(imx363_init) / sizeof(imx363_init[0])
+        : sizeof(imx355_vinit) / sizeof(imx355_vinit[0]);
+    if (slot == 0 && !g_keep0112) {
+        /* 2026-09-01 exact register diff vs the vendor bin: our INIT = the
+         * bin's 29-write initSettings plus this prepended 0x0112=0x0a — the
+         * vendor NEVER writes 0x0112 (relies on POR default). That prepend
+         * was the sole sensor-state delta, so drop it by default;
+         * --keep0112 restores the old behavior for A/B. */
+        init_tbl++;
+        n_init--;
+    }
     double t0 = kt;
     if (!g_noglobal &&
         sensor_config(video_fd, sensor_fd, &sb, session, sensor_hdl,
-                      2 /* INITIAL_CONFIG */, imx355_global,
-                      sizeof(imx355_global) / sizeof(imx355_global[0])) < 0) {
+                      2 /* INITIAL_CONFIG */, init_tbl, n_init) < 0) {
         fprintf(stderr, "sensor INIT packet: %s\n", strerror(errno));
         kt = stream_kmsg(kmsg, t0);
         goto out;
     }
-    printf("sensor INIT (global %zu regs) %s\n",
-        sizeof(imx355_global) / sizeof(imx355_global[0]),
+    printf("sensor INIT (global %zu regs) %s\n", n_init,
         g_noglobal ? "SKIPPED (--noglobal)" : "applied");
     t0 = kt;
     /* tp: force the sensor's built-in test pattern (reg 0x0600) — makes it
      * emit MIPI regardless of the array, separating "sensor transmits" from
      * "sensor exposes". */
-    struct wreg cfg_regs[sizeof(imx355_cfg) / sizeof(imx355_cfg[0])];
-    memcpy(cfg_regs, imx355_cfg, sizeof(cfg_regs));
-    {
-        /* patch the PLL block for (mclk, lanes): the base table carries
-         * the 24 MHz 2-lane set; everything else is derived here */
-        uint32_t p[5];
-        uint32_t addrs[5] = { 0x030e, 0x030d, 0x0303, 0x0820, 0x0114 };
-        pll_params(p);
-        for (size_t i = 0; i < sizeof(cfg_regs) / sizeof(cfg_regs[0]); i++)
-            for (size_t j = 0; j < 5; j++)
-                if (cfg_regs[i].addr == addrs[j])
-                    cfg_regs[i].val = (uint16_t)p[j];
-        for (size_t i = 0; i < sizeof(cfg_regs) / sizeof(cfg_regs[0]); i++)
-            if (cfg_regs[i].addr == 0x0136)
-                cfg_regs[i].val = extclk_reg();
-        printf("pll: %.2f MHz, %d-lane (mpy %u prediv %u sysck %u link %u)\n",
-            g_extclk_mhz, g_lanes, p[0], p[1], p[2], p[3]);
-    }
-    if (tp) {
-        for (size_t i = 0; i < sizeof(cfg_regs) / sizeof(cfg_regs[0]); i++)
-            if (cfg_regs[i].addr == 0x0600)
-                cfg_regs[i].val = (uint16_t)tp;
-        printf("test pattern 0x%04x enabled\n", tp);
+    struct wreg cfg_regs[128];
+    size_t n_cfg;
+    if (slot == 0) {
+        if (g_slowrear) {
+            memcpy(cfg_regs, imx363_mode2610, sizeof(imx363_mode2610));
+            n_cfg = sizeof(imx363_mode2610) / sizeof(imx363_mode2610[0]);
+            printf("rear imx363: vendor-bin mode #2610 2016x1136 "
+                   "(1128 Mbps/lane — true rate test; halfrate touched only "
+                   "the pck mult 0x0307)\n");
+        } else {
+        memcpy(cfg_regs, imx363_cfg, sizeof(imx363_cfg));
+        n_cfg = sizeof(imx363_cfg) / sizeof(imx363_cfg[0]);
+        printf("rear imx363: vendor-bin mode 2016x1136 (verbatim, no PLL "
+               "retune — 24 MHz MCLK matches vendor design)\n");
+        }
+        if (g_rear564) {
+            /* half the #2610 lane rate: OP_MUL 188->94 keeps pck (0x0307
+             * path) and 30 fps untouched, only the serializer slows. Line
+             * payload needs >=~380 Mbps/lane, so 564 still has headroom. */
+            for (size_t i = 0; i < n_cfg; i++)
+                if (cfg_regs[i].addr == 0x030f)
+                    cfg_regs[i].val = 0x5e;
+            printf("rear564: OP_MUL 188->94 (564 Mbps/lane)\n");
+        }
+        if (g_halfrate) {
+            for (size_t i = 0; i < n_cfg; i++)
+                if (cfg_regs[i].addr == 0x0307)
+                    cfg_regs[i].val = 104;
+            printf("halfrate: PLL mult 207->104 (~260 Mbps/lane, ~15 fps)\n");
+        }
+        /* global regs the vendor INIT writes but mode table #544 lacks
+         * (live readback 2026-09-01: defaults 0x0136=0x1a(26MHz!), 0x0820=0).
+         * 0x0136 INCK freq 8.8 fixed point must equal the real MCLK (24M).
+         * 0x0820 REQ_LINK_BIT_RATE = total Mbps = OP-PLL VCO x lanes, rule
+         * proven on this device's imx355 vendor table (0x5a0=1440 = 24/2*30
+         * *4); rear OP regs 0x030d=4 prediv, mpy16 0x030e:0x030f=0x0132=306
+         * -> 24/4*306 = 1836/lane -> 7344 = 0x1cb0.
+         * CAVEAT (2026-09-01): the vendor bin writes NEITHER of these for
+         * imx363 — the rear tables above are verbatim and leave both at
+         * defaults. --rawvendor drops this whole block to test whether our
+         * guessed REQ_LINK (a live DPHY-rate knob on Sony parts) is what
+         * corrupts every packet header (ERROR_ECC on all packets, settle-
+         * and CSID-independent, observed all rear sessions). */
+        if (!g_rawvendor) {
+        cfg_regs[n_cfg].addr = 0x0136;
+        cfg_regs[n_cfg].val = 0x18;
+        cfg_regs[n_cfg].width = 8;
+        n_cfg++;
+        cfg_regs[n_cfg].addr = 0x0137;
+        cfg_regs[n_cfg].val = 0x00;
+        cfg_regs[n_cfg].width = 8;
+        n_cfg++;
+        cfg_regs[n_cfg].addr = 0x0820;
+        cfg_regs[n_cfg].val = 0x1c;
+        cfg_regs[n_cfg].width = 8;
+        n_cfg++;
+        cfg_regs[n_cfg].addr = 0x0821;
+        cfg_regs[n_cfg].val = 0xb0;
+        cfg_regs[n_cfg].width = 8;
+        n_cfg++;
+        } else {
+            printf("rawvendor: 0x0136/0x0821 block skipped (bin verbatim)\n");
+        }
+        /* masterSettings (see imx363_master note) — the rear runs as the
+         * sync master; without these the sensor gates frame readout. */
+        memcpy(&cfg_regs[n_cfg], imx363_master, sizeof(imx363_master));
+        n_cfg += sizeof(imx363_master) / sizeof(imx363_master[0]);
+        printf("rear masterSettings appended (%zu regs)\n",
+               sizeof(imx363_master) / sizeof(imx363_master[0]));
+        if (tp) {
+            /* vendor test-pattern regSettings write the 16-bit 0x0600 as
+             * two bytes: 0x600<-0 (hi) 0x601<-N (lo). Values 0..4 match
+             * mainline imx355: off/solid/bars/grey-bars/PN9. */
+            cfg_regs[n_cfg].addr = 0x0600;
+            cfg_regs[n_cfg].val = 0;
+            cfg_regs[n_cfg].width = 8;
+            n_cfg++;
+            cfg_regs[n_cfg].addr = 0x0601;
+            cfg_regs[n_cfg].val = (uint16_t)tp;
+            cfg_regs[n_cfg].width = 8;
+            n_cfg++;
+            printf("test pattern 0x0600<-0x%04x appended\n", tp);
+        }
+    } else {
+        memcpy(cfg_regs, imx355_vcfg, sizeof(imx355_vcfg));
+        n_cfg = sizeof(imx355_vcfg) / sizeof(imx355_vcfg[0]);
+        printf("front imx355: vendor-bin mode 1640x925 4-lane (verbatim, "
+               "360 Mbps/lane, 30 fps — mainline 2-lane table retired)\n");
+        if (tp) {
+            int has_tp = 0;
+            for (size_t i = 0; i < n_cfg; i++)
+                if (cfg_regs[i].addr == 0x0600) {
+                    cfg_regs[i].val = (uint16_t)tp; has_tp = 1;
+                }
+            printf("test pattern 0x%04x %s\n", tp,
+                has_tp ? "enabled" : "NOT SET (no 0x0600 in vendor table)");
+        }
     }
     if (sensor_config(video_fd, sensor_fd, &sb, session, sensor_hdl,
-                      4 /* CONFIG */, cfg_regs,
-                      sizeof(cfg_regs) / sizeof(cfg_regs[0])) < 0) {
+                      4 /* CONFIG */, cfg_regs, n_cfg) < 0) {
         fprintf(stderr, "sensor CONFIG packet: %s\n", strerror(errno));
         kt = stream_kmsg(kmsg, t0);
         goto out;
     }
-    printf("sensor CONFIG (mode/crop/pll %zu regs) applied\n",
-        sizeof(imx355_cfg) / sizeof(imx355_cfg[0]));
+    printf("sensor CONFIG (mode/crop/pll %zu regs) applied\n", n_cfg);
     t0 = kt;
     if (!g_tpg) {
     if (sensor_config(video_fd, sensor_fd, &sb, session, sensor_hdl,
@@ -1528,8 +2231,15 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
     csi.lane_cnt = (uint8_t)g_lanes;
     csi.secure_mode = 0;
     {
-        /* per-lane rate = VCO = 30*extclk Mbps (matches pll_params) */
-        uint64_t dr = (uint64_t)(30.0 * g_extclk_mhz * 1000000.0 + 0.5);
+        /* per-lane rate: imx363 MIPI = OP-PLL VCO = INCK/0x030d*mpy16
+         * = 24/4*306 = 1836 Mbps (rule proven on this device's imx355
+         * vendor bin: 0x0820=1440 total = 24/2*30*4 lanes);
+         * imx355 vendor = REQ_LINK 0x0820 1440 Mbps total / 4 = 360. */
+        uint64_t dr = slot == 0
+            ? (g_rear564 ? 564000000ULL :
+               (g_slowrear ? 1128000000ULL :
+               (g_halfrate ? 918000000ULL : 1836000000ULL)))
+            : (g_halfrate ? 180000000ULL : 360000000ULL);
         uint64_t ui = 1000000000000ULL / dr;      /* ps */
         uint32_t cnt = (uint32_t)((115000 + 8 * ui) / 5000) - 1;
         if (settle_cnt)
@@ -1618,13 +2328,42 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
         memset(&cc, 0, sizeof(cc));
         cc.usage_type = 0;
         cc.num_rdi = 1;
-        cc.rdi_hz[0] = 400000000;
+        /* RDI path / CSID core clocks. 400 MHz proved the pipeline with the
+         * (slow, internal) TPG, but real sensor traffic ECC+UNDERFLOW'd at
+         * it (observed 2026-09-01: CSID ERROR_ECC + ERROR_STREAM_UNDERFLOW
+         * + UNBOUNDED_FRAME, no frame, ~line-rate error IRQs) — the CSID RX
+         * fifo starves when the core clock can't keep up with the incoming
+         * byte stream. Real-PHY modes run 800M csid / 600M rdi. */
+        cc.rdi_hz[0] = g_tpg ? 400000000 : 600000000;
         bl += blob_add(blob + bl, CAM_ISP_GENERIC_BLOB_TYPE_CLOCK_CONFIG,
                        &cc, sizeof(cc));
         struct cam_isp_csid_clock_config sc;
-        sc.csid_clock = 400000000;
+        sc.csid_clock = g_tpg ? 400000000 : 800000000;
         bl += blob_add(blob + bl, CAM_ISP_GENERIC_BLOB_TYPE_CSID_CLOCK_CONFIG,
                        &sc, sizeof(sc));
+        /* BW_CONFIG_V2 (type 9), --bw only. Hypothesis 2026-09-01: a missing
+         * AXI vote starves the RDI write master (NOC stall → ECC +
+         * STREAM_UNDERFLOW storm, zero buffers). Observed: the blob IS
+         * applied ("ISP_BLOB usage_type=0 [IFE_RDI0] [TRANSAC_WRITE]") but
+         * does NOT clear the storm, and NEW failure lines appear (VFE Bus
+         * Violation 0x10010000, "Apply failed in Substate[SOF]" — apply
+         * failures were absent in every pre-blob storm). So the vote either
+         * breaks config_hw or changes nothing useful; default off. */
+        if (g_bw) {
+            struct cam_isp_bw_config_v2 bw;
+            memset(&bw, 0, sizeof(bw));
+            bw.usage_type = 0;
+            bw.num_paths = 1;
+            bw.axi_path[0].transac_type = 1;  /* CAM_AXI_TRANSACTION_WRITE */
+            bw.axi_path[0].path_data_type = 4; /* CAM_AXI_PATH_DATA_IFE_RDI0 */
+            bw.axi_path[0].camnoc_bw = 2400000000ULL;
+            bw.axi_path[0].mnoc_ab_bw = 2400000000ULL;
+            bw.axi_path[0].mnoc_ib_bw = 2400000000ULL;
+            bw.axi_path[0].ddr_ab_bw = 2400000000ULL;
+            bw.axi_path[0].ddr_ib_bw = 2400000000ULL;
+            bl += blob_add(blob + bl, 9 /*CAM_ISP_GENERIC_BLOB_TYPE_BW_CONFIG_V2*/,
+                           &bw, sizeof(bw));
+        }
         struct cam_isp_resource_hfr_config hfr;
         memset(&hfr, 0, sizeof(hfr));
         hfr.num_ports = 1;
@@ -1639,8 +2378,8 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
         memset(&dim, 0, sizeof(dim));
         dim.rdi_path[0].width = width;
         dim.rdi_path[0].height = height;
-        dim.hbi = 1836;
-        dim.vbi = 1306;
+        dim.hbi = hbi;
+        dim.vbi = vbi;
         bl += blob_add(blob + bl,
                        CAM_ISP_GENERIC_BLOB_TYPE_SENSOR_DIMENSION_CONFIG,
                        &dim, sizeof(dim));
@@ -1753,6 +2492,9 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
 
     if (rb && !g_tpg)
         sensor_readback(sensor_fd, &sb, session, sensor_hdl, "post-START");
+    if (g_verify && !g_tpg)
+        verify_cfg_table(sensor_fd, &sb, session, sensor_hdl, cfg_regs, n_cfg,
+                         "post-START");
 
     /* 14. wait on the fence for the frame */
     printf("waiting for frame (fence %d, %d ms)...\n", sync_obj, wait_ms);
@@ -1781,41 +2523,17 @@ static int run_stream(int slot, const char *out_path, int wait_ms,
         if (rb && !g_tpg)
             sensor_readback(sensor_fd, &sb, session, sensor_hdl,
                             "post-WAIT (after silence)");
+        /* The RDI path may still have written partial bytes before the fatal
+         * halt — the byte pattern of that partial data is direct evidence of
+         * the scrambling mode (lane swap -> structured repeats, analog noise
+         * -> spread corruption, zero -> path never wrote). */
+        inspect_buf(pix_map, (size_t)pixbuf_len, out_path, "partial");
         rc = 2;
         goto out;
     }
 
     /* 14. inspect + dump */
-    size_t nz = 0;
-    {
-        const uint8_t *p8 = pix_map;
-        size_t n = (size_t)pixbuf_len;
-        uint8_t mn = 255, mx = 0;
-        for (size_t i = 0; i < n; i++) {
-            if (p8[i]) nz++;
-            if (p8[i] < mn) mn = p8[i];
-            if (p8[i] > mx) mx = p8[i];
-        }
-        printf("buffer: nonzero %zu/%zu, byte range 0x%02x..0x%02x\n",
-            nz, n, mn, mx);
-        printf("first 32 B:");
-        for (int i = 0; i < 32; i++)
-            printf(" %02x", p8[i]);
-        printf("\n");
-        out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (out_fd >= 0) {
-            size_t off = 0;
-            while (off < n) {
-                ssize_t w = write(out_fd, p8 + off, n - off);
-                if (w <= 0)
-                    break;
-                off += (size_t)w;
-            }
-            printf("dumped %zu B -> %s\n", off, out_path);
-        } else {
-            fprintf(stderr, "open %s: %s\n", out_path, strerror(errno));
-        }
-    }
+    size_t nz = inspect_buf(pix_map, (size_t)pixbuf_len, out_path, "frame");
     rc = nz ? 0 : 3;   /* fence signaled but empty buffer = no frame */
 
 out:
@@ -1875,6 +2593,14 @@ out:
         cam_ioctl(sensor_fd, CAM_RELEASE_DEV, &rel, CAM_HANDLE_USER_POINTER,
                   sizeof(rel));
     }
+    if (rail_hdl) {
+        struct cam_release_dev_cmd rel;
+        memset(&rel, 0, sizeof(rel));
+        rel.session_handle = (int32_t)session;
+        rel.dev_handle = (int32_t)rail_hdl;
+        cam_ioctl(rail_fd, CAM_RELEASE_DEV, &rel, CAM_HANDLE_USER_POINTER,
+                  sizeof(rel));
+    }
     if (session) {
         struct cam_req_mgr_session_info ds;
         memset(&ds, 0, sizeof(ds));
@@ -1890,6 +2616,7 @@ out:
         ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg);
     }
     shot_free(video_fd, &sb);
+    shot_free(video_fd, &rail_sb);
     shot_free(video_fd, &ib);
     shot_free(video_fd, &ub);
     if (pix.out.buf_handle)
@@ -1898,6 +2625,7 @@ out:
     if (pix_mfd > 0) close(pix_mfd);
     if (out_fd >= 0) close(out_fd);
     if (sensor_fd >= 0) close(sensor_fd);
+    if (rail_fd >= 0) close(rail_fd);
     if (csiphy_fd >= 0) close(csiphy_fd);
     if (isp_fd >= 0) close(isp_fd);
     if (kmsg >= 0) {
@@ -1940,6 +2668,15 @@ int main(int argc, char **argv)
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--lanecfg") == 0 && i + 1 < argc)
+            g_lanecfg = (uint32_t)strtoul(argv[++i], 0, 0);
+        else if (strcmp(argv[i], "--force-ife") == 0 && i + 1 < argc) {
+            g_force_ife = atoi(argv[++i]);
+            if (g_force_ife < 0 || g_force_ife > 2) {
+                fprintf(stderr, "--force-ife: 0..2\n");
+                return 2;
+            }
+        }
         else if (strcmp(argv[i], "--lanes") == 0 && i + 1 < argc) {
             g_lanes = atoi(argv[++i]);
             if (g_lanes != 2 && g_lanes != 4) {
@@ -1949,14 +2686,38 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--rb") == 0)
             rb = 1;
+        else if (strcmp(argv[i], "--verify") == 0)
+            g_verify = 1;
+        else if (strcmp(argv[i], "--bw") == 0)
+            g_bw = 1;
+        else if (strcmp(argv[i], "--vc") == 0 && i + 1 < argc)
+            g_vc = (uint32_t)strtoul(argv[++i], 0, 0);
+        else if (strcmp(argv[i], "--dt") == 0 && i + 1 < argc)
+            g_dt = (uint32_t)strtoul(argv[++i], 0, 0);
         else if (strcmp(argv[i], "--noglobal") == 0)
             g_noglobal = 1;
         else if (strcmp(argv[i], "--nostarton") == 0)
             g_nostarton = 1;
+        else if (strcmp(argv[i], "--rawvendor") == 0)
+            g_rawvendor = 1;
+        else if (strcmp(argv[i], "--slowrear") == 0)
+            g_slowrear = 1;
+        else if (strcmp(argv[i], "--rear564") == 0) {
+            g_slowrear = 1;
+            g_rear564 = 1;
+        }
+        else if (strcmp(argv[i], "--keep0112") == 0)
+            g_keep0112 = 1;
+        else if (strcmp(argv[i], "--halfrate") == 0)
+            g_halfrate = 1;
         else if (strcmp(argv[i], "--real") == 0)
             real = 1;
+        else if (strcmp(argv[i], "--rear") == 0)
+            only_slot = 0;   /* rear imx363: vendor-bin tables, 4-lane */
         else if (strcmp(argv[i], "--tpg") == 0)
             g_tpg = 1;
+        else if (strcmp(argv[i], "--railhelper") == 0)
+            g_railhelper = 1;
         else if (strcmp(argv[i], "--sweep") == 0)
             sweep = 1;
         else
