@@ -3203,3 +3203,355 @@ session), camera stack via camera-bringup rcS, /bin/cam-shot =
 defaults, verified). Remaining for M19 real capture: the sensor
 register tables (rear imx363 metric bin holds them — decode the
 Parameter Parser V2 blob — or capture stock-Android I2C traffic).
+
+## M19 camera: REAL SENSOR FRAME — the blocker was lane_cfg identity, not signal integrity (2026-09-01, fifth session)
+
+Continued from the TPG-first-frame session. This session: decoded the
+vendor sensor register tables out of the metric bin, streamed the real
+rear IMX363 through IFE/RDI, chased header corruption for a day, and
+found the actual root cause: **cam_isp_in_port_info.lane_cfg = 0 is NOT
+identity**. Canonical identity is 0x3210. With it the link is clean and
+the first real frame landed in the buffer.
+
+1. **Vendor register tables decoded from the Parameter Parser V2 bin**
+   (/tmp/extract_regs.py, verified register-for-register vs mainline
+   imx355.c for the front). Rear imx363 (metric_imx363_lito2): initSettings
+   = 29 single-byte writes; 12 mode tables (regSetting nodes), of which
+   mode #544 = 2016x1136 @1836 Mbps/lane (our default) and mode #2610 =
+   2016x1136 @1128 Mbps/lane (FLL 2488, LLP 4176, OP_MUL 188, pck ≈312
+   MHz). bin TOC also exposes laneAssign (=0 for both rear and front —
+   that field feeds cam_csiphy_info, NOT the CSID port; don't confuse
+   the two). Also: TOC[23] is a full 84-write 4032x3024 @1368 Mbps mode.
+
+2. **Real streaming: sensor transmits, headers garble.** First real-mode
+   runs (mode #544 @1836): RX IRQ histogram ~95x 0x0d040ff (bits: SOT+EOT
+   all lanes, WARNING_ECC bit14, UNBOUNDED_FRAME bit24, TG_FIFO_OVERFLOW
+   bit26, RST_DONE bit27 — %x strips leading zeros, 0x0d040ff prints as
+   0xd040ff) + a few ERROR_ECC events. Rate ladder: 1128 (mode #2610,
+   --slowrear) same dominant event, 10 ERROR_ECC+10 STREAM_UNDERFLOW kmsg
+   prints; 564 (OP_MUL 188->94, --rear564) 18x 0x1000ff ERROR_ECC —
+   WORSE. U-shaped error curve, vendor-validated 1128 the cleanest of
+   the three, but none clean.
+
+3. **DT/VC sweep via packet-capture registers: all negative.** Armed
+   CSID capture with (VC0, 2B/2A/2C/2D/12), (VC1, 2B/2C/2A/12), VC2/VC3
+   — no long packet ever matched. Short captures: armed VC0 latched
+   VC:0 DT:0 LC:0 (FS decodes); armed VC1 latched VC:1 DT:1 LC:16721 (a
+   frame-end short packet, DT=0x01 correct, LC nonsense) — FE arrives but
+   corrupted. Broadcast short packets (FS/FE) replicate on all 4 lanes so
+   they survive any lane garbling; long-packet headers are byte-striped
+   1 byte/lane so a wrong lane mapping corrupts every one of them. That
+   asymmetry (FS clean, long headers never decode) was the signature of a
+   lane-mapping problem all along — earlier "lane permutation ruled out
+   because FS decodes" reasoning was backwards.
+
+4. **Register-state parity with the vendor achieved — not the cause.**
+   Exact diff of our INIT vs bin initSettings: ours = vendor's 29 writes
+   + one prepended {0x0112, 0x0a} (vendor never writes 0x0112). Dropped
+   it (--keep0112 restores); also fixed the stale IFE timing model
+   (SENSOR_DIMENSION blob was still mode-#544's vbi=1652/pck=208M under
+   #2610; now 2488/312M). Neither change moved the histogram. Sensor
+   state was byte-identical to vendor and the link still garbled.
+
+5. **Kernel has no D-PHY rate tuning.** cam_csiphy_cphy_data_rate_config
+   (the per-rate analog table) runs only under csiphy_3phase; the D-PHY
+   path programs lane enables + settle counts only. data_rate in the
+   csiphy blob is inert for us — no RX equalization knob exists from
+   userspace.
+
+6. **lane_cfg root cause.** cam_ife_csid_core.c writes cfg0 =
+   (lane_num-1) | lane_cfg<<4 | ... unmasked. Mainline camss-csid-gen2
+   documents the register: RX_CFG0 [7:4] DL0_INPUT_SEL, [11:8] DL1,
+   [15:12] DL2, [19:16] DL3 — each logical lane selects its physical
+   source. lane_cfg=0 therefore means ALL FOUR logical lanes read
+   physical D0 — headers stripe garbage. Canonical identity (uapi "4
+   bits per lane" encoding): lane_cfg = 0x3210.
+
+7. **Full sweep that found it** (--lanecfg, one run each,
+   --stream --rear --slowrear --rawvendor): singles 0->mode A (garbled),
+   1->mode B (501x ERROR_ECC, one RDI EOF), 2/3/6/7 dead (RX silence),
+   4/8 no-op, 12 (bits6+7) adds ERROR_CRC+UNDERFLOW; all 24 permutations:
+   only 0x3210 clean; 0x132/0x321 garbled-alive; everything else dead.
+
+8. **The frame** (0x3210, reproduced 3x incl. no-flag default run):
+   RX 370-550x 0x04000ff (WARNING_ECC only, corrected; no ERROR_ECC, no
+   UNBOUNDED/TG_OVF, no CRC failures), LONG_PKT_CAPTURED VC:0 DT:0x2B
+   WC:2520 ECC:0x1b (2520 B = exactly 2016 px RAW10), RDI0 SOF+EOF per
+   frame (5-6 pairs), fence SYNC_WAIT result=0 (signaled),
+   buffer(frame) nonzero 2860467-2860495/2862720, mod-5 histogram
+   820/819/819/819/812 per 4KB (RAW10 packing as expected). Decoded on
+   host to PNG (/tmp/m19-first-frame.{raw,png}, frame md5
+   bab36c2c8edb84b9f3f280f1149db01): a real photograph — dark room,
+   two ceiling lights, door frame. Sensor gain/exposure defaults are
+   dark; a brighter frame needs exposure control (0x0202 coarse).
+
+   cam-shot default now g_lanecfg=0x3210; --lanecfg still overrides.
+
+Device state at session end: MATRIX_CONF_A cleared (0x00),
+/lib/modules.aginx/cam_ife_csid.ko restored to stock build (md5
+3f9bbc83b09942baeb582d80c0e3b2ef, verified on device); loaded modules
+still carry this boot's debug_mdl=0xffffffff/csiphy_dump=1 params (gone
+at next boot); /tmp binaries+logs vanish at reboot. Remaining for M19
+closure: exposure/gain for a usable image, JPEG/encode path, front UW
+(slot 1) same treatment, multi-request queueing (single request worked
+here — "Apply failed in Substate[SOF]" did not block once data flowed).
+
+## M19 camera: capture persists across reboot; exposure/gain + on-device PNG; kmsg follower bounded (2026-09-01, sixth session)
+
+1. **Exposure/gain implemented in cam-shot** (imx355-family formulas,
+   mainline imx355.c; the imx363's own updateGainSettings bin container
+   resists decoding — its slot pairing breaks on non-regSetting-shaped
+   entries). `--cit N` coarse integration lines (0x0202/0x0203, max
+   FLL-10), `--gain X` analog multiplier 1..16 (0x0204/0x0205,
+   val=1024-1024/m clamped 960), `--dgain X` digital (0x3070=1 global
+   select + 0x020e = m*256). Observed: mode #2610 defaults are CIT 2474
+   (FLL 2488, near max — more TIME is unavailable) and gain 1x;
+   `--gain 8` (reg 0x380) visibly brightens the dark-room frame. Dark
+   scenes need gain, not exposure.
+2. **On-device PNG encode**: `--png` writes /tmp/frame.png — gray8 from
+   RAW10 (MSB byte per 4+1 group), filter-0 rows, stored-DEFLATE IDAT,
+   software crc32/adler32. Verified on host (2016x1136 grayscale PNG
+   opens; pixel content matches the raw). Frame artifacts land in
+   /tmp (tmpfs) by design; pull before reboot.
+3. **Persistence**: /bin/cam-shot on device = the lane_cfg-0x3210 +
+   gain + PNG build (md5 41bcda8b6a75f75a4fb6ebad1ff7379e, 755). Recipe
+   synced: camera-bringup updated from the device's newer copy (md5
+   f157e2a9e1c92fa7f430d4dc55489150 both sides), build-rootfs.sh gained
+   the cam-shot zig-cc build line + camera-bringup/cell-bringup in the
+   chmod-755 list (they were 644 in the baked image — the latents that
+   made the baked camera path depend on a hand-chmod'd copy).
+4. **Fresh-boot verification**: rebooted via /bin/reboot2. rcS ran the
+   full chain unprompted — boot.state reached "camera ok media+video
+   nodes" and "done ok". FIRST cam-shot invocation after the cold rcS
+   load faulted mid-stream (CAM-SMMU iommu fault handler isp ctx 0,
+   CAMNOC SLAVE_IRQ err_code=1 address decode @0xdfebb400/0xdfebb300,
+   then CDM stream-off failed 32 — full teardown, no frame). Second and
+   third invocations: clean. Third run output: fence SYNC_WAIT
+   rc=0 result=0, buffer nonzero 2860534/2862720 (99.9%), mod-5
+   histogram 820/819/819/819/817, /tmp/frame.png 2291550 B written
+   on-device. Frame pulled and confirmed (dark room, --gain 8) →
+   /Users/sophiehe/Documents/aginxos-frames/m19-freshboot-frame.png.
+   So: capture works from a cold boot with only rcS-loaded modules and
+   the persisted /bin binary. The first-run IOMMU fault is reproducible
+   knowledge, not noise: retry once after any cold module load.
+5. **kmsg follower was unbounded and filled the rootfs**: rcS's
+   `(cat /dev/kmsg > /var/kmsg-follow.log)&` had grown to 387 MB on the
+   2 GB ext4 — adb push of cam-shot failed ENOSPC at 18 MB free.
+   Fixed in rcS (recipe + device, md5 50b02ae9689ff3933edbd1b5b38cb56e
+   both sides): loop rotates to kmsg-follow.old with `head -c 32M`
+   capping each file (cat dies on SIGPIPE) — the pstore-substitute
+   record is now bounded at ~64 MB. Truncated the 387 MB log by hand;
+   / is back to 403 MB free (80%). Bounded loop verified running on
+   device (one cat|head pair, pid 2194).
+
+Device state at session end: booted AginxOS rootfs, stock vendor_boot,
+camera stack loaded by rcS, /bin/cam-shot + fixed rcS +
+camera-bringup persisted on /etc-/bin (ext4). Full rootfs re-bake
+(#3) NOT done — deferred deliberately (flashes userdata, wipes the
+agent install); the recipe is now correct for whenever it happens.
+
+## M19b: front imx355 + ultra-wide imx481 — all three sensors frame (2026-09-01, seventh session)
+
+1. **Front imx355 (slot 2) framed on the first try** after the lane_cfg
+   fix — every front attempt before it was the same 0-vs-identity bug
+   (the front was cam-shot's default slot all along). Invocation:
+   `/tmp/cam-shot --stream --railhelper --gain 8 --png`. Vendor-bin
+   mode 1640x925 4-lane 360 Mbps/lane verbatim; fence signaled, buffer
+   nonzero 1892325/1896250 (99.8%), PNG on-device; reproduced
+   (1892402). Frame: selfie view of the dark room,
+   aginxos-frames/m19-front.png. --railhelper (rear INIT held in the
+   same session to keep the SLG ldo1..6 + camera_ldo analog rails up)
+   is REQUIRED for the front — its DT node only carries cam_vio.
+   NB: --gain/--dgain folding was rear-only this run; the front frame
+   is at vendor-default gain (folded for slot 1 below, front still to
+   do if a brighter selfie is ever needed).
+2. **UW imx481 (slot 1) framed on the first try too.** Vendor bin
+   (com.qti.sensormodule.metric_imx481_lito2.bin) decoded with the
+   same Parameter-Parser-V2 path: init = 209-write initSettings, modes
+   = 9 regSettings. Mode table (i = regSetting#1301): 2328x1310
+   binned, fll 1888, llp 5120, 4 lanes (0x0114=3). PLL rule
+   lane_Mbps = INCK/0x030d x (0x030e<<8|0x030f) = 24/15x439 = 702.4
+   Mbps/lane -> pck 281 MHz -> 29.1 fps; cross-checked against mode0
+   full-res (24/4x218 = 1308 = the 523.2 MHz pck x 10/4 that the bin's
+   own resolutionData declares — rule holds). Mode[4] (2016x1136)
+   computes to ~120 fps with its 24/3x230 PLL — the vendor fast mode,
+   not used. Slot wiring: --uw, dims/stride 2328x1310/2910, csiphy
+   dr 702.4M (settle 24), cfg buffer grown (209-write INIT = 1680 B
+   > the old 1536 B cmd buf; cfg_regs[128] -> [192] for the 138-write
+   mode). Probe 0x481 @0x34/0x0016 OK with --railhelper. Output:
+   fence signaled, nonzero 3808766/3812100 (99.9%), reproduced
+   (3808795). Frame: wide view of the same dark room,
+   aginxos-frames/m19-uw.png.
+3. **Sensor census complete**: all three Pixel 5 cameras produce real
+   frames through one tool, one pipeline, zero vendor userspace:
+   rear imx363 2016x1136 / UW imx481 2328x1310 / front imx355
+   1640x925, each with its own vendor-bin register tables baked into
+   cam-shot. /bin/cam-shot updated to this build (md5
+   597f47d97539360d25d2fb5ad5c0c23d).
+
+## Rootfs re-bake #3: M19 fully folded — all three cameras from the baked image (2026-09-01)
+
+1. Recipe state baked: cam-shot with the lane_cfg-0x3210 default +
+   gain/PNG + UW tables, camera-bringup 755 (the 644 latent fixed),
+   bounded kmsg follower in rcS. Image built and flashed
+   (fastboot flash userdata, serial 13201FDD4001N8 confirmed;
+   46 s write).
+2. Fresh-bake boot: touch/camera/battery/modem/audio/wlan all ok;
+   "wifi fail no /etc/wifi.conf" as always on a fresh bake.
+3. **Restore flow hit one trap worth recording**: the pre-bake backup
+   tar was taken from /var (bin+home) and MISSED /etc/wifi.conf —
+   the live conf (Legrand AP, the AP the device had been on all day)
+   died with the flash. Recovered from .local/backup-pre-bake-0831/
+   (ssid=Legrand AP — the 0831b copy is the "666" hotspot, which is
+   off: join rc=2). Lesson: pre-flash backup must cover /etc too.
+   wifi.conf restored + net-bringup -> 192.168.0.166; internet ok;
+   time ok; boot.state reached "done ok". /var/bin (5 packages) +
+   /var/home (1 GB) restored from the 0901 tar; 79% used.
+4. **Camera acceptance from the baked image, this boot**: UW first
+   call (no IOMMU fault this time — the cold-load fault is
+   intermittent, not deterministic): fence signaled, nonzero
+   3809092/3812100. Rear: 2860449/2862720. Front: 1892026/1896250.
+   /bin/cam-shot = baked build md5 412c3757e3b57cafa5fcd0c14b389796.
+
+Device state at session end: fresh-bake #3 rootfs running, wifi on
+Legrand AP, agent packages + home restored, all three cameras
+working from the baked image. Backups: .local/backup-pre-bake-0901/
+(tar: var bin+home; wifi.conf came from 0831, NOT the fresh conf).
+
+## M19c: JPEG compression + color path — baseline encoder, all three sensors verified (2026-09-01, eighth session)
+
+1. `boot/rootfs/src/jpegenc.h`: baseline sequential JPEG, no libraries.
+   gray8 (1 comp) and YCbCr 4:2:0 (rgb24 converts internally), quality
+   via IJG rule, runtime-built Huffman (merge tree + canonical codes,
+   Annex-K quant tables in natural order, DQT emits zigzag). Two decoder
+   compat rules found the hard way and now commented in the header:
+   - DHT class byte must be `Tc<<4 | Th` — swapped nibbles define the
+     luma AC table as "DC table 1" and every decoder dies at SOS.
+   - The Huffman code must stay INCOMPLETE (a complete tree assigns the
+     all-1s code, which libjpeg rejects as "Bogus Huffman table") — one
+     freq-1 phantom symbol (index 256) joins the merge tree but is
+     excluded from hbits/hval.
+2. Host validation: sips (Apple ImageIO) + PIL/libjpeg cross-decode.
+   Synthetic RGGB quadrants decode to the exact source colors (worst
+   channel diff 3 of 255); 33x17 odd dims (MCU padding) and all-black/
+   all-white DC extremes decode.
+3. Device (raw2jpg, musl static, md5 d25b1f30263f2f7c4803ba43a188e98c):
+   all three sensors, pulled and sips-verified 2016x1136 / 2328x1310 /
+   1640x925 (front: odd height 925 exercises MCU row padding):
+
+   | sensor | raw | gray q85 | color q85 |
+   |---|---|---|---|
+   | rear imx363 | 2,862,720 B | 453,722 B, 0.101 s | 194,474 B, 0.180 s |
+   | uw imx481 | 3,812,100 B | 104,649 B, 0.126 s | 77,703 B, 0.277 s |
+   | front imx355 | 1,896,250 B | 81,173 B, 0.085 s | 63,296 B, 0.141 s |
+
+   rear color q-sweep: q50 74,153 / q70 101,301 / q85 166,852 /
+   q95 514,714 B. Encode ~0.1–0.3 s/frame on the big core — no integer
+   AAN DCT needed.
+4. rggb CFA phase visually verified correct for imx363 AND imx481 (same
+   indoor scene, matching warm hues; UW wider FOV consistent). imx355
+   NOT hue-verified: phone lay flat, lens against the desk, frame near
+   black — pipeline + odd-height path verified, color judgement
+   impossible as observed.
+5. `cam-shot --jpeg [q]` native (md5 5752fbf026742f829c6f67dcd2baa434
+   at test): color default, `--jpeg-gray` mode (`--jpeg-gray`/`--jpeg-
+   color` also enable, q defaults 85), `--jpeg-out <path>`, default
+   output = raw dump path .raw→.jpg. Observed: color 193,364 B /
+   0.214 s; gray 450,819 B / 0.125 s. raw2jpg also built into the
+   recipe for already-captured dumps.
+6. Front first capture reproduced the known intermittent cold-load
+   IOMMU fault (CAMNOC address-decode @0xdfebb900-class); one retry
+   frames. Same as M19b — not new.
+
+Device state at session end: baked rootfs #3 still running (no flash
+this session); test cam-shot + raw2jpg under /tmp (tmpfs, gone at
+reboot). Repo jpegenc.h + raw2jpg.c + cam-shot --jpeg land post-
+session; re-bake folds M19c.
+
+
+## M19c burst: multi-request capture fixed — RDI write-master loop_size, not a race (2026-09-01, ninth session)
+
+`--frames 2+` previously produced frame 1 fine and frame 2 zero +
+fence timeout, with SMMU PFs at round_up(pix[0] end), CAMNOC address
+decode errors, and `RDI Error: STATUS_1=0x4`. Two candidate causes:
+
+1. **Race/bubble (disproven)**: rolling submission requeues req i+1 at
+   fence i, but fence signal is EOF-ish and userspace wakeup + 3
+   ioctls + CRM apply take ~17 ms vs a 10–18 ms EOF→SOF gap.
+   Discriminating experiment (pq1.log): pre-queue ALL requests before
+   START (`--stream --rear --slowrear --rawvendor --frames 2`) —
+   failed identically. Not a race; deterministic programming error.
+2. **RDI write-master multi-frame mode (confirmed)**: kernel-source
+   decode of cam_vfe_bus_ver2.c update_wm — for RDI WMs (client idx
+   < 3) `loop_size = irq_subsample_period + 1` image_addr writes are
+   emitted per request, and the WM hardware auto-advances the write
+   address by `frame_inc` (= stride × slice_height = whole frame)
+   within the cycle. Our IFE INIT HFR blob set
+   `hfr.port[0].subsample_period = 1` → loop_size 2 → kernel wrote
+   image_addr twice (base, base+size) → frame 2 physically landed at
+   base+frame_inc, exactly past pix[0]'s mapping.
+
+Register decode receipts (cam_vfe170.h / cam_vfe_bus_ver2.c,
+LineageOS redbull): top `reg_update_cmd = 0x4AC`, RDI0 update data 2
+(the trailing CDM pair in every request is correct); WM client 0:
+image_addr 0x2214, stride 0x2228, frame_inc 0x2258, irq_subsample_
+period 0x2248. kmd CDM scratch dump (added `dump_kmd`) showed req 1
+with 6 pairs (double 0x2214 write: base + base+0x2bae80) before the
+fix, 5 pairs after.
+
+**Fix**: `hfr.port[0].subsample_period = 0` (INIT HFR blob, with
+`io.subsample_period` left at 1). Pre-queue all N before START is now
+the default (rolling kept behind `--roll` for A/B — it still hits the
+EOF→SOF race and is not recommended).
+
+Observed (pq2.log / pq4.log, binary md5 dad9d25e006e73864aa68a1228e246bb
+— repo source rebuilds bit-identical):
+- `--frames 2`: both fences signaled 66 ms apart; frames 2,860,441 /
+  2,860,478 of 2,862,720 B nonzero; healthy mod-5 RAW10 histogram.
+- `--frames 4 --jpeg 85`: all four fences signaled (~67 ms spacing,
+  slowrear rate), four full frames, four JPEGs ~84 KB @ 0.166 s, RC=0.
+  One benign CAM_WARN bubble line (detected=0) — no RDI error, no
+  faults.
+
+Device state at session end: baked rootfs #3 still running; test
+cam-shot under /tmp (tmpfs). Burst fix lands to
+boot/rootfs/src/cam-shot.c; re-bake folds it.
+
+## Rootfs re-bake #4: M19b + M19c fully folded — burst + JPEG from the baked image (2026-09-01, ninth session cont'd)
+
+Full re-bake after the M19c JPEG (5429240) and burst fix (70a3635)
+commits: `build-phone.sh musl` + `build-rootfs.sh` → out/rootfs.img
+(132 MB sparse), flashed userdata (fastboot serial 13201FDD4001N8
+confirmed, single device).
+
+userdata flash + state restore, lessons recorded:
+1. Device-only /etc state = wifi.conf only (.rcs-ran is the first-boot
+   marker — leave absent so rcS runs the first-boot path; resolv.conf
+   regenerates). Recipe diff was otherwise empty.
+2. /var holds 1.45 GB of provision-installed software (/var/home
+   986 MB + /var/bin 480 MB) that fits the 2 GB fs but NOT together
+   with its own tar: landing var.tar on /var then untarring hits
+   ENOSPC at ~400 MB into extraction. Stream instead —
+   `cat var.tar | adb shell "tar -xf - -C /"` — restored byte-exact
+   (du 1009808/491600 KB, 417 MB free).
+3. Restoring wifi.conf before first boot means provision starts its
+   full 1.45 GB Wi-Fi download immediately; kill agpkg/agdl if you are
+   about to restore the backup anyway (they compete for /var/tmp).
+4. Mid-flash-session "spontaneous reboots" (~every 2 min, kmsg cut
+   mid-google_charger line) were NOT crashes: wifi-wizard asks on the
+   panel whether to restart the network, and answering y reboots the
+   PHONE. google_charger exonerated; adb drops during pushes were the
+   reboot. UX note: network-restart should re-run net-bringup, not
+   reboot the device.
+
+Acceptance on baked image #4 (clean boot: boot.state modem/audio/wlan
+ok; agsvc runs aginx + aginx-carrier + aginxbrowser from restored
+/var/bin; provision sees installed state, no re-download):
+`/bin/cam-shot --stream --rear --slowrear --rawvendor --frames 4
+--jpeg 85` — all four requests pre-queued before START, four fences
+signaled ~67 ms apart, four full frames (2,860,6xx/2,862,720 B
+nonzero each), four 2016x1136 color q85 JPEGs ~85 KB, RC=0. No RDI
+errors, no faults.
+
+Device state at session end: baked rootfs #4 running, /var restored,
+Wi-Fi on the Legrand AP.
