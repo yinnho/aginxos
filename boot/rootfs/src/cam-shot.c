@@ -1,18 +1,24 @@
-// cam-shot (M19 v0) — Qualcomm cam_req_mgr userspace, first tool: sensor probe.
+// cam-shot (M19) — Qualcomm cam_req_mgr userspace.
 //
-// What it does: for each cam-sensor subdev (found via media2 entity type
-// CAM_SENSOR_DEVICE_TYPE), issue CAM_SENSOR_PROBE_CMD with a hand-built
-// probe packet: cam_cmd_i2c_info + cam_cmd_probe (cmd buf 0) and a
-// power-sequence blob (cmd buf 1). The kernel powers the sensor per the
-// blob, reads the chip-id register over CCI, and powers down. We send
-// expected_id=0xFFFF/data_mask=0 on purpose: the compare always misses,
-// CAM_WARN "read id: 0x.. expected id: 0xffff" prints the REAL chip id to
-// kmsg, and the sensor is left unprobed (retryable). If a slave address
-// NACKs the read returns 0 — we report absence and try the next address.
+// v0 (committed): sensor probe / bus sweep via CAM_SENSOR_PROBE_CMD packets.
 //
-// Packet protocol reference: techpack/camera uapi cam_defs.h / cam_sensor.h
-// / cam_req_mgr.h (LineageOS redbull, lineage-22.1) — structs mirrored
-// below, packed, LE like the kernel.
+// v1 (--stream): one RAW frame through the CamX-style pipeline, no CamX:
+//   probe slot N real -> CREATE_SESSION -> ACQUIRE(sensor, csiphy, ife)
+//   -> ACQUIRE_HW(ife, RDI-only in_port PHY_2/RDI_0) -> LINK(sensor+ife)
+//   -> sensor CONFIG DEV packets (INIT=op2 global regs, CONFIG=op4 mode regs,
+//      applied immediately by KMD; STREAMON=op0 MODE_SELECT, applied at
+//      START_DEV) -> csiphy CONFIG_DEV_EXTERNAL + START -> ife CONFIG DEV
+//      INIT(op0: clock/csid-clock/hfr/sensor-dim blobs) + UPDATE(op1 req1:
+//      io_cfg RDI_0 + cam_sync fence) -> sensor START -> SCHED_REQ(1)
+//      -> cam_sync WAIT on /dev/video4 -> read pixel buffer -> dump.
+//   Register lists are the mainline imx355 1640x1232 2-lane 24MHz mode.
+//   All protocol structs mirrored from techpack/camera uapi (LineageOS
+//   redbull) — packed where the kernel structs are packed, natural where not.
+//
+// v2 (--tpg): same pipeline with CAM_ISP_IFE_IN_RES_TPG — the CSID's own
+//   generator is the source (VC 0xA / DT 0x2B, kernel-fixed), sensor and
+//   csiphy are never touched. A frame here proves the IFE/RDI path; no
+//   frame here means the defect is in our csid/ife arm, not the sensor.
 //
 // Power sequences and rails come from the device DT (dumped 2026-08-31,
 // see HARDWARE.md M19): sensor@0 vio/vana/vdig 2.85/vaf + reset tlmm23 +
@@ -65,6 +71,11 @@ struct cam_packet {
 
 /* ---- cam_req_mgr.h (video3 opcodes + mem mgr) ---- */
 #define CAM_REQ_MGR_CREATE_DEV_NODES 0x10A
+#define CAM_REQ_MGR_CREATE_SESSION  0x10B
+#define CAM_REQ_MGR_DESTROY_SESSION 0x10C
+#define CAM_REQ_MGR_LINK            0x10D
+#define CAM_REQ_MGR_UNLINK          0x10E
+#define CAM_REQ_MGR_SCHED_REQ       0x10F
 #define CAM_REQ_MGR_ALLOC_BUF   0x112
 #define CAM_REQ_MGR_MAP_BUF     0x113
 #define CAM_REQ_MGR_RELEASE_BUF 0x114
@@ -79,6 +90,198 @@ struct cam_mem_mgr_alloc_cmd {
 };
 struct cam_mem_mgr_release_cmd { int32_t buf_handle; uint32_t reserved; };
 
+/* ================= v1 streaming (M19) ================= */
+
+/* generic node opcodes — cam_defs.h */
+#define CAM_ACQUIRE_DEV   0x102
+#define CAM_START_DEV     0x103
+#define CAM_STOP_DEV      0x104
+#define CAM_CONFIG_DEV    0x105
+#define CAM_RELEASE_DEV   0x106
+#define CAM_ACQUIRE_HW    0x151
+#define CAM_CONFIG_DEV_EXTERNAL 0x201
+#define CAM_API_COMPAT_CONSTANT 0xFEFEFEFE
+
+struct cam_acquire_dev_cmd {
+    int32_t  session_handle, dev_handle;
+    uint32_t handle_type, num_resources;
+    uint64_t resource_hdl;
+};
+struct cam_start_stop_dev_cmd { int32_t session_handle, dev_handle; };
+struct cam_release_dev_cmd    { int32_t session_handle, dev_handle; };
+struct cam_config_dev_cmd {
+    int32_t  session_handle, dev_handle;
+    uint64_t offset, packet_handle;
+};
+
+/* req mgr payloads — cam_req_mgr.h (natural alignment, not packed) */
+struct cam_req_mgr_session_info { int32_t session_hdl, reserved; };
+#define CAM_REQ_MGR_MAX_HANDLES 64
+struct cam_req_mgr_link_info {
+    int32_t  session_hdl;
+    uint32_t num_devices;
+    int32_t  dev_hdls[CAM_REQ_MGR_MAX_HANDLES];
+    int32_t  link_hdl;
+};
+struct cam_req_mgr_unlink_info { int32_t session_hdl, link_hdl; };
+struct cam_req_mgr_sched_request {
+    int32_t session_hdl, link_hdl, bubble_enable, sync_mode,
+            additional_timeout, reserved;
+    int64_t req_id;
+};
+
+/* sensor/csiphy acquire — cam_sensor.h (packed) */
+struct cam_sensor_acquire_dev {
+    uint32_t session_handle, device_handle, handle_type, reserved;
+    uint64_t info_handle;
+} __attribute__((packed));
+struct cam_csiphy_acquire_dev_info { uint32_t combo_mode, reserved; }
+    __attribute__((packed));
+struct cam_csiphy_info {
+    uint16_t lane_mask, lane_assign;
+    uint8_t  csiphy_3phase, combo_mode, lane_cnt, secure_mode;
+    uint64_t settle_time, data_rate;
+} __attribute__((packed));
+/* cam_csiphy_query_cap_t { u32 slot_info; u16 reserved } == same layout as
+ * the sensor querycap head; reuse cam_sensor_query_cap for both. */
+
+/* IFE acquire — cam_defs.h v2 (CAM_MAX_ACQ_RES=5, CAM_MAX_HW_SPLIT=3) */
+struct cam_acquire_hw_cmd_v2 {
+    uint32_t struct_version, reserved;
+    int32_t  session_handle, dev_handle;
+    uint32_t handle_type, data_size;
+    uint64_t resource_hdl;
+    struct {
+        uint32_t acquired_hw_id[5];
+        uint32_t acquired_hw_path[5][3];
+        uint32_t valid_acquired_hw;
+    } hw_info;
+};
+
+/* cam_isp.h — NOT packed (all-natural u32/u64) */
+struct cam_isp_out_port_info {
+    uint32_t res_type, format, width, height, comp_grp_id, split_point,
+             secure_mode, reserved;
+};
+struct cam_isp_in_port_info {
+    uint32_t res_type, lane_type, lane_num, lane_cfg, vc, dt, format,
+             test_pattern, usage_type, left_start, left_stop, left_width,
+             right_start, right_stop, right_width, line_start, line_stop,
+             height, pixel_clk, batch_size, dsp_mode, hbi_cnt, reserved,
+             num_out_res;
+    struct cam_isp_out_port_info data[1];
+};
+struct cam_isp_acquire_hw_info {
+    uint16_t common_info_version, common_info_size;
+    uint32_t common_info_offset, num_inputs, input_info_version,
+             input_info_size, input_info_offset;
+    uint64_t data;   /* in_port blob starts here (offset 24, size 32) */
+};
+
+/* io config — cam_defs.h (natural alignment) */
+struct cam_plane_cfg {
+    uint32_t width, height, plane_stride, slice_height, meta_stride,
+             meta_size, meta_offset, packer_config, mode_config,
+             tile_config, h_init, v_init;
+};
+struct cam_buf_io_cfg {
+    int32_t  mem_handle[3];
+    uint32_t offsets[3];
+    struct cam_plane_cfg planes[3];
+    uint32_t format, color_space, color_pattern, bpp, rotation,
+             resource_type;
+    int32_t  fence, early_fence;
+    struct cam_cmd_buf_desc aux_cmd_buf;
+    uint32_t direction, batch_size, subsample_pattern, subsample_period,
+             framedrop_pattern, framedrop_period, flag, padding;
+};
+#define CAM_BUF_OUTPUT 2
+
+/* isp QUERY_CAP — two-step: caps_handle points at cam_isp_query_cap_cmd,
+ * kernel writes it back including the SMMU handles userspace must name in
+ * cam_mem_mgr_alloc_cmd.mmu_hdls for any HW-mapped (pixel) buffer. */
+struct cam_query_cap_cmd { uint32_t size, handle_type; uint64_t caps_handle; };
+struct cam_iommu_handle { int32_t non_secure, secure; };
+struct cam_hw_version { uint32_t major, minor, incr, reserved; };
+struct cam_isp_dev_cap_info {
+    uint32_t hw_type, reserved;
+    struct cam_hw_version hw_version;
+};
+#define CAM_ISP_HW_MAX 5
+struct cam_isp_query_cap_cmd {
+    struct cam_iommu_handle device_iommu, cdm_iommu;
+    int32_t num_dev;
+    uint32_t reserved;
+    struct cam_isp_dev_cap_info dev_caps[CAM_ISP_HW_MAX];
+};
+
+/* generic blob payloads — cam_isp.h (packed) */
+struct cam_isp_clock_config {
+    uint32_t usage_type, num_rdi;
+    uint64_t left_pix_hz, right_pix_hz, rdi_hz[1];
+} __attribute__((packed));
+struct cam_isp_csid_clock_config { uint64_t csid_clock; }
+    __attribute__((packed));
+struct cam_isp_port_hfr_config {
+    uint32_t resource_type, subsample_pattern, subsample_period,
+             framedrop_pattern, framedrop_period, reserved;
+} __attribute__((packed));
+struct cam_isp_resource_hfr_config {
+    uint32_t num_ports, reserved;
+    struct cam_isp_port_hfr_config port[1];
+} __attribute__((packed));
+struct cam_isp_sensor_dimension {
+    uint32_t width, height, measure_enabled;
+} __attribute__((packed));
+struct cam_isp_sensor_config_blob {
+    struct cam_isp_sensor_dimension ppp_path, ipp_path, rdi_path[4];
+    uint32_t hbi, vbi;
+} __attribute__((packed));   /* 80 B: kernel cam_isp_sensor_config, RDI_MAX=4 */
+
+/* IFE resource ids — uapi cam_isp_ife.h */
+#define CAM_ISP_IFE_IN_RES_TPG  0x4000
+#define CAM_ISP_IFE_IN_RES_PHY_2  0x4003
+#define CAM_ISP_IFE_OUT_RES_RDI_0 0x3006
+/* ISP packet meta / blob types — cam_isp.h */
+#define CAM_ISP_PACKET_META_BASE              0
+#define CAM_ISP_PACKET_META_GENERIC_BLOB_COMMON 12
+#define CAM_ISP_GENERIC_BLOB_TYPE_HFR_CONFIG            0
+#define CAM_ISP_GENERIC_BLOB_TYPE_CLOCK_CONFIG          1
+#define CAM_ISP_GENERIC_BLOB_TYPE_CSID_CLOCK_CONFIG     4
+#define CAM_ISP_GENERIC_BLOB_TYPE_SENSOR_DIMENSION_CONFIG 11
+/* formats — cam_defs.h */
+#define CAM_FORMAT_MIPI_RAW_10 3
+
+/* cam_sync — uapi cam_sync.h (video4). NB: _IOWR('V',192,24) encodes to the
+ * same nr as VIDIOC_CAM_CONTROL; the sync node reads cam_private_ioctl_arg. */
+struct cam_private_ioctl_arg {
+    uint32_t id, size, result, reserved;
+    uint64_t ioctl_ptr;
+};
+struct cam_sync_info { char name[64]; int32_t sync_obj; };
+struct cam_sync_wait { int32_t sync_obj; uint32_t reserved; uint64_t timeout_ms; };
+#define CAM_SYNC_CREATE 0
+#define CAM_SYNC_DESTROY 1
+#define CAM_SYNC_WAIT 6
+
+/* media entity types — cam_defs.h */
+#define CAM_CSIPHY_DEVICE_TYPE 0x10008
+#define CAM_ISP_DEVICE_TYPE    0x10002
+
+/* I2C write mosaic — cam_sensor.h (packed). A random-wr command is
+ * header{count, op_code, cmd_type, data_type, addr_type} followed by count
+ * {u32 reg_addr, u32 reg_data}; the KMD parser walks the cmd buffer and
+ * advances by 8 + 8*count bytes per command. */
+struct i2c_rdwr_header {
+    uint32_t count;
+    uint8_t  op_code, cmd_type, data_type, addr_type;
+} __attribute__((packed));
+struct i2c_random_wr_payload { uint32_t reg_addr, reg_data; }
+    __attribute__((packed));
+#define CMD_I2C_RNDM_WR 5
+#define I2C_OP_RNDM_WR  1
+#define I2C_TYPE_BYTE   1
+
 /* ---- cam_sensor.h ---- */
 #define CAM_SENSOR_PROBE_CMD (0x109 + 1)
 struct cam_cmd_i2c_info { uint32_t slave_addr; uint8_t i2c_freq_mode,
@@ -87,6 +290,14 @@ struct cam_cmd_probe {
     uint8_t data_type, addr_type, op_code, cmd_type;
     uint32_t reg_addr, expected_data, data_mask;
     uint16_t camera_id; uint8_t fw_update_flag; uint16_t reserved;
+} __attribute__((packed));
+/* READREG payload (cam_sensor.h, packed): reg_addr to read, reg_data =
+ * byte count (<=8), query_data_handle = user address the KMD copy_to_user()s
+ * the raw CCI bytes into — the read happens synchronously inside the
+ * CAM_CONFIG_DEV ioctl (cam_sensor_read_reg). */
+struct cam_cmd_get_sensor_data {
+    uint32_t reg_addr, reg_data;
+    uint64_t query_size_handle, query_data_handle;
 } __attribute__((packed));
 struct cam_power_settings {
     uint16_t power_seq_type, reserved;
@@ -139,7 +350,12 @@ struct media_entity_desc {
 struct slot_cfg {
     const char *name;
     uint32_t addr;   /* 8-bit CCI slave address for the real probe */
-    /* power-up steps: seq_type, config_val, delay_ms */
+    /* power-up steps: seq_type, config_val, delay_ms. config_val is 0 for
+     * rails ("keep DT voltages") but must be the rate in Hz for SENSOR_MCLK:
+     * the kernel only clk_set_rate()s cam_clk when config_val != 0 — with 0
+     * it runs at the camcc default ("set cam_clk, rate 0", observed
+     * 2026-09-01) and the sensor PLL locks to an unknown reference. DT
+     * clock-rates = 24 MHz for all three sensor nodes. */
     struct { uint8_t seq; uint32_t cfg; uint16_t delay; } up[8];
     int n_up;
     /* power-down steps (applied in given order) */
@@ -161,7 +377,7 @@ static struct slot_cfg slots[3] = {
         { SENSOR_VIO,         0, 1 }, { SENSOR_VANA, 0, 1 },
         { SENSOR_VAF,         0, 0 }, { SENSOR_VDIG, 0, 1 },
         { SENSOR_CUSTOM_REG1, 0, 1 }, { SENSOR_CUSTOM_REG2, 0, 1 },
-        { SENSOR_MCLK,        0, 1 }, { SENSOR_RESET, 1, 5 } },
+        { SENSOR_MCLK, 24000000, 1 }, { SENSOR_RESET, 1, 5 } },
         .n_up = 8, .down = {
         { SENSOR_MCLK,        0, 1 }, { SENSOR_RESET, 0, 1 },
         { SENSOR_CUSTOM_REG2, 0, 1 }, { SENSOR_CUSTOM_REG1, 0, 1 },
@@ -170,7 +386,7 @@ static struct slot_cfg slots[3] = {
     [1] = { "rear-uw", .addr = 0x34, .up = {
         { SENSOR_VIO,   0, 1 }, { SENSOR_VANA,  0, 1 },
         { SENSOR_VDIG,  0, 1 }, { SENSOR_RESET, 1, 8 },
-        { SENSOR_MCLK,  0, 1 } }, .n_up = 5, .down = {
+        { SENSOR_MCLK, 24000000, 1 } }, .n_up = 5, .down = {
         { SENSOR_MCLK,  0, 1 }, { SENSOR_RESET, 0, 5 },
         { SENSOR_VDIG,  0, 1 }, { SENSOR_VANA,  0, 1 },
         { SENSOR_VIO,   0, 1 } }, .n_down = 5 },
@@ -178,14 +394,96 @@ static struct slot_cfg slots[3] = {
         { SENSOR_VIO,          0, 1 },
         { SENSOR_CUSTOM_GPIO1, 1, 5 },   /* PM8150L gpio2 */
         { SENSOR_RESET,        1, 8 },
-        { SENSOR_MCLK,         0, 1 } }, .n_up = 4, .down = {
+        { SENSOR_MCLK,  24000000, 1 } }, .n_up = 4, .down = {
         { SENSOR_MCLK,         0, 1 },
         { SENSOR_RESET,        0, 5 },
         { SENSOR_CUSTOM_GPIO1, 0, 1 },
         { SENSOR_VIO,          0, 1 } }, .n_down = 4 },
 };
 
+/* chip ids observed on this device (HARDWARE.md 2026-08-31) */
+static const uint32_t slot_id[3] = { 0x363, 0x481, 0x355 };
+
 static const uint32_t try_addrs[] = { 0x34, 0x20, 0x10, 0x6E, 0x6C, 0x36 };
+
+/* ---- imx355 register lists (mainline drivers/media/i2c/imx355.c) ----
+ * Front camera, slot 2, slave 0x34, chip id 0x355 @ reg 0x16.
+ * Mode: 1640x1232 (crop 3280x2464 @0,0, 2x2 binning), 2-lane DPHY,
+ * 24 MHz MCLK -> extclk 0x1800, pll_op_mul 111, prediv 3 (888 Mbps/lane,
+ * link freq 444 MHz, pixel rate 177.6 MPix/s), fll 1306, llp 1836, RAW10.
+ * Width 8 = 8-bit reg, 16 = 16-bit reg; the packet builder groups by width
+ * into separate I2C random-write commands. */
+struct wreg { uint16_t addr; uint16_t val; uint8_t width; };
+
+/* imx355_global_regs — sent as INITIAL_CONFIG (applied at CONFIG_DEV) */
+static const struct wreg imx355_global[] = {
+    {0x304e, 0x03, 8}, {0x4348, 0x16, 8}, {0x4350, 0x19, 8},
+    {0x4408, 0x0a, 8}, {0x440c, 0x0b, 8}, {0x4411, 0x5f, 8},
+    {0x4412, 0x2c, 8}, {0x4623, 0x00, 8}, {0x462c, 0x0f, 8},
+    {0x462d, 0x00, 8}, {0x462e, 0x00, 8}, {0x4684, 0x54, 8},
+    {0x480a, 0x07, 8}, {0x4908, 0x07, 8}, {0x4909, 0x07, 8},
+    {0x490d, 0x0a, 8}, {0x491e, 0x0f, 8}, {0x4921, 0x06, 8},
+    {0x4923, 0x28, 8}, {0x4924, 0x28, 8}, {0x4925, 0x29, 8},
+    {0x4926, 0x29, 8}, {0x4927, 0x1f, 8}, {0x4928, 0x20, 8},
+    {0x4929, 0x20, 8}, {0x492a, 0x20, 8}, {0x492c, 0x05, 8},
+    {0x492d, 0x06, 8}, {0x492e, 0x06, 8}, {0x492f, 0x06, 8},
+    {0x4930, 0x03, 8}, {0x4931, 0x04, 8}, {0x4932, 0x04, 8},
+    {0x4933, 0x05, 8}, {0x595e, 0x01, 8}, {0x5963, 0x01, 8},
+    {0x3030, 0x01, 8}, {0x3031, 0x01, 8}, {0x3045, 0x01, 8},
+    {0x4010, 0x00, 8}, {0x4011, 0x00, 8}, {0x4012, 0x00, 8},
+    {0x4013, 0x01, 8}, {0x68a8, 0xfe, 8}, {0x68a9, 0xff, 8},
+    {0x6888, 0x00, 8}, {0x6889, 0x00, 8}, {0x68b0, 0x00, 8},
+    {0x3058, 0x00, 8}, {0x305a, 0x00, 8},
+    {0x0112, 0x0a, 8},   /* CST_SZ: 10-bit addr/data (RAW10) */
+    {0x0113, 0x0a, 8},
+    {0x0301, 0x05, 8},   /* PLL_IVT_PCK_DIV */
+    {0x0303, 0x01, 8},   /* PLL_IVT_SYSCK_DIV (rewritten at streamon) */
+    {0x0305, 0x02, 8}, {0x0306, 0x00, 8}, {0x0307, 0x78, 8},
+    {0x030b, 0x01, 8},
+    {0x030d, 0x02, 8},   /* PLL_OP_PREDIV default (rewritten at streamon) */
+    {0x0310, 0x00, 8}, {0x0220, 0x00, 8}, {0x0222, 0x01, 8},
+    {0x3088, 0x04, 8}, {0x6813, 0x02, 8}, {0x6835, 0x07, 8},
+    {0x6836, 0x01, 8}, {0x6837, 0x04, 8}, {0x684d, 0x07, 8},
+    {0x684e, 0x01, 8}, {0x684f, 0x04, 8},
+};
+
+/* streamon body — mode regs + crop + binning + PLL + MIPI + timing.
+ * Sent as CONFIG (applied at CONFIG_DEV), in mainline order. */
+static const struct wreg imx355_cfg[] = {
+    {0x0700, 0x00, 8},   /* mode regs */
+    {0x0701, 0x10, 8},
+    {0x0344, 0, 16},     /* crop X_ADD_START */
+    {0x0346, 0, 16},     /* crop Y_ADD_START */
+    {0x0348, 3279, 16},  /* X_ADD_END (3280-1) */
+    {0x034a, 2463, 16},  /* Y_ADD_END (2464-1) */
+    {0x034c, 1640, 16},  /* X_OUT_SIZE */
+    {0x034e, 1232, 16},  /* Y_OUT_SIZE */
+    {0x0900, 0x01, 8},   /* binning mode (2x2 -> 0x22 != 0x11 -> 0x01) */
+    {0x0901, 0x22, 8},   /* binning type */
+    {0x0902, 0x00, 8},   /* binning weighting */
+    /* MCLK: the DT clock-rates for this sensor ask for 24 MHz, so that is
+     * the default (extclk 0x1800, mul 111, prediv 3, 888 Mbps/lane, link
+     * 444 MHz). A 19.2 MHz variant (0x1333/92/2 -> 883.2 Mbps) exists in
+     * mainline and stays reachable with --mclk 19; a frame-period
+     * measurement once suggested 19.2 MHz but was later shown unreliable
+     * (mixed print sites), so treat 24 MHz as the recorded default. */
+    {0x0136, 0x1800, 16},/* EXTCLK_FREQ 24.0 MHz (8.8 fixed point) */
+    {0x030e, 111, 16},   /* PLL_OP_MUL (24 MHz, 2-lane) */
+    {0x030d, 3, 8},      /* PLL_OP_PREDIV (24 MHz, 2-lane) */
+    {0x0303, 2, 8},      /* PLL_IVT_SYSCK_DIV (2-lane) */
+    {0x0114, 1, 8},      /* LANE_SEL: 2 lanes */
+    {0x0820, 1776, 16},  /* REQ_LINK_BIT_RATE MHz (444*2*2) */
+    {0x3070, 1, 8},      /* DPGA_USE_GLOBAL_GAIN */
+    {0x0342, 1836, 16},  /* LLP */
+    {0x0340, 1306, 16},  /* FLL */
+    {0x0202, 1000, 16},  /* exposure */
+    {0x0204, 0, 16},     /* analog gain */
+    {0x020e, 256, 16},   /* digital gain 1.0x (8.8) */
+    {0x0600, 0, 16},     /* test pattern off */
+};
+
+static const struct wreg imx355_streamon[] = { {0x0100, 1, 8} };
+static const struct wreg imx355_streamoff[] = { {0x0100, 0, 8} };
 
 /* ---- helpers ---- */
 /* NB: video3 (cam_req_mgr) checks size == sizeof(payload struct), so the
@@ -500,21 +798,1173 @@ static int find_sensor_nodes(int sd_slot_fd[MAX_SUBDEV], int sd_slot[MAX_SUBDEV]
     return n;
 }
 
+/* ============ v1: one RAW frame through cam_req_mgr / IFE RDI ============ */
+
+/* kmsg tail for streaming: print every camera-stack line */
+static double stream_kmsg(int fd, double since_us)
+{
+    char buf[512];
+    double max = since_us;
+    while (1) {
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        if (n <= 0)
+            break;
+        buf[n] = 0;
+        double ts;
+        if (sscanf(buf, "%*d,%*llu,%lf;%*s", &ts) != 1) {
+            char *s = strchr(buf, ';');
+            if (!s)
+                continue;
+            ts = max;
+        }
+        if (ts > max)
+            max = ts;
+        if (ts < since_us)
+            continue;
+        char *semi = strchr(buf, ';');
+        if (semi && strstr(semi, "CAM-"))
+            printf("    kmsg: %s", semi + 1);
+    }
+    return max;
+}
+
+/* find the subdev node for an entity type; want_slot >= 0 also matches the
+ * querycap slot_info (sensor/csiphy). Returns fd or -1. */
+static int find_subdev_by_type(uint32_t type, int want_slot, int *out_slot)
+{
+    for (int mi = 0; mi < 8; mi++) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/media%d", mi);
+        int mfd = open(path, O_RDONLY);
+        if (mfd < 0)
+            continue;
+        uint32_t id = 0;
+        for (;;) {
+            struct media_entity_desc ent;
+            memset(&ent, 0, sizeof(ent));
+            ent.id = id | MEDIA_ENT_ID_FLAG_NEXT;
+            if (ioctl(mfd, MEDIA_IOC_ENUM_ENTITIES, &ent) < 0)
+                break;
+            id = ent.id;
+            if (ent.type != type || ent.dev.v4l.major == 0)
+                continue;
+            char want[32];
+            snprintf(want, sizeof(want), "%u:%u",
+                ent.dev.v4l.major, ent.dev.v4l.minor);
+            for (int s = 0; s < 32; s++) {
+                char sf[96], dv[64], devp[32];
+                snprintf(sf, sizeof(sf),
+                    "/sys/class/video4linux/v4l-subdev%d/dev", s);
+                int df = open(sf, O_RDONLY);
+                if (df < 0)
+                    continue;
+                ssize_t r = read(df, dv, sizeof(dv) - 1);
+                close(df);
+                if (r <= 0)
+                    continue;
+                dv[r] = 0;
+                size_t wl = strlen(want);
+                if (strncmp(dv, want, wl) != 0 ||
+                    (dv[wl] != '\n' && dv[wl] != 0))
+                    continue;
+                snprintf(devp, sizeof(devp), "/dev/v4l-subdev%d", s);
+                int fd = open(devp, O_RDWR);
+                if (fd < 0)
+                    break;
+                if (want_slot >= 0) {
+                    struct cam_sensor_query_cap cap;
+                    memset(&cap, 0, sizeof(cap));
+                    if (cam_ioctl(fd, CAM_QUERY_CAP, &cap,
+                                  CAM_HANDLE_USER_POINTER,
+                                  sizeof(cap)) < 0 ||
+                        (int)cap.slot_info != want_slot) {
+                        close(fd);
+                        break;
+                    }
+                    if (out_slot)
+                        *out_slot = (int)cap.slot_info;
+                }
+                printf("  node %s = %s\n",
+                    type == CAM_SENSOR_DEVICE_TYPE ? "sensor" :
+                    type == CAM_CSIPHY_DEVICE_TYPE ? "csiphy" : "isp",
+                    devp);
+                close(mfd);
+                return fd;
+            }
+        }
+        close(mfd);
+    }
+    return -1;
+}
+
+/* build I2C random-write mosaic into buf; returns bytes used */
+static size_t build_i2c_writes(uint8_t *buf, const struct wreg *r, int n)
+{
+    uint8_t *p = buf;
+    int i = 0;
+    while (i < n) {
+        int j = i;
+        while (j < n && r[j].width == r[i].width)
+            j++;
+        struct i2c_rdwr_header *h = (void *)p;
+        h->count = (uint32_t)(j - i);
+        h->op_code = I2C_OP_RNDM_WR;
+        h->cmd_type = CMD_I2C_RNDM_WR;
+        h->data_type = r[i].width == 16 ? I2C_TYPE_WORD : I2C_TYPE_BYTE;
+        /* imx355 register ADDRESSES are always 16-bit, only data width
+         * varies — with BYTE addr the CCI truncates 0x030d to register
+         * 0x0d and the write is silently dropped (observed: every 8-bit
+         * reg read back its old value while all 16-bit regs landed). */
+        h->addr_type = I2C_TYPE_WORD;
+        struct i2c_random_wr_payload *pl = (void *)(p + sizeof(*h));
+        for (int k = i; k < j; k++) {
+            pl[k - i].reg_addr = r[k].addr;
+            pl[k - i].reg_data = r[k].val;
+        }
+        p += sizeof(*h) + sizeof(*pl) * (uint32_t)(j - i);
+        i = j;
+    }
+    return (size_t)(p - buf);
+}
+
+/* one shot buffer set (packet + i2c cmd buf), reusable across packets */
+struct shot_bufs {
+    struct cam_mem_mgr_alloc_cmd pkt, cmd;
+    void *p_pkt, *p_cmd;
+    int pkt_fd, cmd_fd;
+    size_t cmd_cap;
+};
+
+static void shot_free(int video_fd, struct shot_bufs *b)
+{
+    if (b->p_pkt) munmap(b->p_pkt, 4096);
+    if (b->p_cmd) munmap(b->p_cmd, b->cmd_cap);
+    if (b->pkt.out.buf_handle) release_buf(video_fd, b->pkt.out.buf_handle);
+    if (b->cmd.out.buf_handle) release_buf(video_fd, b->cmd.out.buf_handle);
+    if (b->pkt_fd > 0) close(b->pkt_fd);
+    if (b->cmd_fd > 0) close(b->cmd_fd);
+    memset(b, 0, sizeof(*b));
+}
+
+/* mmu_hdl > 0: cmd buf is also HW-mapped into that SMMU ctx (the CDM reads
+ * the kmd/BL region through its own iommu; without it submit_bl fails its
+ * sanity check — observed). mmu_hdl <= 0: CPU-only (sensor packets). */
+static int shot_alloc(int video_fd, struct shot_bufs *b, size_t cmd_cap,
+                      int32_t mmu_hdl)
+{
+    memset(b, 0, sizeof(*b));
+    b->cmd_cap = (cmd_cap + 4095) & ~4095UL;
+    if (alloc_buf(video_fd, 4096, 4096, &b->pkt) < 0)
+        return -1;
+    memset(&b->cmd, 0, sizeof(b->cmd));
+    b->cmd.len = b->cmd_cap;
+    b->cmd.align = 8;
+    if (mmu_hdl > 0) {
+        b->cmd.mmu_hdls[0] = mmu_hdl;
+        b->cmd.num_hdl = 1;
+        b->cmd.flags = 0x49;  /* KMD_ACCESS|CMD_BUF_TYPE|HW_READ_WRITE */
+    } else {
+        b->cmd.flags = 0x48;  /* KMD_ACCESS|CMD_BUF_TYPE */
+    }
+    if (cam_ioctl(video_fd, CAM_REQ_MGR_ALLOC_BUF, &b->cmd,
+                  CAM_HANDLE_USER_POINTER, sizeof(b->cmd)) < 0) {
+        fprintf(stderr, "cmd alloc_buf(%zu): %s\n", b->cmd_cap,
+            strerror(errno));
+        shot_free(video_fd, b);
+        return -1;
+    }
+    b->pkt_fd = b->pkt.out.fd;
+    b->cmd_fd = b->cmd.out.fd;
+    b->p_pkt = map_fd(b->pkt_fd, 4096);
+    b->p_cmd = map_fd(b->cmd_fd, b->cmd_cap);
+    if (!b->p_pkt || !b->p_cmd) {
+        shot_free(video_fd, b);
+        return -1;
+    }
+    memset(b->p_pkt, 0, 4096);
+    memset(b->p_cmd, 0, b->cmd_cap);
+    return 0;
+}
+
+/* sensor CONFIG_DEV packet: header + 1 cmd desc holding the i2c mosaic.
+ * The KMD parses exactly one cmd buffer per config packet. opcodes:
+ * 0=STREAMON(applied at START_DEV) 2=INITIAL_CONFIG 4=CONFIG 5=STREAMOFF
+ * (2/4/5 applied immediately). */
+static int sensor_config(int video_fd, int sd_fd, struct shot_bufs *b,
+                         uint32_t session, uint32_t dev_hdl,
+                         uint32_t op, const struct wreg *regs, int n)
+{
+    size_t used = build_i2c_writes(b->p_cmd, regs, n);
+    memset(b->p_pkt, 0, 512);
+    struct cam_packet *pk = b->p_pkt;
+    pk->header.op_code = op;
+    pk->header.request_id = 0;
+    pk->header.size = (uint32_t)(sizeof(*pk) + sizeof(struct cam_cmd_buf_desc));
+    pk->num_cmd_buf = 1;
+    struct cam_cmd_buf_desc *d = (void *)pk->payload;
+    d->mem_handle = (int32_t)b->cmd.out.buf_handle;
+    d->size = (uint32_t)b->cmd_cap;
+    d->length = (uint32_t)used;
+    struct cam_config_dev_cmd cfg = {
+        .session_handle = (int32_t)session, .dev_handle = (int32_t)dev_hdl,
+        .offset = 0, .packet_handle = b->pkt.out.buf_handle };
+    return cam_ioctl(sd_fd, CAM_CONFIG_DEV, &cfg,
+                     CAM_HANDLE_USER_POINTER, sizeof(cfg));
+}
+
+/* sensor register readback (op 6 READREG): one cmd buf holding
+ * cam_cmd_get_sensor_data; the KMD does the CCI read inside the ioctl and
+ * copy_to_user()s nbytes raw bytes into our stack var. Reuses the sensor
+ * shot bufs (settings were already copied out at parse time). */
+static int sensor_readreg(int sd_fd, struct shot_bufs *b, uint32_t session,
+                          uint32_t dev_hdl, uint32_t addr, int nbytes,
+                          uint8_t *out)
+{
+    struct cam_cmd_get_sensor_data *gs = b->p_cmd;
+    memset(b->p_cmd, 0, 64);
+    gs->reg_addr = addr;
+    gs->reg_data = (uint32_t)nbytes;
+    gs->query_data_handle = (uint64_t)(uintptr_t)out;
+    memset(b->p_pkt, 0, 512);
+    struct cam_packet *pk = b->p_pkt;
+    pk->header.op_code = 6;   /* CAM_SENSOR_PACKET_OPCODE_SENSOR_READREG */
+    pk->header.request_id = 0;
+    pk->header.size = (uint32_t)(sizeof(*pk) + sizeof(struct cam_cmd_buf_desc));
+    pk->num_cmd_buf = 1;
+    struct cam_cmd_buf_desc *d = (void *)pk->payload;
+    d->mem_handle = (int32_t)b->cmd.out.buf_handle;
+    d->size = (uint32_t)b->cmd_cap;
+    d->length = sizeof(*gs);
+    struct cam_config_dev_cmd cfg = {
+        .session_handle = (int32_t)session, .dev_handle = (int32_t)dev_hdl,
+        .offset = 0, .packet_handle = b->pkt.out.buf_handle };
+    if (cam_ioctl(sd_fd, CAM_CONFIG_DEV, &cfg,
+                  CAM_HANDLE_USER_POINTER, sizeof(cfg)) < 0) {
+        fprintf(stderr, "READREG 0x%04x: %s\n", addr, strerror(errno));
+        return -1;
+    }
+    return nbytes;
+}
+
+/* readback table: 8-bit regs read 1 byte, 16-bit read 2 (bus order MSB
+ * first). expect = value as written in the reg tables. */
+static const struct rbreg {
+    uint32_t addr; uint32_t val; uint8_t n; const char *name;
+} rbregs[] = {
+    {0x304e, 0x03,   1, "global 0x304e"},  /* INIT-only 8-bit write */
+    {0x0136, 0x1800, 2, "EXTCLK 24MHz"},
+    {0x0114, 0x0001, 1, "LANE_SEL 2"},
+    {0x030e, 111,    2, "PLL_OP_MUL"},
+    {0x030d, 3,      1, "PLL_OP_PREDIV"},
+    {0x0303, 2,      1, "IVT_SYSCK_DIV"},
+    {0x0820, 1776,   2, "REQ_LINK_BIT_RATE"},
+    {0x0342, 1836,   2, "LLP"},
+    {0x0340, 1306,   2, "FLL"},
+    {0x0100, 1,      1, "MODE_SELECT"},
+};
+
+/* MCLK input actually fed to the sensor: DT asks for 24 MHz (default);
+ * --mclk 19 selects the 19.2 MHz parameter set. Chosen before packets are
+ * built so both the write tables and the readback expectations follow. */
+static int g_mclk24 = 1;
+/* --mclk <MHz>: the EXTCLK the sensor actually receives. Generic PLL path:
+ * PREDIV=1 MUL=30 → VCO = 30*f Mbps/lane for ANY f, and the CSIPHY data
+ * rate is told the same number, so a sweep over f hypotheses needs only
+ * self-consistent configs (observed idea 2026-09-01: real MCLK proved to
+ * be neither 24 nor 19.2 — both tuned sets stream the same ECC garbage). */
+static double g_extclk_mhz = 24.0;
+
+/* Lane count. The vendor module info (mipiFlags in
+ * /vendor/lib64/camera/com.qti.sensormodule.primax_imx355_lito2.bin) says
+ * this module runs clk + 4 data lanes, so 4 is the default; the mainline
+ * driver's 2-lane set stays reachable with --lanes 2. */
+static int g_lanes = 4;
+/* --noglobal: skip the 70-reg global init (mainline imx355 list, sourced
+ * from a ChromeOS module build) and write only the per-mode config. A/B for
+ * whether the borrowed global tuning is what corrupts this primax module's
+ * MIPI TX (all configs stream garbage with it; observed 2026-09-01). */
+static int g_noglobal;
+/* --nostarton: see imx355_streamoff above. */
+static int g_nostarton;
+/* --tpg: arm the CSID's built-in test pattern generator instead of the PHY
+ * RX (CAM_ISP_IFE_IN_RES_TPG). The whole sensor side (probe, power, register
+ * lists, csiphy) is skipped, so a frame proves the IFE/RDI pipeline alone —
+ * the discriminator between "pipeline broken" and "sensor silent" (the
+ * sensor's own 0x0600 pattern via --tp still needs PLL+start, so it never
+ * exercised this). Kernel fixes TPG traffic at VC 0xA / DT 0x2B. */
+static int g_tpg;
+
+/* per (mclk, lanes) PLL tuple: [mpy, prediv, sysck, link_total, lane_sel] */
+static void pll_params(uint32_t *m19)
+{
+    /* generic: MUL=30 PREDIV=1 → VCO = 30*extclk Mbps (720 @24M, the same
+     * VCO as the legacy tuned 4-lane set); REQ_LINK = VCO*lanes. The CSIPHY
+     * data rate is told the same per-lane number, so any EXTCLK hypothesis
+     * is a self-consistent config. */
+    uint32_t vco = (uint32_t)(30.0 * g_extclk_mhz + 0.5);
+    m19[0] = 30;                          /* PLL_OP_MUL */
+    m19[1] = 1;                           /* PLL_OP_PREDIV */
+    m19[2] = g_lanes == 4 ? 1 : 2;        /* IVT_SYSCK_DIV */
+    m19[3] = vco * (uint32_t)g_lanes;     /* REQ_LINK_BIT_RATE total Mbps */
+    m19[4] = (uint32_t)g_lanes - 1;       /* LANE_SEL */
+}
+
+static uint16_t extclk_reg(void)
+{
+    return (uint16_t)(g_extclk_mhz * 256.0 + 0.5);  /* 8.8 fixed point */
+}
+
+static void mclk_expect(uint32_t addr, uint32_t *val)
+{
+    uint32_t p[5];
+    pll_params(p);
+    switch (addr) {
+    case 0x0136: *val = extclk_reg(); break;
+    case 0x030e: *val = p[0]; break;      /* PLL_OP_MUL */
+    case 0x030d: *val = p[1]; break;      /* PLL_OP_PREDIV */
+    case 0x0303: *val = p[2]; break;      /* IVT_SYSCK_DIV */
+    case 0x0820: *val = p[3]; break;      /* REQ_LINK_BIT_RATE */
+    case 0x0114: *val = p[4]; break;      /* LANE_SEL */
+    }
+}
+
+static void sensor_readback(int sd_fd, struct shot_bufs *b, uint32_t session,
+                            uint32_t dev_hdl, const char *when)
+{
+    printf("== sensor readback (%s) ==\n", when);
+    for (size_t i = 0; i < sizeof(rbregs) / sizeof(rbregs[0]); i++) {
+        uint8_t v[8] = {0xEE, 0xEE, 0xEE, 0xEE};
+        if (sensor_readreg(sd_fd, b, session, dev_hdl, rbregs[i].addr,
+                           rbregs[i].n, v) < 0) {
+            printf("  0x%04x read FAILED (sensor not answering?)\n",
+                rbregs[i].addr);
+            break;
+        }
+        uint32_t got = rbregs[i].n == 2
+            ? (uint32_t)((v[0] << 8) | v[1]) : v[0];
+        uint32_t expect = rbregs[i].val;
+        mclk_expect(rbregs[i].addr, &expect);
+        printf("  0x%04x %-18s = 0x%0*x (expect 0x%x) %s\n",
+            rbregs[i].addr, rbregs[i].name, rbregs[i].n == 2 ? 4 : 2,
+            got, expect,
+            got == expect ? "ok" : "MISMATCH");
+    }
+}
+
+/* sensor NOP packet for req_id — registers the request with the req mgr
+ * (every linked device must add a request before it can be applied). */
+static int sensor_nop(int video_fd, int sd_fd, struct shot_bufs *b,
+                      uint32_t session, uint32_t dev_hdl, int64_t req_id)
+{
+    memset(b->p_pkt, 0, 512);
+    struct cam_packet *pk = b->p_pkt;
+    pk->header.op_code = 127;
+    pk->header.request_id = (uint64_t)req_id;
+    pk->header.size = (uint32_t)sizeof(*pk);
+    pk->num_cmd_buf = 0;
+    struct cam_config_dev_cmd cfg = {
+        .session_handle = (int32_t)session, .dev_handle = (int32_t)dev_hdl,
+        .offset = 0, .packet_handle = b->pkt.out.buf_handle };
+    return cam_ioctl(sd_fd, CAM_CONFIG_DEV, &cfg,
+                     CAM_HANDLE_USER_POINTER, sizeof(cfg));
+}
+
+/* IFE packet builder. num_cmd = 1 (kmd only, length 0 => whole buf is KMD
+ * scratch for CDM commands) or 2 (kmd + generic-blob cmd, meta 12).
+ * io_cfg: optional output port entry. */
+static int isp_config(int video_fd, int isp_fd, struct shot_bufs *b,
+                      uint32_t session, uint32_t dev_hdl, uint32_t op,
+                      int64_t req_id, size_t blob_len, int n_io,
+                      const struct cam_buf_io_cfg *io)
+{
+    memset(b->p_pkt, 0, 1024);
+    int ndesc = blob_len ? 2 : 1;
+    struct cam_packet *pk = b->p_pkt;
+    pk->header.op_code = op;
+    pk->header.request_id = (uint64_t)req_id;
+    pk->header.size = (uint32_t)(sizeof(*pk) +
+        ndesc * sizeof(struct cam_cmd_buf_desc) +
+        n_io * sizeof(struct cam_buf_io_cfg));
+    pk->num_cmd_buf = ndesc;
+    pk->kmd_cmd_buf_index = 0;
+    pk->kmd_cmd_buf_offset = 0;
+    struct cam_cmd_buf_desc *d = (void *)pk->payload;
+    /* cmd buffer layout: [0, half) carries the blob payload (desc 1),
+     * [half, cap) is kmd scratch where the hw mgr builds CDM commands.
+     * desc 0 (kmd) has length 0 -> add_command_buffers skips it. */
+    uint32_t half = (uint32_t)(b->cmd_cap / 2);
+    d[0].mem_handle = (int32_t)b->cmd.out.buf_handle;
+    d[0].offset = half;
+    d[0].size = half;
+    d[0].length = 0;
+    if (blob_len) {
+        d[1].mem_handle = (int32_t)b->cmd.out.buf_handle;
+        d[1].offset = 0;
+        d[1].size = half;
+        d[1].length = (uint32_t)blob_len;
+        d[1].meta_data = CAM_ISP_PACKET_META_GENERIC_BLOB_COMMON;
+    }
+    if (n_io) {
+        pk->io_configs_offset =
+            ndesc * sizeof(struct cam_cmd_buf_desc);
+        pk->num_io_configs = n_io;
+        memcpy((uint8_t *)pk->payload + pk->io_configs_offset, io,
+            n_io * sizeof(*io));
+    }
+    struct cam_config_dev_cmd cfg = {
+        .session_handle = (int32_t)session, .dev_handle = (int32_t)dev_hdl,
+        .offset = 0, .packet_handle = b->pkt.out.buf_handle };
+    return cam_ioctl(isp_fd, CAM_CONFIG_DEV, &cfg,
+                     CAM_HANDLE_USER_POINTER, sizeof(cfg));
+}
+
+/* append one generic blob (word = size<<8 | type, payload padded to 4) */
+static size_t blob_add(uint8_t *p, uint32_t type, const void *payload,
+                       size_t len)
+{
+    uint32_t hdr = ((uint32_t)len << 8) | type;
+    memcpy(p, &hdr, 4);
+    memcpy(p + 4, payload, len);
+    size_t pad = (4 - (len & 3)) & 3;
+    memset(p + 4 + len, 0, pad);
+    return 4 + len + pad;
+}
+
+static int run_stream(int slot, const char *out_path, int wait_ms,
+                      uint32_t settle_cnt, uint32_t tp, int rb)
+{
+    int rc = 1, video_fd = -1, sync_fd = -1, kmsg = -1;
+    int sensor_fd = -1, csiphy_fd = -1, isp_fd = -1;
+    int out_fd = -1;
+    uint32_t session = 0, sensor_hdl = 0, csiphy_hdl = 0, isp_hdl = 0,
+             link_hdl = 0, sync_obj = 0;
+    struct shot_bufs sb = {0}, ib = {0}, ub = {0};
+    struct cam_mem_mgr_alloc_cmd pix = {0};
+    void *pix_map = MAP_FAILED;
+    int pix_mfd = -1;
+    double kt = 0;
+    const uint32_t width = 1640, height = 1232, stride = 2050, dt = 0x2B;
+    const uint64_t pixbuf_len = (uint64_t)stride * height;  /* 2,525,600 */
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    video_fd = open("/dev/video3", O_RDWR);
+    sync_fd = open("/dev/video4", O_RDWR);
+    kmsg = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+    if (kmsg >= 0)
+        kt = kmsg_drain(kmsg, 0);
+
+    printf("== stream slot %d (%s), %ux%u RAW10 (stride %u) ==\n",
+        slot, slots[slot].name, width, height, stride);
+
+    /* locate the three nodes: sensor by slot; its querycap says which
+     * csiphy index serves that slot; isp by entity type */
+    sensor_fd = find_subdev_by_type(CAM_SENSOR_DEVICE_TYPE, slot, NULL);
+    int phy_idx = -1;
+    if (sensor_fd >= 0) {
+        struct cam_sensor_query_cap cap;
+        memset(&cap, 0, sizeof(cap));
+        if (cam_ioctl(sensor_fd, CAM_QUERY_CAP, &cap, CAM_HANDLE_USER_POINTER,
+                      sizeof(cap)) == 0)
+            phy_idx = (int)cap.csiphy_slot_id;
+    }
+    csiphy_fd = phy_idx >= 0
+        ? find_subdev_by_type(CAM_CSIPHY_DEVICE_TYPE, phy_idx, NULL) : -1;
+    isp_fd = find_subdev_by_type(CAM_ISP_DEVICE_TYPE, -1, NULL);
+    if (sensor_fd < 0 || csiphy_fd < 0 || isp_fd < 0) {
+        fprintf(stderr, "node discovery failed: sensor=%d csiphy=%d(%d) isp=%d\n",
+            sensor_fd, csiphy_fd, phy_idx, isp_fd);
+        goto out;
+    }
+
+    /* 1. real probe (expected id -> is_probe_succeed=1; powers down after).
+     * Runs in --tpg too: the kernel rejects the sensor ACQUIRE_DEV with
+     * EINVAL while is_probe_succeed==0 (fresh boot), and the vendor TPG
+     * topology keeps the (idle, powered) sensor in the link. TPG mode
+     * differs only from here on: no regs, no mode config, no streamon,
+     * no csiphy. */
+    int prc = 0;
+    printf("probe %s @0x%02x expect 0x%04x: ", slots[slot].name,
+        slots[slot].addr, slot_id[slot]);
+    fflush(stdout);
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        double tp0 = kt;
+        prc = probe_once(video_fd, sensor_fd, slot, slots[slot].addr,
+                         0x0016, slot_id[slot]);
+        kt = kmsg_drain(kmsg, tp0);
+        printf("rc=%d (%s)%s", prc, prc ? strerror(errno) : "OK",
+            attempt < 3 && prc ? "; retry " : "\n");
+        if (prc == 0)
+            break;
+        sleep(2);
+    }
+    if (prc != 0) {
+        /* without is_probe_succeed=1 the sensor driver rejects the INIT
+         * packet; no point continuing */
+        fprintf(stderr, "probe failed, aborting\n");
+        rc = 2;
+        goto out;
+    }
+    if (g_tpg)
+        printf("tpg mode: no regs/mode-config/streamon/csiphy — CSID TPG is the source\n");
+
+    /* 2. session */
+    struct cam_req_mgr_session_info si;
+    memset(&si, 0, sizeof(si));
+    if (cam_ioctl(video_fd, CAM_REQ_MGR_CREATE_SESSION, &si,
+                  CAM_HANDLE_USER_POINTER, sizeof(si)) < 0) {
+        fprintf(stderr, "CREATE_SESSION: %s\n", strerror(errno));
+        goto out;
+    }
+    session = (uint32_t)si.session_hdl;
+    printf("session %u\n", session);
+
+    /* 3a. sensor acquire */
+    struct cam_sensor_acquire_dev acq;
+    memset(&acq, 0, sizeof(acq));
+    acq.session_handle = session;
+    acq.handle_type = CAM_HANDLE_USER_POINTER;
+    if (cam_ioctl(sensor_fd, CAM_ACQUIRE_DEV, &acq,
+                  CAM_HANDLE_USER_POINTER, sizeof(acq)) < 0) {
+        fprintf(stderr, "sensor ACQUIRE_DEV: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, kt);
+        goto out;
+    }
+    sensor_hdl = acq.device_handle;
+    printf("sensor dev hdl %u\n", sensor_hdl);
+
+    /* 3b. csiphy acquire (combo_mode 0) */
+    struct cam_csiphy_acquire_dev_info phy_ai;
+    memset(&phy_ai, 0, sizeof(phy_ai));
+    memset(&acq, 0, sizeof(acq));
+    acq.session_handle = session;
+    acq.handle_type = CAM_HANDLE_USER_POINTER;
+    acq.info_handle = (uint64_t)(uintptr_t)&phy_ai;
+    if (cam_ioctl(csiphy_fd, CAM_ACQUIRE_DEV, &acq,
+                  CAM_HANDLE_USER_POINTER, sizeof(acq)) < 0) {
+        fprintf(stderr, "csiphy ACQUIRE_DEV: %s\n", strerror(errno));
+        goto out;
+    }
+    csiphy_hdl = acq.device_handle;
+    printf("csiphy dev hdl %u\n", csiphy_hdl);
+
+    /* 3c. isp acquire (compat constant: dev handle only, HW via ACQUIRE_HW) */
+    struct cam_acquire_dev_cmd iacq;
+    memset(&iacq, 0, sizeof(iacq));
+    iacq.session_handle = (int32_t)session;
+    iacq.handle_type = CAM_HANDLE_USER_POINTER;
+    iacq.num_resources = CAM_API_COMPAT_CONSTANT;
+    if (cam_ioctl(isp_fd, CAM_ACQUIRE_DEV, &iacq,
+                  CAM_HANDLE_USER_POINTER, sizeof(iacq)) < 0) {
+        fprintf(stderr, "isp ACQUIRE_DEV: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, kt);
+        goto out;
+    }
+    isp_hdl = (uint32_t)iacq.dev_handle;
+    printf("isp dev hdl %u\n", isp_hdl);
+
+    /* 3d. isp ACQUIRE_HW: in_port PHY_2 -> out RDI_0, rdi-only context.
+     * The kernel reads the in_port at &acquire_hw_info->data == blob+24;
+     * nesting hdr+port in one struct puts the port 8 B late (observed:
+     * "Invalid num output res 0"). Build it by pointer instead. */
+    uint8_t acq_blob[256];
+    memset(acq_blob, 0, sizeof(acq_blob));
+    struct cam_isp_acquire_hw_info *ah = (void *)acq_blob;
+    struct cam_isp_in_port_info *port = (void *)&ah->data;
+    ah->common_info_version = 0x1000;
+    ah->common_info_size = sizeof(*port);
+    ah->num_inputs = 1;
+    ah->input_info_version = 0x2000;
+    ah->input_info_size = sizeof(*port);
+    ah->input_info_offset = 0;
+    port->res_type = g_tpg ? CAM_ISP_IFE_IN_RES_TPG : CAM_ISP_IFE_IN_RES_PHY_2;
+    port->lane_type = 0;              /* DPHY */
+    port->lane_num = 2;
+    port->vc = 0;
+    port->dt = dt;                    /* RAW10 */
+    port->format = CAM_FORMAT_MIPI_RAW_10;
+    port->test_pattern = 0;           /* TPG: incremental data */
+    port->usage_type = 0;             /* single IFE */
+    port->left_start = 0;
+    port->left_stop = width - 1;
+    port->left_width = width;
+    port->line_start = 0;
+    port->line_stop = height - 1;
+    port->height = height;
+    port->pixel_clk = 177600000;      /* 444MHz*2lane/10bit */
+    port->num_out_res = 1;
+    port->data[0].res_type = CAM_ISP_IFE_OUT_RES_RDI_0;
+    port->data[0].format = CAM_FORMAT_MIPI_RAW_10;
+    port->data[0].width = width;
+    port->data[0].height = height;
+
+    struct cam_acquire_hw_cmd_v2 ahw;
+    memset(&ahw, 0, sizeof(ahw));
+    ahw.struct_version = 2;
+    ahw.session_handle = (int32_t)session;
+    ahw.dev_handle = (int32_t)isp_hdl;
+    ahw.handle_type = CAM_HANDLE_USER_POINTER;
+    ahw.data_size = 24 + (uint32_t)sizeof(*port);
+    ahw.resource_hdl = (uint64_t)(uintptr_t)acq_blob;
+    if (cam_ioctl(isp_fd, CAM_ACQUIRE_HW, &ahw,
+                  CAM_HANDLE_USER_POINTER, sizeof(ahw)) < 0) {
+        fprintf(stderr, "isp ACQUIRE_HW: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, kt);
+        goto out;
+    }
+    printf("isp ACQUIRE_HW ok (hw id mask 0x%x, valid %u)\n",
+        ahw.hw_info.acquired_hw_id[0], ahw.hw_info.valid_acquired_hw);
+
+    /* 4. link sensor + ife */
+    struct cam_req_mgr_link_info li;
+    memset(&li, 0, sizeof(li));
+    li.session_hdl = (int32_t)session;
+    li.num_devices = 2;
+    li.dev_hdls[0] = (int32_t)sensor_hdl;
+    li.dev_hdls[1] = (int32_t)isp_hdl;
+    if (cam_ioctl(video_fd, CAM_REQ_MGR_LINK, &li,
+                  CAM_HANDLE_USER_POINTER, sizeof(li)) < 0) {
+        fprintf(stderr, "LINK: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, kt);
+        goto out;
+    }
+    link_hdl = (uint32_t)li.link_hdl;
+    printf("link hdl %u\n", link_hdl);
+
+    /* 5. sensor register lists: global (INIT), mode (CONFIG), MODE_SELECT
+     * (STREAMON, applied at START_DEV).
+     * --tpg still runs INIT+CONFIG: the kernel only advances the sensor to
+     * CAM_SENSOR_CONFIG when a CONFIG packet carries real i2c settings,
+     * and the NOP opcode handler silently drops our per-frame nop while
+     * the state is INIT/ACQUIRE ("Rxed NOP packets without linking") —
+     * the req mgr then skips every frame waiting on cam-sensor and the
+     * IFE's req 1 (with our fence) never applies (observed 2026-09-01:
+     * "Skip Frame: req: 1 not ready ... dev: cam-sensor" at every SOF).
+     * Only the STREAMON packet (sensor emitting) stays sensor-mode-only. */
+    if (shot_alloc(video_fd, &sb, 16 * 80 + 256, 0) < 0)
+        goto out;
+    double t0 = kt;
+    if (!g_noglobal &&
+        sensor_config(video_fd, sensor_fd, &sb, session, sensor_hdl,
+                      2 /* INITIAL_CONFIG */, imx355_global,
+                      sizeof(imx355_global) / sizeof(imx355_global[0])) < 0) {
+        fprintf(stderr, "sensor INIT packet: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, t0);
+        goto out;
+    }
+    printf("sensor INIT (global %zu regs) %s\n",
+        sizeof(imx355_global) / sizeof(imx355_global[0]),
+        g_noglobal ? "SKIPPED (--noglobal)" : "applied");
+    t0 = kt;
+    /* tp: force the sensor's built-in test pattern (reg 0x0600) — makes it
+     * emit MIPI regardless of the array, separating "sensor transmits" from
+     * "sensor exposes". */
+    struct wreg cfg_regs[sizeof(imx355_cfg) / sizeof(imx355_cfg[0])];
+    memcpy(cfg_regs, imx355_cfg, sizeof(cfg_regs));
+    {
+        /* patch the PLL block for (mclk, lanes): the base table carries
+         * the 24 MHz 2-lane set; everything else is derived here */
+        uint32_t p[5];
+        uint32_t addrs[5] = { 0x030e, 0x030d, 0x0303, 0x0820, 0x0114 };
+        pll_params(p);
+        for (size_t i = 0; i < sizeof(cfg_regs) / sizeof(cfg_regs[0]); i++)
+            for (size_t j = 0; j < 5; j++)
+                if (cfg_regs[i].addr == addrs[j])
+                    cfg_regs[i].val = (uint16_t)p[j];
+        for (size_t i = 0; i < sizeof(cfg_regs) / sizeof(cfg_regs[0]); i++)
+            if (cfg_regs[i].addr == 0x0136)
+                cfg_regs[i].val = extclk_reg();
+        printf("pll: %.2f MHz, %d-lane (mpy %u prediv %u sysck %u link %u)\n",
+            g_extclk_mhz, g_lanes, p[0], p[1], p[2], p[3]);
+    }
+    if (tp) {
+        for (size_t i = 0; i < sizeof(cfg_regs) / sizeof(cfg_regs[0]); i++)
+            if (cfg_regs[i].addr == 0x0600)
+                cfg_regs[i].val = (uint16_t)tp;
+        printf("test pattern 0x%04x enabled\n", tp);
+    }
+    if (sensor_config(video_fd, sensor_fd, &sb, session, sensor_hdl,
+                      4 /* CONFIG */, cfg_regs,
+                      sizeof(cfg_regs) / sizeof(cfg_regs[0])) < 0) {
+        fprintf(stderr, "sensor CONFIG packet: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, t0);
+        goto out;
+    }
+    printf("sensor CONFIG (mode/crop/pll %zu regs) applied\n",
+        sizeof(imx355_cfg) / sizeof(imx355_cfg[0]));
+    t0 = kt;
+    if (!g_tpg) {
+    if (sensor_config(video_fd, sensor_fd, &sb, session, sensor_hdl,
+                      0 /* STREAMON, held for START_DEV */, g_nostarton
+                          ? imx355_streamoff : imx355_streamon,
+                      1) < 0) {
+        fprintf(stderr, "sensor STREAMON packet: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, t0);
+        goto out;
+    }
+    printf("sensor STREAMON packet queued%s\n",
+        g_nostarton ? " (MODE_SELECT=0 — sensor held in standby)" : "");
+    }
+    /* 6. csiphy: 2-lane DPHY @ 888 Mbps/lane (link freq 444 MHz).
+     * KMD does NOT derive settle from data_rate: cam_csiphy_config_dev
+     * does plain settle_cnt = settle_time / 200000000, so 0 means the
+     * HS-RX settle counter is programmed 0 and the receiver never syncs
+     * (observed: no data, no CSID errors). settle_cnt from the DPHY
+     * spec + mainline camss 2ph calc:
+     *   ui = 1e12/data_rate ps = 1126
+     *   t_hs_settle = (85+6ui + 145+10ui)/2 = 115000+8ui ps
+     *   timer 200 MHz -> 5000 ps/count
+     *   settle_cnt = t_hs_settle/5000 - 1 = 23
+     * settle_time (ps-ish vendor units) = settle_cnt * 2e8. */
+    struct cam_csiphy_info csi;
+    memset(&csi, 0, sizeof(csi));
+    if (!g_tpg) {
+    /* lane_mask bitmap: bit0=DL0, bit1=CLK, bit2=DL1, bit3=DL2, bit4=DL3
+     * (cam_csiphy_config_dev builds the lane-enable register from it).
+     * 2-lane 0x7, 4-lane 0x1f — the vendor module runs 4 data lanes. */
+    csi.lane_mask = g_lanes == 4 ? 0x1f : 0x7;
+    csi.lane_assign = 0x0000;
+    csi.csiphy_3phase = 0;
+    csi.combo_mode = 0;
+    csi.lane_cnt = (uint8_t)g_lanes;
+    csi.secure_mode = 0;
+    {
+        /* per-lane rate = VCO = 30*extclk Mbps (matches pll_params) */
+        uint64_t dr = (uint64_t)(30.0 * g_extclk_mhz * 1000000.0 + 0.5);
+        uint64_t ui = 1000000000000ULL / dr;      /* ps */
+        uint32_t cnt = (uint32_t)((115000 + 8 * ui) / 5000) - 1;
+        if (settle_cnt)
+            cnt = settle_cnt;
+        csi.settle_time = (uint64_t)cnt * 200000000ULL;
+        printf("csiphy settle_cnt=%u (settle_time=%llu, dr=%llu Mbps)\n",
+            cnt, (unsigned long long)csi.settle_time,
+            (unsigned long long)(dr / 1000000));
+        csi.data_rate = dr;
+    }
+    struct cam_config_dev_cmd pcfg = {
+        .session_handle = (int32_t)session, .dev_handle = (int32_t)csiphy_hdl,
+        .offset = 0, .packet_handle = (uint64_t)(uintptr_t)&csi };
+    if (cam_ioctl(csiphy_fd, CAM_CONFIG_DEV_EXTERNAL, &pcfg,
+                  CAM_HANDLE_USER_POINTER, sizeof(pcfg)) < 0) {
+        fprintf(stderr, "csiphy CONFIG_DEV_EXTERNAL: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, kt);
+        goto out;
+    }
+    printf("csiphy configured (%d lane, %llu Mbps/lane)\n",
+        g_lanes, (unsigned long long)(csi.data_rate / 1000000));
+    }
+
+    /* 7. pixel buffer via cam_mem_mgr (PIXEL_BUF maps into IFE img iommu).
+     * HW bufs must name the SMMU ctx bank: num_hdl=0 leaves map_hw_va's
+     * loop empty and it returns its init -1 = EPERM (observed on device).
+     * The IFE image iommu handle comes from QUERY_CAP on the isp node. */
+    struct cam_query_cap_cmd qc;
+    struct cam_isp_query_cap_cmd qisp;
+    memset(&qisp, 0, sizeof(qisp));
+    memset(&qc, 0, sizeof(qc));
+    qc.size = sizeof(qisp);
+    qc.handle_type = CAM_HANDLE_USER_POINTER;
+    qc.caps_handle = (uint64_t)(uintptr_t)&qisp;
+    if (cam_ioctl(isp_fd, CAM_QUERY_CAP, &qc, CAM_HANDLE_USER_POINTER,
+                  sizeof(qc)) < 0) {
+        fprintf(stderr, "isp QUERY_CAP: %s\n", strerror(errno));
+        goto out;
+    }
+    printf("isp iommu: img %d (sec %d), cdm %d\n",
+        qisp.device_iommu.non_secure, qisp.device_iommu.secure,
+        qisp.cdm_iommu.non_secure);
+    memset(&pix, 0, sizeof(pix));
+    pix.len = pixbuf_len;
+    pix.align = 4096;
+    pix.mmu_hdls[0] = qisp.device_iommu.non_secure;
+    pix.num_hdl = 1;
+    pix.flags = 0x81;  /* CAM_MEM_FLAG_HW_READ_WRITE|CAM_MEM_FLAG_PIXEL_BUF_TYPE */
+    if (cam_ioctl(video_fd, CAM_REQ_MGR_ALLOC_BUF, &pix,
+                  CAM_HANDLE_USER_POINTER, sizeof(pix)) < 0) {
+        fprintf(stderr, "pixel ALLOC_BUF: %s\n", strerror(errno));
+        goto out;
+    }
+    pix_mfd = pix.out.fd;
+    pix_map = map_fd(pix_mfd, pixbuf_len);
+    if (pix_map == MAP_FAILED)
+        goto out;
+    memset(pix_map, 0, pixbuf_len);
+    printf("pixel buf hdl 0x%x (%llu B)\n", pix.out.buf_handle,
+        (unsigned long long)pixbuf_len);
+
+    /* 8. sync fence (frame-done signal) */
+    struct cam_sync_info sinfo;
+    struct cam_private_ioctl_arg sarg;
+    memset(&sinfo, 0, sizeof(sinfo));
+    strcpy(sinfo.name, "cam-shot-rdi0");
+    memset(&sarg, 0, sizeof(sarg));
+    sarg.id = CAM_SYNC_CREATE;
+    sarg.size = sizeof(sinfo);
+    sarg.ioctl_ptr = (uint64_t)(uintptr_t)&sinfo;
+    if (sync_fd < 0 || ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg) < 0) {
+        fprintf(stderr, "CAM_SYNC_CREATE: %s\n", strerror(errno));
+        goto out;
+    }
+    sync_obj = (uint32_t)sinfo.sync_obj;
+    printf("sync obj %d\n", sync_obj);
+
+    /* 9. IFE INIT packet (op 0): clock + csid clock + hfr + sensor dim */
+    if (shot_alloc(video_fd, &ib, 8192, qisp.cdm_iommu.non_secure) < 0)  /* blobs + kmd */
+        goto out;
+    /* our builder puts blob cmd at offset 0 and kmd at offset cmd_cap */
+    uint8_t *blob = ib.p_cmd;
+    size_t bl = 0;
+    {
+        struct cam_isp_clock_config cc;
+        memset(&cc, 0, sizeof(cc));
+        cc.usage_type = 0;
+        cc.num_rdi = 1;
+        cc.rdi_hz[0] = 400000000;
+        bl += blob_add(blob + bl, CAM_ISP_GENERIC_BLOB_TYPE_CLOCK_CONFIG,
+                       &cc, sizeof(cc));
+        struct cam_isp_csid_clock_config sc;
+        sc.csid_clock = 400000000;
+        bl += blob_add(blob + bl, CAM_ISP_GENERIC_BLOB_TYPE_CSID_CLOCK_CONFIG,
+                       &sc, sizeof(sc));
+        struct cam_isp_resource_hfr_config hfr;
+        memset(&hfr, 0, sizeof(hfr));
+        hfr.num_ports = 1;
+        hfr.port[0].resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
+        hfr.port[0].subsample_pattern = 1;
+        hfr.port[0].subsample_period = 1;
+        hfr.port[0].framedrop_pattern = 1;
+        hfr.port[0].framedrop_period = 1;
+        bl += blob_add(blob + bl, CAM_ISP_GENERIC_BLOB_TYPE_HFR_CONFIG,
+                       &hfr, sizeof(hfr));
+        struct cam_isp_sensor_config_blob dim;
+        memset(&dim, 0, sizeof(dim));
+        dim.rdi_path[0].width = width;
+        dim.rdi_path[0].height = height;
+        dim.hbi = 1836;
+        dim.vbi = 1306;
+        bl += blob_add(blob + bl,
+                       CAM_ISP_GENERIC_BLOB_TYPE_SENSOR_DIMENSION_CONFIG,
+                       &dim, sizeof(dim));
+    }
+    t0 = kt;
+    if (isp_config(video_fd, isp_fd, &ib, session, isp_hdl,
+                   0 /* INIT: ((op+1)&0xf)==1 */, 0, bl, 0, NULL) < 0) {
+        fprintf(stderr, "isp INIT packet: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, t0);
+        goto out;
+    }
+    printf("isp INIT packet ok (blobs %zu B)\n", bl);
+
+    /* 10. SCHED_REQ FIRST: it inserts req 1 into the req mgr's in_q;
+     * each device's per-request packet then calls add_req, which fails
+     * with ENOENT ("req not found in in_q") if the id was never
+     * scheduled (observed on device). */
+    struct cam_req_mgr_sched_request sr;
+    memset(&sr, 0, sizeof(sr));
+    sr.session_hdl = (int32_t)session;
+    sr.link_hdl = (int32_t)link_hdl;
+    sr.sync_mode = 0;
+    sr.req_id = 1;
+    t0 = kt;
+    if (cam_ioctl(video_fd, CAM_REQ_MGR_SCHED_REQ, &sr,
+                  CAM_HANDLE_USER_POINTER, sizeof(sr)) < 0) {
+        fprintf(stderr, "SCHED_REQ: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, t0);
+        goto out;
+    }
+    printf("req 1 scheduled\n");
+
+    /* 11. IFE UPDATE packet (op 1, req 1): RDI_0 output + fence */
+    if (shot_alloc(video_fd, &ub, 8192, qisp.cdm_iommu.non_secure) < 0)
+        goto out;
+    struct cam_buf_io_cfg io;
+    memset(&io, 0, sizeof(io));
+    io.mem_handle[0] = (int32_t)pix.out.buf_handle;
+    io.offsets[0] = 0;
+    io.planes[0].width = width;
+    io.planes[0].height = height;
+    io.planes[0].plane_stride = stride;
+    io.planes[0].slice_height = height;
+    io.format = CAM_FORMAT_MIPI_RAW_10;
+    io.bpp = 10;
+    io.resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
+    io.fence = (int32_t)sync_obj;
+    io.direction = CAM_BUF_OUTPUT;
+    io.subsample_pattern = 1;
+    io.subsample_period = 1;
+    io.framedrop_pattern = 1;
+    io.framedrop_period = 1;
+    t0 = kt;
+    if (isp_config(video_fd, isp_fd, &ub, session, isp_hdl,
+                   1 /* UPDATE */, 1, 0, 1, &io) < 0) {
+        fprintf(stderr, "isp UPDATE packet: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, t0);
+        goto out;
+    }
+    printf("isp UPDATE req 1 queued (fence %d)\n", sync_obj);
+
+    /* sensor must also register req 1 -> NOP packet */
+    if (sensor_nop(video_fd, sensor_fd, &sb, session, sensor_hdl, 1) < 0) {
+        fprintf(stderr, "sensor NOP req1: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, kt);
+        goto out;
+    }
+
+    /* 11. start: csiphy -> ife (arms CSID/IFE, no data yet) -> sensor
+     * (applies MODE_SELECT=1; frames begin flowing). TPG mode starts the
+     * IFE only — the generator lives inside the CSID the IFE manager armed. */
+    struct cam_start_stop_dev_cmd ss;
+    memset(&ss, 0, sizeof(ss));
+    ss.session_handle = (int32_t)session;
+    ss.dev_handle = (int32_t)csiphy_hdl;
+    if (!g_tpg &&
+        cam_ioctl(csiphy_fd, CAM_START_DEV, &ss, CAM_HANDLE_USER_POINTER,
+                  sizeof(ss)) < 0) {
+        fprintf(stderr, "csiphy START: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, kt);
+        goto out;
+    }
+    if (!g_tpg)
+        printf("csiphy started\n");
+    memset(&ss, 0, sizeof(ss));
+    ss.session_handle = (int32_t)session;
+    ss.dev_handle = (int32_t)isp_hdl;
+    t0 = kt;
+    if (cam_ioctl(isp_fd, CAM_START_DEV, &ss, CAM_HANDLE_USER_POINTER,
+                  sizeof(ss)) < 0) {
+        fprintf(stderr, "isp START: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, t0);
+        goto out;
+    }
+    printf("isp started\n");
+    memset(&ss, 0, sizeof(ss));
+    ss.session_handle = (int32_t)session;
+    ss.dev_handle = (int32_t)sensor_hdl;
+    t0 = kt;
+    if (!g_tpg &&
+        cam_ioctl(sensor_fd, CAM_START_DEV, &ss, CAM_HANDLE_USER_POINTER,
+                  sizeof(ss)) < 0) {
+        fprintf(stderr, "sensor START: %s\n", strerror(errno));
+        kt = stream_kmsg(kmsg, t0);
+        goto out;
+    }
+    printf(g_tpg ? "tpg: ife armed, generator runs from CSID\n"
+                 : "sensor started (MODE_SELECT=1 written)\n");
+    kt = stream_kmsg(kmsg, kt);
+
+    if (rb && !g_tpg)
+        sensor_readback(sensor_fd, &sb, session, sensor_hdl, "post-START");
+
+    /* 14. wait on the fence for the frame */
+    printf("waiting for frame (fence %d, %d ms)...\n", sync_obj, wait_ms);
+    struct cam_sync_wait sw;
+    memset(&sw, 0, sizeof(sw));
+    sw.sync_obj = (int32_t)sync_obj;
+    sw.timeout_ms = (uint64_t)wait_ms;
+    memset(&sarg, 0, sizeof(sarg));
+    sarg.id = CAM_SYNC_WAIT;
+    sarg.size = sizeof(sw);
+    sarg.ioctl_ptr = (uint64_t)(uintptr_t)&sw;
+    int wrc = ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg);
+    /* cam_sync_wait reports its own status through sarg.result even when
+     * the ioctl returns 0 (observed: rc=0, result=-110 ETIMEDOUT together
+     * with CAM_ERR "timed out for sync obj" in dmesg). */
+    int32_t wres = (int32_t)sarg.result;
+    printf("SYNC_WAIT rc=%d result=%d (%s)\n", wrc, wres,
+        wrc ? strerror(errno)
+            : (wres ? "timed out" : "signaled"));
+    kt = stream_kmsg(kmsg, kt);
+    if (wrc < 0 || wres < 0) {
+        /* RX has gone silent by now (observed: CSID fatal-halts its csi2
+         * rx ~48 ms after stream start). Read the sensor again AFTER the
+         * silence: MODE_SELECT still 1 = sensor alive and (as far as it
+         * knows) transmitting -> the receiver side died, not the sensor. */
+        if (rb && !g_tpg)
+            sensor_readback(sensor_fd, &sb, session, sensor_hdl,
+                            "post-WAIT (after silence)");
+        rc = 2;
+        goto out;
+    }
+
+    /* 14. inspect + dump */
+    size_t nz = 0;
+    {
+        const uint8_t *p8 = pix_map;
+        size_t n = (size_t)pixbuf_len;
+        uint8_t mn = 255, mx = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (p8[i]) nz++;
+            if (p8[i] < mn) mn = p8[i];
+            if (p8[i] > mx) mx = p8[i];
+        }
+        printf("buffer: nonzero %zu/%zu, byte range 0x%02x..0x%02x\n",
+            nz, n, mn, mx);
+        printf("first 32 B:");
+        for (int i = 0; i < 32; i++)
+            printf(" %02x", p8[i]);
+        printf("\n");
+        out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out_fd >= 0) {
+            size_t off = 0;
+            while (off < n) {
+                ssize_t w = write(out_fd, p8 + off, n - off);
+                if (w <= 0)
+                    break;
+                off += (size_t)w;
+            }
+            printf("dumped %zu B -> %s\n", off, out_path);
+        } else {
+            fprintf(stderr, "open %s: %s\n", out_path, strerror(errno));
+        }
+    }
+    rc = nz ? 0 : 3;   /* fence signaled but empty buffer = no frame */
+
+out:
+    /* teardown: streamoff -> stop (isp, csiphy, sensor) -> unlink -> release
+     * -> destroy session. Best effort; the kernel also tears down on close. */
+    printf("== teardown ==\n");
+    if (sensor_fd >= 0 && sensor_hdl && sb.p_pkt)
+        sensor_config(video_fd, sensor_fd, &sb, session, sensor_hdl,
+                      5 /* STREAMOFF */, imx355_streamoff, 1);
+    struct cam_start_stop_dev_cmd st;
+    memset(&st, 0, sizeof(st));
+    st.session_handle = (int32_t)session;
+    if (isp_hdl) {
+        st.dev_handle = (int32_t)isp_hdl;
+        cam_ioctl(isp_fd, CAM_STOP_DEV, &st, CAM_HANDLE_USER_POINTER,
+                  sizeof(st));
+    }
+    if (csiphy_hdl) {
+        st.dev_handle = (int32_t)csiphy_hdl;
+        cam_ioctl(csiphy_fd, CAM_STOP_DEV, &st, CAM_HANDLE_USER_POINTER,
+                  sizeof(st));
+    }
+    if (sensor_hdl) {
+        st.dev_handle = (int32_t)sensor_hdl;
+        cam_ioctl(sensor_fd, CAM_STOP_DEV, &st, CAM_HANDLE_USER_POINTER,
+                  sizeof(st));
+    }
+    if (link_hdl) {
+        struct cam_req_mgr_unlink_info ul;
+        memset(&ul, 0, sizeof(ul));
+        ul.session_hdl = (int32_t)session;
+        ul.link_hdl = (int32_t)link_hdl;
+        cam_ioctl(video_fd, CAM_REQ_MGR_UNLINK, &ul, CAM_HANDLE_USER_POINTER,
+                  sizeof(ul));
+    }
+    if (isp_hdl) {
+        struct cam_release_dev_cmd rel;
+        memset(&rel, 0, sizeof(rel));
+        rel.session_handle = (int32_t)session;
+        rel.dev_handle = (int32_t)isp_hdl;
+        cam_ioctl(isp_fd, CAM_RELEASE_DEV, &rel, CAM_HANDLE_USER_POINTER,
+                  sizeof(rel));
+    }
+    if (csiphy_hdl) {
+        struct cam_release_dev_cmd rel;
+        memset(&rel, 0, sizeof(rel));
+        rel.session_handle = (int32_t)session;
+        rel.dev_handle = (int32_t)csiphy_hdl;
+        cam_ioctl(csiphy_fd, CAM_RELEASE_DEV, &rel, CAM_HANDLE_USER_POINTER,
+                  sizeof(rel));
+    }
+    if (sensor_hdl) {
+        struct cam_release_dev_cmd rel;
+        memset(&rel, 0, sizeof(rel));
+        rel.session_handle = (int32_t)session;
+        rel.dev_handle = (int32_t)sensor_hdl;
+        cam_ioctl(sensor_fd, CAM_RELEASE_DEV, &rel, CAM_HANDLE_USER_POINTER,
+                  sizeof(rel));
+    }
+    if (session) {
+        struct cam_req_mgr_session_info ds;
+        memset(&ds, 0, sizeof(ds));
+        ds.session_hdl = (int32_t)session;
+        cam_ioctl(video_fd, CAM_REQ_MGR_DESTROY_SESSION, &ds,
+                  CAM_HANDLE_USER_POINTER, sizeof(ds));
+    }
+    if (sync_obj) {
+        memset(&sarg, 0, sizeof(sarg));
+        sarg.id = CAM_SYNC_DESTROY;
+        sarg.size = sizeof(sinfo);
+        sarg.ioctl_ptr = (uint64_t)(uintptr_t)&sinfo;
+        ioctl(sync_fd, VIDIOC_CAM_CONTROL, &sarg);
+    }
+    shot_free(video_fd, &sb);
+    shot_free(video_fd, &ib);
+    shot_free(video_fd, &ub);
+    if (pix.out.buf_handle)
+        release_buf(video_fd, pix.out.buf_handle);
+    if (pix_map != MAP_FAILED) munmap(pix_map, pixbuf_len);
+    if (pix_mfd > 0) close(pix_mfd);
+    if (out_fd >= 0) close(out_fd);
+    if (sensor_fd >= 0) close(sensor_fd);
+    if (csiphy_fd >= 0) close(csiphy_fd);
+    if (isp_fd >= 0) close(isp_fd);
+    if (kmsg >= 0) {
+        stream_kmsg(kmsg, kt);
+        close(kmsg);
+    }
+    if (video_fd >= 0) close(video_fd);
+    if (sync_fd >= 0) close(sync_fd);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     int only_slot = -1;
-    int real = 0, sweep = 0;
+    int real = 0, sweep = 0, stream = 0;
+    const char *out_path = "/tmp/frame.raw";
+    int wait_ms = 3000;
+    uint32_t settle_cnt = 0;   /* 0 = derive from data rate (23 @888 Mbps) */
+    uint32_t tp = 0;           /* sensor test pattern (0x0600), 0=off */
+    int rb = 0;                /* post-START sensor register readback */
     uint32_t reg = 0x0016;   /* Sony IMX3xx-family chip id register */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--reg") == 0 && i + 1 < argc)
             reg = (uint32_t)strtoul(argv[++i], 0, 0);
+        else if (strcmp(argv[i], "--stream") == 0)
+            stream = 1;
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc)
+            out_path = argv[++i];
+        else if (strcmp(argv[i], "--wait") == 0 && i + 1 < argc)
+            wait_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--settle") == 0 && i + 1 < argc)
+            settle_cnt = (uint32_t)strtoul(argv[++i], 0, 0);
+        else if (strcmp(argv[i], "--tp") == 0 && i + 1 < argc)
+            tp = (uint32_t)strtoul(argv[++i], 0, 0);
+        else if (strcmp(argv[i], "--mclk") == 0 && i + 1 < argc) {
+            g_extclk_mhz = atof(argv[++i]);
+            g_mclk24 = g_extclk_mhz == 24.0;
+            if (g_extclk_mhz < 6.0 || g_extclk_mhz > 40.0) {
+                fprintf(stderr, "--mclk: 6..40 MHz supported\n");
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--lanes") == 0 && i + 1 < argc) {
+            g_lanes = atoi(argv[++i]);
+            if (g_lanes != 2 && g_lanes != 4) {
+                fprintf(stderr, "--lanes: only 2 or 4 supported\n");
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--rb") == 0)
+            rb = 1;
+        else if (strcmp(argv[i], "--noglobal") == 0)
+            g_noglobal = 1;
+        else if (strcmp(argv[i], "--nostarton") == 0)
+            g_nostarton = 1;
         else if (strcmp(argv[i], "--real") == 0)
             real = 1;
+        else if (strcmp(argv[i], "--tpg") == 0)
+            g_tpg = 1;
         else if (strcmp(argv[i], "--sweep") == 0)
             sweep = 1;
         else
             only_slot = atoi(argv[i]);
     }
+    if (stream)   /* default front camera (slot 2, imx355) */
+        return run_stream(only_slot >= 0 ? only_slot : 2, out_path, wait_ms,
+                          settle_cnt, tp, rb);
 
     int video_fd = open("/dev/video3", O_RDWR);
     if (video_fd < 0) {
@@ -534,8 +1984,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* chip ids observed on this device (HARDWARE.md 2026-08-31) */
-    static const uint32_t slot_id[3] = { 0x363, 0x481, 0x355 };
+    /* chip ids for the real probe (moved to file scope: probe + stream) */
     for (int i = 0; i < n; i++) {
         if (only_slot >= 0 && sd_slot[i] != only_slot) {
             close(sd_fd[i]);
