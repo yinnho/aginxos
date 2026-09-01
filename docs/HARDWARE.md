@@ -3591,3 +3591,38 @@ Demo artifacts on the Mac: ~/Desktop/burst10s.gif / burst10s.mp4
 Device state: baked #4 running; test binary /tmp/cam-shot-ring3
 (md5 = repo build). Ring mode lands to boot/rootfs/src/cam-shot.c;
 next bake folds it.
+
+## M19c white balance: gray-world auto WB kills the Matrix green (ninth session cont'd)
+
+User report: "颜色偏绿,好像黑客帝国的那种绿" (image leans green, like the
+Matrix). Measured on x10-75.jpg (PIL channel means): R=51.4 G=81.2 B=54.0
+→ G/R=1.58, G/B=1.51. Root cause: the RGGB debayer had NO white-balance
+gains at all, and G has 2x the samples.
+
+Fix in cam-shot.c (dump_jpeg color path):
+- wb_measure(): per-site means straight off the Bayer pattern (R at
+  even/even, B at odd/odd, G on the cross), gains normalize all three to
+  the BRIGHTEST site mean — every gain >= 1, so brightness is preserved
+  and the --gain/--dgain exposure tuning is never undone. Gains capped
+  at 4x; means < 1 (black frame) leave wb = 1,1,1.
+- cs_debayer() applies the gains post-interpolation, clamps at 255.
+- Default is AUTO (per frame); --wb r,g,b manual, --wb off.
+
+Observed on device (rear imx363, --gain 16 --dgain 2):
+- wb: auto r=1.55 g=1.00 b=1.47 (matches the manual PIL measurement
+  1.58/1.51; site means vs debayered+JPEG means explain the small gap).
+- JPEG channel means after: R=74.7 G=79.8 B=75.9 → G/R=1.07, G/B=1.05.
+  Residual ~6% = JPEG 4:2:0 chroma subsampling softening R/B; visually
+  neutral (white paper neutral, warm desk lamp stays warm — correct).
+- 150-frame burst re-run with WB: 10.02 s (t2992.864 -> t3002.885),
+  real-time held; per-frame gains adapt as the scene changes
+  (r 1.29→1.55 across the burst). Encode cost unchanged (0.19-0.20 s).
+
+Demo artifacts refreshed: ~/Desktop/burst10s.gif / burst10s.mp4 now
+color-balanced (150 frames, 2016x1136, 15 fps real-time).
+
+Note for the next bake: the WB binary is /tmp/cam-shot-wb on the device
+(test path /data/local/tmp/cam-shot-wb); baked #4 rootfs still carries
+the pre-WB cam-shot — fold with the ring-mode change.
+
+Commit: 6557bab (cam-shot.c; jpegenc.h was already tracked by 2f48c3f).
