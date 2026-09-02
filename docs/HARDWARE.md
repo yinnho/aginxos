@@ -3703,3 +3703,66 @@ payload: NV12 still silent (147 SOF/EOF, fence -110). Titan 170 did NOT
 inherit the 4.7 IQ-module offsets, or the Bayer color pipe needs its own
 config regardless. Payload reverted to the committed 16-pair version
 (binary md5 4dbdada2b4de8456e96ddfb264c02928 = repo = device).
+
+## M14 — A/B self-update: slot mechanics fully mapped, agupd autonomous E2E (2026-09-02)
+
+Task #56. Everything below observed on device this session. The GPT-attr
+slot model from M16 turned out to be the AOSP layout; the real one is
+Qualcomm's uefi.lnx.3.0 layout (cross-checked against QRD-Development/abl
+uefi.lnx.3.0.r12-rel PartitionTableUpdate.c; redfin ABL r3-0.6 matches it):
+
+    bits 48-49  priority (max 3)      bit 54  successful
+    bit  50     ACTIVE (selector gate) bit 55  unbootable
+    bits 51-53  tries (max 7)
+
+GetActiveSlot only considers entries with ACTIVE set — priority alone
+selects nothing (why M16's old tool never switched anything). The old
+mark "worked" by bit overlap: 7<<52 also sets bit 54 (succ).
+
+Observed mechanics, all live:
+- **Userspace attrs-only switching works, both directions.** agboot-ok
+  set-active X (attrs per ABL SetActiveSlot, no GUID swap, no LUN flip)
+  → reboot → boots X with full bringup. a→b and b→a both done. The r12
+  SwitchPtnSlots GUID swap + UFS bBootLunEn flip are NOT gated on this
+  older ABL; the earlier "LUN flip required" conclusion was wrong. The
+  boot LUN stays 1 (xbl_a chain) for both slots; stock xbl_a/xbl_b are
+  functionally identical. MarkPtnActive flips ACTIVE on every LUN's
+  entries each boot (xbl_a/xbl_b included).
+- **Tries drain**: every unmarked boot decrements the ACTIVE boot
+  entry (live: 7→3→2→1 across failed/hung cycles; 3→2, 7→6 on normal
+  unmarked boots).
+- **rcS mark** (agboot-ok v2): after `done ok`, boot entry of running
+  slot gets succ|tries=7|ACTIVE; other entries ACTIVE only. Observed
+  landing on both slots. Note: rcS marks even on `done fail` — the
+  wait loop times out at 300 s and runs the marker regardless (M16
+  legacy; revisit: only hard no-boots roll back as-is).
+- **Automatic rollback (tries exhausted)**: staged b with tries=0 →
+  reboot → ABL FindBootableSlot: not bootable → HandleActiveSlotUnbootable
+  marked b unbootable (boot_b raw 0x0082 — byte-identical to the stock
+  factory parked state), re-activated a via SetActiveSlot, cold-rebooted
+  by itself; device came back on a, rcS re-marked. Zero host involvement
+  after the reboot command.
+- **agupd E2E, fully autonomous**: one `agupd apply` (manifest with
+  boot+vendor_boot+dtbo+vbmeta+vbmeta_system, all sha256-verified, all
+  written to the inactive slot) → agboot-ok set-active → reboot2 →
+  boots the new slot → rcS marks. No fastboot anywhere in the loop.
+
+Failure-class map (each provoked and observed):
+- corrupt kernel, intact header, mirrored vbmeta → device-unlocked so
+  AVB tolerates the hash mismatch (orange), boots the bad kernel, which
+  HANGS: dark screen, no USB, no watchdog rescue. Forced power-cycles
+  drain one try each; rollback only if something keeps rebooting it.
+  GAP for follow-up: arm a hardware watchdog in rcS/agsvc.
+- zeroed boot header → GetAVBVersion misreads header_version=0 → VB1
+  path fails → `IsUnlocked && error` → ABL drops to fastboot. No
+  rollback, but host-recoverable.
+- tries=0 → instant auto-rollback (the good path above).
+
+Session end state: slot a active + marked (pri3/ACTIVE/tries7/succ1);
+b = healthy byte-mirror of a's chain (pri2/succ1); boot_b GUID-swap
+parity even (fastboot switches + ABL rollback cancel out). rcS boot
+state this last boot: done fail (wifi join rc=4, known AP flake #76) —
+unrelated to M14; marker still fired after the 300 s timeout.
+Deployed: /usr/bin/agupd (md5 0b1daf0795e751d6b8eba595093bb43f),
+/usr/bin/agboot-ok (md5 8ac7d78e77cf491e401d94f6c8d1d6e8) — fold into
+next rootfs re-bake along with the /etc/aginx-version stamp.
