@@ -235,7 +235,14 @@ crates/periph/
 2. **音频前端**：扬声器放 TTS 同时 mic 要听见打断 → AEC + VAD +
    波束（speexdsp/webrtc-audio-processing 可跑），调参依赖腔体/
    增益/双 mic 布局，ODM 联调项，NRE 合同必须单列。
-3. **表情渲染**：framebuffer 直绘（灯/眼睛动画状态机）。
+3. **表情渲染**：framebuffer 直绘（灯/眼睛动画状态机）。文字栈
+   定档：**ab_glyph**（纯 Rust OTF 栅格化，零 C 依赖）+ **NotoSansCJK
+   子集**（几百字+ASCII，几百 KB；最终架构无 Android 层，
+   /system/fonts 那课作废，字体自己带进 rootfs，全量字体只给
+   typst/ffmpeg）+ qrcode crate 出码 + 自写 CJK 断行（不需要
+   cosmic-text）。坑：Noto 官方分发是 .otc 合集须确认 collection
+   index 支持或子集化时拆单；ab_glyph 无 hinting，按物理像素/2 倍
+   分辨率栅格化即够，不引 fontdue
 4. **开机绑定流程 + 设备路由登记**（咬合 relay）。
 5. **记忆备份**：rclone 定期推服务器（单点失忆对冲）。
 
