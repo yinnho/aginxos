@@ -242,6 +242,19 @@ crates/periph/
 视觉通路 v1 定调：本地拍照 → AginxBrain 路由云端 vision API；
 本地小 vision 模型（Qwen-VL 2B int4 在 6TOPS 勉强）v2 再议。
 
+## 数据面扩展备忘（watch item，非依赖）
+
+OpenDuck（[CITGuru/openduck](https://github.com/CITGuru/openduck)，
+2026-09 调研）：开源版 MotherDuck——`ATTACH 'openduck:mydb'` 挂
+远程库、单查询 LOCAL/REMOTE 双端执行、差分存储。**569★ 单人项目
+已休眠（停更 5 月起），不进依赖不进 agpkg**。记它的原因：卡上
+8GB RAM 跑不动全量历史分析（session-events 长期积累/跨分身记忆
+挖掘）是真实缺口，「重活上移」目前只答了 ffmpeg/LLM，数据查询类
+重活无答案——dual execution 是这个问题的漂亮形态（agent 写 SQL
+不用知道数据在哪）。真到 8GB 查不动那天，第一动作仍是朴素解：
+大表放服务器 PG/duckdb，卡上 agent 远程查询；MotherDuck 模式有
+成熟开源实现时再评估升级。
+
 ## 已拍板 / 待拍板
 
 已拍板：五官俱全「有点人样」、v1 按需唤醒 + v2 常听、secure boot
