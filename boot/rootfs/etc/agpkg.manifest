@@ -32,6 +32,12 @@
 aginx          https://github.com/yinnho/aginx/releases/download/v0.3.2/aginx-aarch64-unknown-linux-musl 1f8134d0d7bbead9ffcff9c7c1cb1499f3fcc10b4c7f3db7f44e41d658991690
 aginx-carrier  https://github.com/yinnho/aginx-carrier/releases/download/v0.2.1/aginx-carrier-v0.2.1-aarch64-unknown-linux-musl c0d490d3f5f579f5e40c9e5972d89459997ed6357f9ee1fccea833ea40d97ba5
 aginxbrowser   https://github.com/yinnho/aginxos/releases/download/aginxbrowser-v0.2.5/aginxbrowser-v0.2.5-aarch64-unknown-linux-musl 5561e6287d6b146a94170bb71fc2c5b0ff0e9e6cfd0aa0a8ea84a21d630a99e6
+# python3 (M28) — first TREE bundle: musl CPython 3.12.14 (python-build-
+# standalone 20260901 install_only_stripped) + Alpine musl 1.2.5 ld.so;
+# pkg.toml exec faces /var/bin/python3 as a symlink into
+# /var/lib/agpkg/pkgfiles/python3/. Provision finalize links the loader
+# to /lib/ld-musl-aarch64.so.1 (kernel interp path) and marks it done.
+python3        https://github.com/yinnho/aginxos/releases/download/python3-v3.12.14/python3-v3.12.14-4pc.tar 23923ffe46c3562d3801b742fea02ccc7f0aaddd91d7a40a66e4a6ee7a6beb73
 codex          https://github.com/yinnho/aginxos/releases/download/codex-v0.151.0/codex-v0.151.0-aarch64-unknown-linux-musl 56f026015ccc3ebc12895282200d89c216892bf6fa15fa7f228e6e0c6ad6ce76
 # grok is optional since M23 (选装 tier): an agent CLI like codex, but
 # self-built and not needed for the phone's own loop — pick it via "+".

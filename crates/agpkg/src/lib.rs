@@ -50,6 +50,7 @@ pub struct Paths {
     pub skills: PathBuf,
     pub units: PathBuf,
     pub stamps: PathBuf,
+    pub pkgfiles: PathBuf,
     pub dldir: PathBuf,
     pub manifest: PathBuf,
     pub agdl: PathBuf,
@@ -69,6 +70,7 @@ impl Paths {
             skills: envp("AGPKG_SKILLS", "/var/lib/agpkg/skills"),
             units: envp("AGPKG_UNITS", "/var/lib/agpkg/units"),
             stamps: envp("AGPKG_STAMPS", "/var/lib/agpkg/stamps"),
+            pkgfiles: envp("AGPKG_PKGFILES", "/var/lib/agpkg/pkgfiles"),
             dldir: envp("AGPKG_DL", "/var/tmp/agpkg"),
             manifest: envp("AGPKG_MANIFEST", "/etc/agpkg.manifest"),
             agdl: envp("AGPKG_AGDL", "/usr/bin/agdl"),
@@ -301,25 +303,61 @@ fn read_member<R: Read>(e: &mut tar::Entry<R>) -> Result<Vec<u8>, Fail> {
 fn install_bundle(p: &Paths, name: &str, src: &Path) -> Result<Kind, Fail> {
     let f = std::fs::File::open(src).map_err(|e| io_fail("open", format!("{}: {e}", src.display())))?;
     let mut ar = tar::Archive::new(f);
-    // member path (normalized) -> bytes; dirs and pax metadata are not
-    // kept — files only.
+    // Two install surfaces in one tar:
+    //   files/**  — a payload TREE, streamed straight to a temp dir
+    //               (a CPython tree is ~150 MB; buffering it in the
+    //               members map would double memory for nothing). Only
+    //               valid with pkg.toml `exec` — see below.
+    //   everything else — buffered small members: bin/<name>, pkg.toml,
+    //               SKILL.md, extra files that ride with the skill.
+    // Dirs are not kept (parents are created by their children);
+    // symlinks under files/ are recreated, elsewhere ignored.
     let mut members: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut tree_streamed = false;
+    let tmp_tree = p.pkgfiles.join(".tmp-install");
+    let _ = std::fs::remove_dir_all(&tmp_tree);
+    let stream_dir = tmp_tree.clone();
+    let mut tree_symlinks: Vec<(String, String)> = Vec::new();
     let entries = ar.entries().map_err(|e| io_fail("pkg_read", format!("tar walk: {e}")))?;
     for e in entries {
         let mut e = e.map_err(|e| io_fail("pkg_read", format!("tar member: {e}")))?;
-        if !e.header().entry_type().is_file() {
-            continue;
-        }
         let raw = e.path().map_err(|e| io_fail("pkg_read", format!("tar path: {e}")))?.to_string_lossy().into_owned();
         let key = member_path(&raw)?;
+        let et = e.header().entry_type();
+        if et.is_dir() {
+            continue;
+        }
+        if key.starts_with("files/") || key == "files" {
+            if !et.is_file() && !et.is_symlink() && !et.is_hard_link() {
+                continue; // fifo/device in a package tree: not ours
+            }
+            if et.is_symlink() || et.is_hard_link() {
+                let target = e.link_name()
+                    .map_err(|e| io_fail("pkg_read", format!("tar link: {e}")))?
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if target.starts_with('/') {
+                    return Err(io_fail("pkg_unsafe_link", format!("files/{raw} -> {target}: absolute link"))
+                        .with_hint("links inside a package tree must stay relative"));
+                }
+                tree_streamed = true;
+                tree_symlinks.push((key, target));
+                continue;
+            }
+            let rel = key.strip_prefix("files/").unwrap_or_default();
+            if rel.is_empty() {
+                continue;
+            }
+            tree_streamed = true;
+            stream_member(&mut e, &stream_dir, rel)?;
+            continue;
+        }
+        if !et.is_file() {
+            continue;
+        }
         members.insert(key, read_member(&mut e)?);
     }
 
-    let bin_key = format!("bin/{name}");
-    let bin = members.remove(&bin_key).ok_or_else(|| {
-        io_fail("pkg_missing_bin", format!("bundle missing {bin_key}"))
-            .with_hint(format!("四件套 = bin/{name} + pkg.toml + SKILL.md"))
-    })?;
     let pkg_raw = members.remove("pkg.toml").ok_or_else(|| {
         io_fail("pkg_missing_manifest", "bundle missing pkg.toml")
             .with_hint(format!("四件套 = bin/{name} + pkg.toml + SKILL.md"))
@@ -329,14 +367,22 @@ fn install_bundle(p: &Paths, name: &str, src: &Path) -> Result<Kind, Fail> {
         io_fail("skill_missing", "bundle missing SKILL.md — a package without its skill doc does not install")
             .with_hint("add SKILL.md at the tar root describing what this package is for and how to use it")
     })?;
-    // one package, one binary — a second bin/ member is a packaging bug
-    // that would silently not install, so it is a hard error.
-    if let Some(extra) = members.keys().find(|k| k.starts_with("bin/")) {
-        return Err(io_fail("pkg_extra_bin", format!("unexpected {extra} — one binary per package"))
-            .with_hint(format!("the package binary is {bin_key}; anything else belongs beside SKILL.md")));
+    let bin_key = format!("bin/{name}");
+    let bin = members.remove(&bin_key);
+    if bin.is_none() && !tree_streamed {
+        // v0 error precedence: a missing face outranks pkg.toml
+        // problems — and with no files/ tree, no later `exec` could
+        // rescue the bundle.
+        let _ = std::fs::remove_dir_all(&tmp_tree);
+        return Err(io_fail("pkg_missing_bin", format!("bundle missing {bin_key}"))
+            .with_hint(format!("四件套 = bin/{name} + pkg.toml + SKILL.md")));
     }
 
-    // pkg.toml: name must match; [service] (optional) becomes an agsvc unit.
+    // pkg.toml: name must match; `exec` (optional) names the entry under
+    // files/ that becomes the /var/bin face as a SYMLINK into the tree —
+    // for runtimes whose executable resolves its own libs/stdlib
+    // relative to its real path (CPython); [service] (optional) becomes
+    // an agsvc unit.
     let doc: toml::Value = toml::from_str(&String::from_utf8_lossy(&pkg_raw))
         .map_err(|e| io_fail("pkg_manifest_parse", format!("pkg.toml: {e}")))?;
     let tbl = doc.as_table().ok_or_else(|| io_fail("pkg_manifest_parse", "pkg.toml: want a table at top level"))?;
@@ -349,6 +395,45 @@ fn install_bundle(p: &Paths, name: &str, src: &Path) -> Result<Kind, Fail> {
             format!("pkg.toml name '{pkg_name}' != install name '{name}'"),
         )
         .with_hint("install name and pkg.toml name must be the same string"));
+    }
+    let exec = tbl.get("exec").and_then(|v| v.as_str());
+
+    // The face: either a flat binary member (bin/<name>) or a symlink
+    // into the files/ tree (pkg.toml exec). Exactly one.
+    match (exec, bin.is_some()) {
+        (Some(ex), true) => {
+            let _ = std::fs::remove_dir_all(&tmp_tree);
+            return Err(io_fail("pkg_face_twice", format!("bundle has both exec = \"{ex}\" and {bin_key}"))
+                .with_hint("a package face is either a flat bin/<name> member or pkg.toml exec — not both"));
+        }
+        (Some(ex), false) => {
+            if member_path(ex).is_err() || ex.starts_with('/') {
+                let _ = std::fs::remove_dir_all(&tmp_tree);
+                return Err(io_fail("pkg_exec", format!("pkg.toml exec '{ex}' is not a safe relative path")));
+            }
+            // exists = streamed file OR a pending tree symlink (links are
+            // materialized at commit, so the exec face may legitimately
+            // still be only in tree_symlinks here).
+            let pending_link = tree_symlinks.iter().any(|(k, _)| k == &format!("files/{ex}"));
+            if !pending_link && !tmp_tree.join(ex).exists() {
+                let _ = std::fs::remove_dir_all(&tmp_tree);
+                return Err(io_fail("pkg_exec", format!("pkg.toml exec 'files/{ex}' not in the bundle"))
+                    .with_hint("exec names a member under files/ — ship it in the tar"));
+            }
+        }
+        (None, false) => {
+            let _ = std::fs::remove_dir_all(&tmp_tree);
+            return Err(io_fail("pkg_missing_bin", format!("bundle missing {bin_key}"))
+                .with_hint(format!("四件套 = bin/{name} + pkg.toml + SKILL.md")));
+        }
+        (None, true) => {}
+    }
+    // one package, one binary — a second bin/ member is a packaging bug
+    // that would silently not install, so it is a hard error.
+    if let Some(extra) = members.keys().find(|k| k.starts_with("bin/")) {
+        let _ = std::fs::remove_dir_all(&tmp_tree);
+        return Err(io_fail("pkg_extra_bin", format!("unexpected {extra} — one binary per package"))
+            .with_hint(format!("the package binary is {bin_key}; anything else belongs beside SKILL.md")));
     }
 
     let mut has_unit = false;
@@ -375,8 +460,32 @@ fn install_bundle(p: &Paths, name: &str, src: &Path) -> Result<Kind, Fail> {
         has_unit = true;
     }
 
-    // binary + SKILL.md (and any extra files that ride with the skill)
-    place_binary(p, name, &bin)?;
+    // Commit the tree (if any): files/ is already streamed under the
+    // temp dir with its modes; swap it in wholesale. No .prev — a tree
+    // package rolls back by re-syncing (its bytes are pinned by the
+    // manifest sha, and sync is self-healing every boot).
+    let tree_used = exec.is_some();
+    if tree_used {
+        for (key, target) in &tree_symlinks {
+            let rel = key.strip_prefix("files/").unwrap_or(key);
+            let dst = tmp_tree.join(rel);
+            std::fs::create_dir_all(dst.parent().unwrap_or(&tmp_tree))
+                .map_err(|e| io_fail("pkg_tree", format!("{}: {e}", dst.display())))?;
+            std::os::unix::fs::symlink(target, &dst)
+                .map_err(|e| io_fail("pkg_tree", format!("link {key} -> {target}: {e}")))?;
+        }
+        let final_tree = p.pkgfiles.join(name);
+        mkdir_all(&p.pkgfiles)?;
+        let _ = std::fs::remove_dir_all(&final_tree);
+        std::fs::rename(&tmp_tree, &final_tree)
+            .map_err(|e| io_fail("pkg_tree", format!("{}: {e}", final_tree.display())))?;
+    }
+
+    // The face + SKILL.md (and any extra files that ride with the skill).
+    match exec {
+        Some(ex) => place_symlink_face(p, name, &p.pkgfiles.join(name).join(ex))?,
+        None => place_binary(p, name, bin.as_ref().unwrap())?,
+    }
     let skill_dir = p.skills.join(name);
     mkdir_all(&skill_dir)?;
     write_644(&skill_dir.join("SKILL.md"), &skill)
@@ -389,6 +498,66 @@ fn install_bundle(p: &Paths, name: &str, src: &Path) -> Result<Kind, Fail> {
         reload_units(p);
     }
     Ok(Kind::Bundle { skill: true, unit: has_unit })
+}
+
+/// Stream one files/ member to its place in the temp tree, keeping the
+/// tar's mode (a tree package's executables must arrive executable).
+fn stream_member<R: Read>(e: &mut tar::Entry<R>, root: &Path, rel: &str) -> Result<(), Fail> {
+    use std::os::unix::fs::PermissionsExt;
+    let dst = root.join(rel);
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io_fail("pkg_tree", format!("{}: {e}", parent.display())))?;
+    }
+    let mut out = std::fs::File::create(&dst).map_err(|e| io_fail("pkg_tree", format!("{}: {e}", dst.display())))?;
+    let mut take = std::io::BufReader::new(std::io::Read::by_ref(e)).take(MEMBER_MAX + 1);
+    std::io::copy(&mut take, &mut out)
+        .map_err(|e| io_fail("pkg_tree", format!("{}: {e}", dst.display())))?;
+    if take.limit() == 0 {
+        return Err(io_fail("pkg_member_huge", format!("files/{rel} exceeds 256 MiB — not a package member")));
+    }
+    let mode = e.header().mode().unwrap_or(0o644) & 0o777;
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(mode))
+        .map_err(|e| io_fail("pkg_tree", format!("{}: {e}", dst.display())))?;
+    Ok(())
+}
+
+/// Make /var/bin/<name> a symlink pointing at the tree entry (relative,
+/// so the tree and the face move together). Replaces whatever face was
+/// there — file, symlink, or nothing.
+fn place_symlink_face(p: &Paths, name: &str, target: &Path) -> Result<(), Fail> {
+    mkdir_all(&p.bindir)?;
+    let face = p.bindir.join(name);
+    let rel = relative_path(&face, target).ok_or_else(|| {
+        io_fail("pkg_face", format!("cannot relate {name} face to {}", target.display()))
+    })?;
+    let _ = std::fs::remove_file(&face);
+    std::os::unix::fs::symlink(&rel, &face)
+        .map_err(|e| io_fail("pkg_face", format!("{name} -> {}: {e}", rel.display())))?;
+    Ok(())
+}
+
+/// Relative path for a symlink at `link` pointing at `to` (both
+/// absolute, pure string arithmetic). Resolution anchors at the link's
+/// DIRECTORY — the link's own name is not part of the walk.
+fn relative_path(link: &Path, to: &Path) -> Option<PathBuf> {
+    let dir = link.parent()?;
+    let f: Vec<_> = dir.components().collect();
+    let t: Vec<_> = to.components().collect();
+    let mut i = 0;
+    while i < f.len() && i < t.len() && f[i] == t[i] {
+        i += 1;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for _ in i..f.len() {
+        parts.push("..".into());
+    }
+    for c in &t[i..] {
+        parts.push(c.as_os_str().to_string_lossy().into_owned());
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(parts.join("/")))
 }
 
 /// Write the agsvc overlay unit: [unit] name + the package's [service]
@@ -715,6 +884,7 @@ mod tests {
             skills: root.join("skills"),
             units: root.join("units"),
             stamps: root.join("stamps"),
+            pkgfiles: root.join("pkgfiles"),
             dldir: root.join("dl"),
             manifest: root.join("manifest"),
             agdl: root.join("agdl"),
@@ -938,6 +1108,128 @@ mod tests {
         build_tar(&t4, &[("bin/wrong", b"B"), ("pkg.toml", PKG_TOML.as_bytes()), ("SKILL.md", b"s")]);
         let f = install_file(&p, "dup", &t4, &sha256_file(&t4).unwrap()).unwrap_err();
         assert_eq!(f.code, "pkg_missing_bin");
+    }
+
+    /// Tar with a files/ tree: control members at the root, streamed
+    /// files with explicit modes, and symlink members inside the tree.
+    fn build_tree_tar(
+        path: &Path,
+        control: &[(&str, &[u8])],
+        tree_files: &[(&str, &[u8], u32)],
+        tree_links: &[(&str, &str)],
+    ) {
+        let f = fs::File::create(path).unwrap();
+        let mut b = tar::Builder::new(f);
+        for (name, data) in control {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append_data(&mut h, name, *data).unwrap();
+        }
+        for (name, data, mode) in tree_files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(*mode);
+            h.set_cksum();
+            b.append_data(&mut h, format!("files/{name}"), *data).unwrap();
+        }
+        for (name, target) in tree_links {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(0);
+            h.set_mode(0o777);
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_cksum();
+            b.append_link(&mut h, format!("files/{name}"), *target).unwrap();
+        }
+        b.finish().unwrap();
+    }
+
+    const TREE_TOML: &str = "name = \"python3\"\nversion = \"3.12\"\nexec = \"bin/python3\"\n";
+
+    #[test]
+    fn tree_bundle_faces_symlink_and_keeps_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp("tree");
+        let p = paths(&root);
+        let t = root.join("p.tar");
+        build_tree_tar(
+            &t,
+            &[("pkg.toml", TREE_TOML.as_bytes()), ("SKILL.md", b"# python3 skill\n")],
+            &[
+                ("bin/python3", b"ELF", 0o755),
+                ("lib/python312/os.py", b"import sys\n", 0o644),
+            ],
+            &[("bin/python3.12", "python3")],
+        );
+        let sha = sha256_file(&t).unwrap();
+        assert_eq!(
+            install_file(&p, "python3", &t, &sha).unwrap(),
+            Kind::Bundle { skill: true, unit: false }
+        );
+        // face is a symlink that resolves INTO the tree, relative
+        let face = p.bindir.join("python3");
+        assert!(face.is_symlink());
+        assert_eq!(fs::read(&face).unwrap(), b"ELF");
+        let lnk = fs::read_link(&face).unwrap().to_string_lossy().into_owned();
+        assert!(!lnk.starts_with('/'), "face must be relative: {lnk}");
+        // tree landed with modes and its internal symlink
+        let elf = p.pkgfiles.join("python3/bin/python3");
+        assert_eq!(fs::read(&elf).unwrap(), b"ELF");
+        assert_eq!(fs::metadata(&elf).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            fs::metadata(p.pkgfiles.join("python3/lib/python312/os.py")).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::read_link(p.pkgfiles.join("python3/bin/python3.12")).unwrap().to_string_lossy(),
+            "python3"
+        );
+        // skill + stamp as usual
+        assert!(p.skills.join("python3/SKILL.md").is_file());
+        assert_eq!(fs::read_to_string(p.stamps.join("python3")).unwrap().trim(), sha);
+        // a wiped tree leaves a dangling face -> exists() false -> sync
+        // takes the download path (the M26 gate, tree edition)
+        fs::remove_dir_all(p.pkgfiles.join("python3")).unwrap();
+        assert!(!p.bindir.join("python3").exists());
+    }
+
+    #[test]
+    fn tree_bundle_face_rules() {
+        let root = tmp("treeface");
+        let p = paths(&root);
+        // exec AND a flat bin member: two faces
+        let t = root.join("a.tar");
+        build_tree_tar(
+            &t,
+            &[("bin/python3", b"X"), ("pkg.toml", TREE_TOML.as_bytes()), ("SKILL.md", b"s")],
+            &[("bin/python3", b"ELF", 0o755)],
+            &[],
+        );
+        let f = install_file(&p, "python3", &t, &sha256_file(&t).unwrap()).unwrap_err();
+        assert_eq!(f.code, "pkg_face_twice");
+        // exec pointing at a member that is not in the tar
+        let t2 = root.join("b.tar");
+        build_tree_tar(
+            &t2,
+            &[("pkg.toml", TREE_TOML.as_bytes()), ("SKILL.md", b"s")],
+            &[("lib/x.py", b"print(1)\n", 0o644)],
+            &[],
+        );
+        let f = install_file(&p, "python3", &t2, &sha256_file(&t2).unwrap()).unwrap_err();
+        assert_eq!(f.code, "pkg_exec");
+        assert!(!p.pkgfiles.join("python3").exists());
+        assert!(!p.pkgfiles.join(".tmp-install").exists(), "failed installs leave no temp tree");
+        // absolute link inside the tree
+        let t3 = root.join("c.tar");
+        build_tree_tar(
+            &t3,
+            &[("pkg.toml", TREE_TOML.as_bytes()), ("SKILL.md", b"s")],
+            &[("bin/python3", b"ELF", 0o755)],
+            &[("lib/evil", "/etc/passwd")],
+        );
+        let f = install_file(&p, "python3", &t3, &sha256_file(&t3).unwrap()).unwrap_err();
+        assert_eq!(f.code, "pkg_unsafe_link");
     }
 
     #[test]
