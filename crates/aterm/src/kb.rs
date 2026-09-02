@@ -17,8 +17,12 @@
 // shift) SYM (one-shot symbol page) SPC DEL ENT. CTL is a one-shot
 // modifier: letter -> KeyEvent::Ctrl (CTL c = 0x03 when encoded).
 //
-// Layout math (1080x2340): 10 keys/row x 4 rows, 28 px side margins,
-// 24 px bottom margin; keys scale to fit.
+// Layout math (1080x2340): a plain 10-column grid — every row divides the
+// usable width evenly (28 px side margins, 24 px bottom margin) with ONE
+// uniform keycap gap (≈0.8% of span), so the four letter rows are identical
+// and edge-to-edge with the extra-keys and specials rows (2026-09-02: the
+// QWERTY stagger and fixed-width cells are gone — all rows have 10 keys,
+// so all rows are the same row).
 
 use crate::input::{Dir, InputEvent, KeyEvent};
 use std::fs::OpenOptions;
@@ -82,6 +86,10 @@ pub const SPECIALS: [KeyDef; 5] = [
 
 pub const KB_M: usize = 28; // side margin (px)
 pub const KB_B: usize = 24; // bottom margin (px)
+// Row height cap: keeps the terminal area identical to the pre-grid layout
+// on redfin — the h/2 height budget would allow 229, far taller than a
+// 10-column grid needs now that the width no longer shrinks the cells.
+const KB_ROW_H: usize = 118;
 
 pub struct Kb {
     shift: bool,
@@ -94,17 +102,11 @@ pub struct KeyGeom {
     pub extra_y: usize, // extra-keys row top edge (px)
     pub extra_h: usize,
     pub x_off: usize, // side margin
+    pub gap: usize, // uniform keycap gap, H+V (≈0.8% of span)
     pub label_scale: usize, // letter labels: ~half the cap, not edge-to-edge
     pub span: usize, // usable width inside the margins
     pub cell_w: usize,
     pub cell_h: usize,
-}
-
-impl KeyGeom {
-    /// QWERTY stagger: each letter row indents a quarter key further.
-    pub fn row_off(&self, row: usize) -> usize {
-        self.cell_w * row / 4
-    }
 }
 
 impl Kb {
@@ -113,15 +115,14 @@ impl Kb {
     }
 
     pub fn geom(w: usize, h: usize) -> KeyGeom {
-        // cell height budget: half the screen, 5 rows incl. specials
-        let panel_h = h / 2;
-        let cell_h = panel_h / 5;
-        let mut scale = (cell_h - 6) / 8;
-        // width budget: 10 keys/row + QWERTY stagger (up to 3/4 key)
-        let wscale = (((w - 2 * KB_M) * 4 / 43).saturating_sub(6)) / 6;
-        scale = scale.min(wscale).max(2);
-        let cell_w = 6 * scale + 6;
-        let cell_h = 8 * scale + 6;
+        // 10-column grid: every row divides the span into equal cells — no
+        // stagger, no fixed cell size — so all four letter rows are
+        // identical (10 keys each) and flush with the extra-keys and
+        // specials rows. One gap constant spaces every keycap, H and V.
+        let span = w - 2 * KB_M;
+        let cell_w = span / 10;
+        let cell_h = (h / 2 / 5).min(KB_ROW_H);
+        let gap = span / 128; // ≈0.8% of span: 8 px on the 1080 panel
         // letter labels: ~half the keycap so rows read as separate keys
         let label_scale = ((cell_w - 24) / 6).min((cell_h - 24) / 8).max(2);
         let panel_y = h - KB_B - cell_h * 5;
@@ -131,8 +132,9 @@ impl Kb {
             extra_y: panel_y - extra_h - 8,
             extra_h,
             x_off: KB_M,
+            gap,
             label_scale,
-            span: w - 2 * KB_M,
+            span,
             cell_w,
             cell_h,
         }
@@ -172,10 +174,6 @@ impl Kb {
         let x = x - g.x_off;
         let row = (y - g.panel_y) / g.cell_h;
         if row < 4 {
-            if x < g.row_off(row) {
-                return None;
-            }
-            let x = x - g.row_off(row);
             let col = x / g.cell_w;
             let s = if self.sym { SYM_ROWS[row] } else { ROWS[row] };
             if col >= s.len() {

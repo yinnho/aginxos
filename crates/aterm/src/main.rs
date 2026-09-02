@@ -488,29 +488,32 @@ impl<'a> Render<'a> {
         let m = kg.x_off;
         fill_rect(pix, self.pitch, w, h, m as i32, kg.extra_y as i32, (w - 2 * m) as i32, (h - kg.extra_y) as i32, 0x00050A08);
         fill_rect(pix, self.pitch, w, h, m as i32, kg.extra_y as i32 - 2, (w - 2 * m) as i32, 2, DIM);
+        // One gap constant spaces every keycap on the keyboard (2026-09-02):
+        // caps are cells inset by gap/2, so H and V seams are all gap wide.
+        let gi = kg.gap / 2;
         // extra-keys row (Termux): ESC TAB CTL < v ^ > — labels from the
         // key table, arrows drawn bigger than text labels
         let ekw = (w - 2 * m) / kb::EXTRA_KEYS.len();
         for (i, kd) in kb::EXTRA_KEYS.iter().enumerate() {
-            let x0 = m + i * ekw + 3;
-            let y0 = kg.extra_y + 2;
+            let x0 = m + i * ekw + gi;
+            let y0 = kg.extra_y + gi;
             let active = self.mod_active(kd, kb);
             let ks = if i >= 3 { 5 } else { 3 };
-            self.keycap(pix, x0, y0, ekw - 6, kg.extra_h - 4, kd.label, ks, active);
+            self.keycap(pix, x0, y0, ekw - kg.gap, kg.extra_h - kg.gap, kd.label, ks, active);
         }
         for (r, row) in kb.page_rows().iter().enumerate() {
             for (col, ch) in row.chars().enumerate() {
-                let x0 = m + kg.row_off(r) + col * kg.cell_w + 4;
-                let y0 = kg.panel_y + r * kg.cell_h + 4;
-                self.keycap(pix, x0, y0, kg.cell_w - 8, kg.cell_h - 8, &ch.to_string(), kg.label_scale, false);
+                let x0 = m + col * kg.cell_w + gi;
+                let y0 = kg.panel_y + r * kg.cell_h + gi;
+                self.keycap(pix, x0, y0, kg.cell_w - kg.gap, kg.cell_h - kg.gap, &ch.to_string(), kg.label_scale, false);
             }
         }
         let kw = (w - 2 * m) / 5;
         for (i, kd) in kb::SPECIALS.iter().enumerate() {
-            let x0 = m + i * kw + 4;
-            let y0 = kg.panel_y + 4 * kg.cell_h + 4;
+            let x0 = m + i * kw + gi;
+            let y0 = kg.panel_y + 4 * kg.cell_h + gi;
             let active = self.mod_active(kd, kb);
-            self.keycap(pix, x0, y0, kw - 8, kg.cell_h - 8, kd.label, 4, active);
+            self.keycap(pix, x0, y0, kw - kg.gap, kg.cell_h - kg.gap, kd.label, 4, active);
         }
     }
 
