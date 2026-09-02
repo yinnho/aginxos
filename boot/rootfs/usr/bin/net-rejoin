@@ -35,8 +35,9 @@ while [ $attempt -lt 2 ]; do
   ip link set "$IF" up 2>/dev/null
   if /bin/wifi-join "$IF" "$SSID" "$PSK"; then
     if udhcpc -i "$IF" -n -q -t 6 -T 3 >/dev/null 2>&1; then
-      # NB: plain `ip addr` — busybox ip does not take -4 and fails silently
-      echo "net-rejoin: lease ok ($(ip addr show "$IF" | awk '/inet /{print $2; exit}'))"
+      # NB: plain `ip addr` — busybox ip does not take -4 and fails
+      # silently; sed not awk — this busybox's awk applet segfaults.
+      echo "net-rejoin: lease ok ($(ip addr show "$IF" | sed -n 's/^ *inet \([0-9.][0-9.]*\)\/.*/\1/p' | head -n 1))"
       exit 0
     fi
     echo "net-rejoin: join ok but no lease"

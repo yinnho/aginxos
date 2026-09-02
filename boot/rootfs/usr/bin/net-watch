@@ -49,7 +49,9 @@ while :; do
     continue
   fi
   idle=0
-  gw=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')
+  # busybox awk segfaults on this device (case file in net-bringup) —
+  # sed parse, or gw is always empty and we rejoin a healthy net every 45 s.
+  gw=$(ip route 2>/dev/null | sed -n 's/^default via \([0-9.][0-9.]*\) .*/\1/p' | head -n 1)
   if [ -n "$gw" ] && ping -c1 -W3 "$gw" >/dev/null 2>&1; then
     wanfail=$(( wanfail + 1 ))
     if [ $wanfail -eq 8 ]; then
