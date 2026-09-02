@@ -3814,3 +3814,40 @@ Session end state: AginxOS rootfs #5 on slot a (active + marked, succ1);
 slot b = healthy byte-mirror (pri2/succ1); vendor_boot = ROOTFS=1 build
 (the standing operating state; stock copies untouched in boot/). All 5
 manifest packages installed; aginxbrowser ready, codex/grok registered.
+
+## 2026-09-02 — M20a/M20b: relay restored + network self-heal (net-watch)
+
+**M20a — relay long-connection restored.** Root cause of the dead
+aginx/aginx-carrier units was missing identity, not code: `/home/.aginx`
+(config.toml/binding.json/agents/carrier state) died with an earlier
+userdata re-bake and `/etc/aginx/env` was already an empty dir in the
+0831 backup — the env was lost even earlier. Restored `/home/.aginx`
+(4.7 MB, 50 files) from `.local/backup-pre-bake-0901/prebake0901.tar`;
+a minimal `/etc/aginx/env` containing only `HOME=/home` proved
+sufficient (relay endpoint + identity live in .aginx). Result: both
+units ready under agsvc, relay ESTABLISHED 192.168.0.166 →
+106.75.32.216:8443. aginx reconnects by itself (10 s retry loop) once
+the network returns — observed live. env is now baked in the recipe
+(`boot/rootfs/etc/aginx/env`); .aginx stays per-device data (restore
+path = pre-bake backups until the #86 backup channel exists).
+
+**M20b — net-watch self-heal, proven by deliberate link kill.**
+New: `/usr/bin/net-rejoin` (the one in-place recovery primitive: flush
++ wifi-join + udhcpc, 2 attempts, lease-gated), `/usr/bin/net-watch`
+(agsvc unit, PID under agsvc; waits for net-bringup's boot verdict,
+then probes the default gateway every 15 s — 3 consecutive fails →
+net-rejoin; WAN-side loss logged only), and wifi-wizard no longer
+offers a whole-device reboot after configuring — it nudges
+`agctl restart aginx aginx-carrier` in place instead. Test:
+`ip link set wlan0 down` → fail 1/3, 2/3, 3/3 logged (~45 s) →
+automatic rejoin (scan picked BSS 44:d1:fa:de:16:b9 this time) →
+lease ok, default route back, ping ok — zero human input, total
+outage ~75 s. The relay TCP connection survived the heal (same IP);
+`agctl restart aginx` on a ready unit verified as the wizard path.
+Found and fixed during the test: the fail counter was reset every loop
+(one variable double-used) — never tripped; now separate idle flag.
+Two cosmetic follow-ups: busybox `ip` does not accept `-4` (silent
+empty output — use plain `ip addr`), and a stray "Segmentation fault"
+line appears after wifi-join's "keys installed" during rejoin — join
+still returns 0 and the link comes up; suspect a busybox applet or
+wifi-join teardown; harmless to the outcome, left as a watch item.
