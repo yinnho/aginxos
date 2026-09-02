@@ -3893,3 +3893,26 @@ green without human input: agsvc up 32.7 s, wdt armed 32.9 s
 rejoined WLAN, ntpd re-synced (device GMT == host wall clock to the
 second). Power sampler (M23a) restarted post-test; idle draw ~79-91 mA
 @ ~4.46 V while "Charging" status.
+
+## 2026-09-02 — M21: update signing — ed25519 gate in agupd, E2E on device
+
+Unsigned/tampered manifests are now dead at the door. New host tool
+`agsign` (keygen/sign/verify; private key in `.local/keys/agupd.key`,
+0600, gitignored — public key compiled into agupd as
+`AGUPD_PUBKEY_B64`). Signature scheme: detached — base64(64-byte
+ed25519) in `<manifest>.sig` next to the manifest (local sibling or
+URL+".sig"), verified over the RAW manifest bytes (no JSON
+canonicalization anywhere), BEFORE parsing or downloading anything.
+
+Device E2E (`agupd apply --no-reboot`, new binary swapped into
+/usr/bin): (1) no .sig → rc=1, nothing attempted; (2) tampered body
+("test-1"→"test-EVIL") with the stale sig → rc=1; (3) properly signed
+manifest → gate passed ("running aginxos c95e7c1 → applying test-1 to
+slot _b" — that print sits after fetch+verify+parse in cmd_apply),
+then died at the image-download stage as designed (bogus example.com
+URL) — no partition touched. Gate order confirmed in source: verify →
+parse → print → stage → verify sha256 → write. Host self-test of
+agsign sign/verify/tamper passed first (Verification equation was not
+satisfied on tamper). Binary cost: agupd 281 KB → 482 KB (ed25519-
+dalek, static musl). Rootfs bake #6 will fold it in; until then the
+on-device binary is hand-swapped (state noted above).
