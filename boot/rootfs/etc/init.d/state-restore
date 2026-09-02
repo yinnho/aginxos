@@ -1,0 +1,47 @@
+#!/bin/sh
+# state-restore (M22) — put back what agupd captured before a rootfs swap.
+#
+# A rootfs update replaces the WHOLE userdata ext4, so the irreplaceable
+# device state (Wi-Fi psk, relay identity in /home/.aginx, logs) would
+# die with it. agupd tars that set to 64 GiB on the same partition with
+# an ASCII marker (magic AGXSTATE + 16 decimal length digits); rcS runs
+# THIS on the fresh rootfs before any service starts, then clears the
+# marker in place (conv=notrunc — never truncate the partition).
+#
+# Marker layout (must match agupd STATE_OFF): block 16777216 (64 GiB in
+# 4K blocks) holds the header; the tar follows at block 16777217.
+#
+# A stale marker (update crashed after the state write but before the
+# swap) restores the same data onto the same fs — a harmless no-op. An
+# old rootfs without this script simply ignores it.
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+UD=/dev/block/by-name/userdata
+BLK=16777216   # 64 GiB / 4096 — agupd STATE_OFF
+
+[ -b "$UD" ] || exit 0
+# tr -d '\0' first: $( ) drops NUL bytes, which would shift every
+# following byte and corrupt the cut offsets below.
+hdr=$(dd if="$UD" bs=4096 skip=$BLK count=1 2>/dev/null | tr -d '\000')
+magic=$(printf '%s' "$hdr" | head -c 8)
+[ "$magic" = "AGXSTATE" ] || exit 0
+len=$(printf '%s' "$hdr" | cut -c9-24 | tr -d ' ')
+case "$len" in
+  ''|*[!0-9]*) echo "state-restore: bad length field" >&2; exit 1 ;;
+esac
+[ "$len" -gt 0 ] || exit 1
+
+nblk=$(( (len + 4095) / 4096 ))
+echo "state-restore: marker found (${len} B tar) — restoring" > /dev/kmsg
+dd if="$UD" of=/tmp/state.tar bs=4096 skip=$((BLK + 1)) count=$nblk 2>/dev/null
+truncate -s "$len" /tmp/state.tar 2>/dev/null || dd if=/dev/zero of=/tmp/state.tar bs=1 seek="$len" count=0 2>/dev/null
+if tar -xf /tmp/state.tar -C / 2>/dev/null; then
+  echo "state-restore: ok" > /dev/kmsg
+else
+  echo "state-restore: tar extract FAILED — keeping marker for manual retry" > /dev/kmsg
+  rm -f /tmp/state.tar
+  exit 1
+fi
+rm -f /tmp/state.tar
+dd if=/dev/zero of="$UD" bs=4096 seek=$BLK count=1 conv=notrunc 2>/dev/null
+echo "state-restore: marker cleared" > /dev/kmsg

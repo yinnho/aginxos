@@ -222,6 +222,7 @@ chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/app-registry" "${TREE}/etc/init.d/provision" \
   "${TREE}/etc/init.d/aterm-handoff" \
   "${TREE}/etc/init.d/camera-bringup" "${TREE}/etc/init.d/cell-bringup" \
+  "${TREE}/etc/init.d/state-restore" \
   "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdl" "${TREE}/usr/bin/aterm" \
   "${TREE}/usr/bin/wifi-wizard" "${TREE}/usr/bin/agsvc" \
   "${TREE}/usr/bin/agctl" "${TREE}/usr/bin/agboot-ok" \

@@ -64,6 +64,15 @@ struct Image {
     url: String,
     sha256: String,
     size: Option<u64>,
+    /// M22: body already streamed to the swap area on userdata (by the
+    /// host over adb — a sparse 1-2 GiB mke2fs image cannot ride the
+    /// small live fs). agupd then hashes the staged blocks against this
+    /// manifest's sha256 and writes the commit header. Production https
+    /// updates (pre_staged absent) download through agdl as usual —
+    /// which will need direct-to-offset streaming once images approach
+    /// the fs size (agdl -o seek; follow-up).
+    #[serde(default)]
+    pre_staged: bool,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +83,228 @@ struct Manifest {
     dtbo: Option<Image>,
     vbmeta: Option<Image>,
     vbmeta_system: Option<Image>,
+    /// M22: new rootfs image for the userdata partition. Carried through
+    /// the signed manifest like everything else; the swap itself happens
+    /// in the initramfs trampoline on next boot (see SWAP_OFF below).
+    rootfs: Option<Image>,
+}
+
+// --- M22 rootfs-swap protocol (MUST match crates/aginxos-init) ---
+//
+// The live rootfs IS the userdata partition, so it cannot be rewritten
+// from userspace. Instead agupd stages the new image ON the same
+// partition, beyond the ext4 (fs is 2 GiB; if it is ever grown past
+// ~7 GiB these offsets must move):
+//   8 GiB         SWAP_OFF:  4096-byte header (the commit point)
+//   8 GiB + 4096  SWAP_BODY: new rootfs image, payload_len bytes
+//   32 GiB        BAK_OFF:   trampoline's copy of the old fs
+// Header layout: magic[8]="AGXROOT1", u32le version=1, u32le flags
+// (1=pending), u64le payload_len, sha256 as 64 lowercase hex chars,
+// u64le old_len (bytes of the current fs, for the trampoline's
+// backup). Write order is crash-safe: body first + fsync, header LAST
+// — a crash before the header leaves the old rootfs untouched and the
+// stray body harmless. The trampoline (new vendor_boot, A/B-protected
+// by M14) sees the marker, verifies the body hash, backs up the old
+// fs to 32 GiB, dd's the new image to offset 0, clears the marker,
+// and only then mounts. That is why a rootfs update MUST ship with
+// the matching vendor_boot: an old trampoline ignores the marker.
+const SWAP_OFF: u64 = 8 << 30;
+const SWAP_HDR: u64 = 4096;
+const BAK_OFF: u64 = 32 << 30;
+const SWAP_MAGIC: &[u8; 8] = b"AGXROOT1";
+// Irreplaceable device state (Wi-Fi psk, relay identity in /home/.aginx,
+// logs) staged at 64 GiB with its own ASCII marker — MUST match
+// /etc/init.d/state-restore. Re-downloadable things (/var/lib/agpkg
+// packages) deliberately do NOT ride along: the new rootfs re-provisions.
+const STATE_OFF: u64 = 64 << 30;
+const STATE_MAGIC: &[u8; 8] = b"AGXSTATE";
+const STATE_MAX: u64 = 512 << 20;
+
+fn swap_header(payload_len: u64, sha256_hex: &str, old_len: u64) -> Vec<u8> {
+    let mut h = vec![0u8; SWAP_HDR as usize];
+    h[..8].copy_from_slice(SWAP_MAGIC);
+    h[8..12].copy_from_slice(&1u32.to_le_bytes()); // version
+    h[12..16].copy_from_slice(&1u32.to_le_bytes()); // flags: pending
+    h[16..24].copy_from_slice(&payload_len.to_le_bytes());
+    h[24..88].copy_from_slice(sha256_hex.as_bytes());
+    h[88..96].copy_from_slice(&old_len.to_le_bytes());
+    h
+}
+
+/// Stream a file to `off` on an already-open block device, fsync, return
+/// bytes written.
+fn pwrite_file_at(fd: i32, staged: &str, off: u64) -> u64 {
+    let mut src = File::open(staged).unwrap_or_else(|e| die(&format!("open {staged}: {e}")));
+    let len = src.metadata().unwrap_or_else(|e| die(&format!("stat {staged}: {e}"))).len();
+    let mut buf = vec![0u8; 4 << 20];
+    let mut off = off;
+    let mut left = len;
+    while left > 0 {
+        let n = src.read(&mut buf).unwrap_or_else(|e| die(&format!("read {staged}: {e}")));
+        if n == 0 { die(&format!("{staged}: short read at {}", len - left)); }
+        let mut done = 0usize;
+        while done < n {
+            let w = unsafe {
+                libc::pwrite(fd, buf[done..n].as_ptr() as *const _, (n - done) as _, off as libc::off_t)
+            };
+            if w <= 0 { die(&format!("pwrite at {off}: {}", std::io::Error::last_os_error())); }
+            done += w as usize;
+            off += w as u64;
+        }
+        left -= n as u64;
+    }
+    len
+}
+
+/// Capture the irreplaceable set as a tar (busybox, absolute paths) and
+/// stage it at STATE_OFF with an ASCII header: magic(8) + 16 decimal
+/// digits of length + newline — parseable by /etc/init.d/state-restore
+/// with nothing but dd/head/cut. Marker last = crash-safe.
+fn stage_state_tar(staging_root: &str) {
+    let tar_path = format!("{staging_root}/state.tar");
+    let _ = std::fs::remove_file(&tar_path);
+    // best-effort: an agent mid-write means one file is torn, not lost
+    let _ = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "tar -cf {tar_path} /etc/wifi.conf /etc/aginx /home /root /var/log /var/power 2>/dev/null"
+        ))
+        .status();
+    let len = match std::fs::metadata(&tar_path) {
+        Ok(m) => m.len(),
+        Err(_) => die("state capture produced no tar — refusing to update (would be a factory reset)"),
+    };
+    if len == 0 || len > STATE_MAX {
+        die(&format!("state tar is {len} bytes (max {STATE_MAX}) — refusing"));
+    }
+    let dev = "/dev/block/by-name/userdata";
+    let dst = OpenOptions::new().write(true).open(dev)
+        .unwrap_or_else(|e| die(&format!("open {dev} rw: {e}")));
+    let fd = dst.as_raw_fd();
+    let wrote = pwrite_file_at(fd, &tar_path, STATE_OFF + SWAP_HDR);
+    if wrote != len {
+        die(&format!("state tar wrote {wrote} != {len}"));
+    }
+    unsafe { libc::fsync(fd) };
+    let mut h = vec![0u8; SWAP_HDR as usize];
+    h[..8].copy_from_slice(STATE_MAGIC);
+    h[8..24].copy_from_slice(format!("{len:016}").as_bytes());
+    h[24] = b'\n';
+    let mut done = 0usize;
+    while done < h.len() {
+        let w = unsafe {
+            libc::pwrite(fd, h[done..].as_ptr() as *const _, (h.len() - done) as _, STATE_OFF as libc::off_t)
+        };
+        if w <= 0 { die(&format!("pwrite state header: {}", std::io::Error::last_os_error())); }
+        done += w as usize;
+    }
+    unsafe { libc::fsync(fd) };
+    println!("agupd: state tar staged at {STATE_OFF} ({len} bytes)");
+    let _ = std::fs::remove_file(&tar_path);
+}
+
+/// Verify the pre-staged body ON the block device (hash over
+/// SWAP_OFF+SWAP_HDR .. len) against the signed manifest, then write the
+/// commit header. The signature is the trust anchor: the host streamed
+/// the bytes, the manifest says what they must hash to.
+fn commit_rootfs_swap(img: &Image) {
+    let dev = "/dev/block/by-name/userdata";
+    let dst = OpenOptions::new().write(true).open(dev)
+        .unwrap_or_else(|e| die(&format!("open {dev} rw: {e}")));
+    let fd = dst.as_raw_fd();
+    let len = match std::fs::metadata(&img.url) {
+        // a local image tells us its length directly
+        Ok(m) => m.len(),
+        Err(_) => img.size.unwrap_or_else(|| die("pre-staged rootfs needs a local url or size")),
+    };
+    if len == 0 || len % 4096 != 0 {
+        die(&format!("pre-staged rootfs len {len} — want non-zero 4K-aligned"));
+    }
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 4 << 20];
+    let mut done: u64 = 0;
+    while done < len {
+        let want = ((len - done) as usize).min(buf.len());
+        let n = unsafe {
+            libc::pread(fd, buf[..want].as_mut_ptr() as *mut _, want as _, (SWAP_OFF + SWAP_HDR + done) as libc::off_t)
+        };
+        if n <= 0 {
+            die(&format!("read staged body at {done}: {}", std::io::Error::last_os_error()));
+        }
+        h.update(&buf[..n as usize]);
+        done += n as u64;
+    }
+    let got = hex(&h.finish());
+    if !got.eq_ignore_ascii_case(&img.sha256) {
+        die(&format!("pre-staged rootfs body sha256 {got} != manifest {} — re-stream it", img.sha256));
+    }
+    println!("agupd: pre-staged rootfs body verified ({len} bytes)");
+
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let cst = std::ffi::CString::new("/").unwrap();
+    if unsafe { libc::statfs(cst.as_ptr(), &mut st) } != 0 {
+        die(&format!("statfs /: {}", std::io::Error::last_os_error()));
+    }
+    let old_len = st.f_blocks as u64 * st.f_bsize as u64;
+    if old_len + (4 << 20) >= SWAP_OFF {
+        die(&format!("rootfs fs is {old_len} bytes — grown into the {SWAP_OFF} swap area, refusing"));
+    }
+    let hdr = swap_header(len, &got, old_len);
+    let mut w = 0usize;
+    while w < hdr.len() {
+        let k = unsafe {
+            libc::pwrite(fd, hdr[w..].as_ptr() as *const _, (hdr.len() - w) as _, SWAP_OFF as libc::off_t)
+        };
+        if k <= 0 { die(&format!("pwrite swap header: {}", std::io::Error::last_os_error())); }
+        w += k as usize;
+    }
+    unsafe { libc::fsync(fd) };
+    println!("agupd: rootfs swap committed at {SWAP_OFF} (len {len}, old fs {old_len})");
+}
+
+/// Stage the verified rootfs image into the swap area on the userdata
+/// partition. Nothing at offset 0 is touched — the running fs stays
+/// valid no matter when we crash.
+fn stage_rootfs_swap(staged: &str, sha256_hex: &str) -> u64 {
+    let dev = "/dev/block/by-name/userdata";
+    let dst = OpenOptions::new().write(true).open(dev)
+        .unwrap_or_else(|e| die(&format!("open {dev} rw: {e}")));
+    let mut src = File::open(staged).unwrap_or_else(|e| die(&format!("open {staged}: {e}")));
+    let len = src.metadata().unwrap_or_else(|e| die(&format!("stat {staged}: {e}"))).len();
+    if len == 0 || len % 4096 != 0 {
+        die(&format!("{staged}: len {len} — want a non-zero 4K-aligned image"));
+    }
+    // old fs extent (for the trampoline's backup): the mounted rootfs
+    // knows its own size.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let cst = std::ffi::CString::new("/").unwrap();
+    if unsafe { libc::statfs(cst.as_ptr(), &mut st) } != 0 {
+        die(&format!("statfs /: {}", std::io::Error::last_os_error()));
+    }
+    let old_len = st.f_blocks as u64 * st.f_bsize as u64;
+    if old_len + (4 << 20) >= SWAP_OFF {
+        die(&format!("rootfs fs is {old_len} bytes — grown into the {SWAP_OFF} swap area, refusing"));
+    }
+
+    let fd = dst.as_raw_fd();
+    let wrote = pwrite_file_at(fd, staged, SWAP_OFF + SWAP_HDR);
+    if wrote != len {
+        die(&format!("rootfs image wrote {wrote} != {len}"));
+    }
+    unsafe { libc::fsync(fd) };
+    // commit point: the header, last
+    let h = swap_header(len, sha256_hex, old_len);
+    let mut done = 0usize;
+    while done < h.len() {
+        let w = unsafe {
+            libc::pwrite(fd, h[done..].as_ptr() as *const _, (h.len() - done) as _, SWAP_OFF as libc::off_t)
+        };
+        if w <= 0 { die(&format!("pwrite swap header: {}", std::io::Error::last_os_error())); }
+        done += w as usize;
+    }
+    unsafe { libc::fsync(fd) };
+    println!("agupd: rootfs staged at {SWAP_OFF} on userdata (len {len}, old fs {old_len}, backup target {BAK_OFF})");
+    len
 }
 
 fn die(msg: &str) -> ! {
@@ -279,6 +510,29 @@ fn cmd_apply(src: &str, no_reboot: bool) {
         println!("agupd: {name}: {n} bytes → {dev} (sha256 ok)");
         if staged != img.url {
             let _ = std::fs::remove_file(&staged);
+        }
+    }
+    // M22: stage the new rootfs into the userdata swap area (after all
+    // partition writes — the marker must never reference an update whose
+    // kernel half failed to land). Rootfs updates require the matching
+    // vendor_boot: only that trampoline knows how to perform the swap.
+    // State tar goes first: whenever the swap marker exists, the captured
+    // state must already be complete.
+    if let Some(img) = &m.rootfs {
+        if m.vendor_boot.is_none() {
+            die("manifest has rootfs but no vendor_boot — the swap trampoline must ship with it");
+        }
+        stage_state_tar(&root);
+        if img.pre_staged {
+            commit_rootfs_swap(img);
+        } else {
+            let staged = format!("{root}/rootfs.img");
+            let staged = stage(&img.url, &staged);
+            verify(img, &staged);
+            stage_rootfs_swap(&staged, &img.sha256);
+            if staged != img.url {
+                let _ = std::fs::remove_file(&staged);
+            }
         }
     }
     let st = Command::new("/usr/bin/agboot-ok")

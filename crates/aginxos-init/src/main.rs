@@ -818,6 +818,240 @@ fn kill_adbd() {
     klog("rootfs: old adbd stopped");
 }
 
+// --- M22 rootfs-swap protocol (MUST match crates/agupd) ---
+//
+// agupd stages a new rootfs image on the userdata partition beyond the
+// live ext4 and parks a 4096-byte marker at 8 GiB (details + crash
+// ordering in agupd's source). We run BEFORE the first mount of
+// userdata, which is the only moment offset 0 is rewritable:
+//   marker pending + body hash ok   -> back up old fs to 32 GiB, copy
+//                                      the new image to offset 0,
+//                                      clear the marker, mount as usual
+//   marker pending + body hash BAD  -> clear the marker, boot the
+//                                      current fs (update dead, box up)
+//   mount fails after a swap        -> restore the 32 GiB backup and
+//                                      retry once (old fs back, box up)
+const SWAP_OFF: u64 = 8 << 30;
+const SWAP_HDR: u64 = 4096;
+const BAK_OFF: u64 = 32 << 30;
+const SWAP_MAGIC: &[u8; 8] = b"AGXROOT1";
+const BLKBUF: usize = 4 << 20;
+
+struct SwapCtx {
+    fd: i32,     // block device, still open for the restore path
+    old_len: u64,
+}
+
+fn pread_at(fd: i32, buf: &mut [u8], off: u64) -> isize {
+    unsafe {
+        libc::pread(fd, buf.as_mut_ptr() as *mut _, buf.len(), off as libc::off_t)
+    }
+}
+
+fn pwrite_at(fd: i32, buf: &[u8], off: u64) -> isize {
+    unsafe {
+        libc::pwrite(fd, buf.as_ptr() as *const _, buf.len(), off as libc::off_t)
+    }
+}
+
+/// Copy `len` bytes from `src_off` to `dst_off` on the same device.
+fn blk_copy(fd: i32, src_off: u64, dst_off: u64, len: u64) -> Result<(), String> {
+    let mut buf = vec![0u8; BLKBUF];
+    let mut done: u64 = 0;
+    while done < len {
+        let want = ((len - done) as usize).min(BLKBUF);
+        let n = pread_at(fd, &mut buf[..want], src_off + done);
+        if n <= 0 {
+            return Err(format!("read at {}: {}", src_off + done, std::io::Error::last_os_error()));
+        }
+        let mut w = 0usize;
+        while w < n as usize {
+            let k = pwrite_at(fd, &buf[w..n as usize], dst_off + done + (w as u64));
+            if k <= 0 {
+                return Err(format!("write at {}: {}", dst_off + done + (w as u64), std::io::Error::last_os_error()));
+            }
+            w += k as usize;
+        }
+        done += n as u64;
+    }
+    unsafe { libc::fsync(fd) };
+    Ok(())
+}
+
+fn hex32(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Check for a pending swap marker; perform it if sane. Returns the
+/// context needed to undo the swap if the subsequent mount fails.
+fn maybe_swap_rootfs(devpath: &str) -> Option<SwapCtx> {
+    let c_path = std::ffi::CString::new(devpath).unwrap();
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        klog(&format!("rootfs-swap: open {devpath}: {}", std::io::Error::last_os_error()));
+        return None;
+    }
+    let mut hdr = vec![0u8; SWAP_HDR as usize];
+    let n = pread_at(fd, &mut hdr, SWAP_OFF);
+    if n != SWAP_HDR as isize || &hdr[..8] != SWAP_MAGIC {
+        return None; // the normal boot path: nothing staged
+    }
+    let flags = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
+    let payload_len = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+    let sha_hex = String::from_utf8_lossy(&hdr[24..88]).trim_end_matches('\0').to_string();
+    let old_len = u64::from_le_bytes(hdr[88..96].try_into().unwrap());
+    if flags != 1 || payload_len == 0 || payload_len % 4096 != 0 {
+        klog("rootfs-swap: bad header — clearing marker, booting current");
+        let zero = vec![0u8; SWAP_HDR as usize];
+        pwrite_at(fd, &zero, SWAP_OFF);
+        unsafe { libc::fsync(fd) };
+        return None;
+    }
+    if old_len == 0 || old_len >= SWAP_OFF {
+        klog(&format!("rootfs-swap: old_len {old_len} insane — clearing marker, booting current"));
+        let zero = vec![0u8; SWAP_HDR as usize];
+        pwrite_at(fd, &zero, SWAP_OFF);
+        unsafe { libc::fsync(fd) };
+        return None;
+    }
+    klog(&format!("rootfs-swap: pending (new {payload_len} B, old fs {old_len} B) — hashing staged body"));
+
+    // 1. verify the staged body before touching anything
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; BLKBUF];
+    let mut done: u64 = 0;
+    while done < payload_len {
+        let want = ((payload_len - done) as usize).min(BLKBUF);
+        let n = pread_at(fd, &mut buf[..want], SWAP_OFF + SWAP_HDR + done);
+        if n <= 0 {
+            klog(&format!("rootfs-swap: read staged body: {}", std::io::Error::last_os_error()));
+            return None;
+        }
+        h.update(&buf[..n as usize]);
+        done += n as u64;
+    }
+    let got = hex32(&h.finish());
+    if got != sha_hex {
+        klog(&format!("rootfs-swap: staged body sha256 {got} != {sha_hex} — keeping current"));
+        let zero = vec![0u8; SWAP_HDR as usize];
+        pwrite_at(fd, &zero, SWAP_OFF);
+        unsafe { libc::fsync(fd) };
+        return None;
+    }
+    klog("rootfs-swap: body sha256 ok — backing up current fs");
+
+    // 2. back up the old fs, then swap it out
+    if let Err(e) = blk_copy(fd, 0, BAK_OFF, old_len) {
+        klog(&format!("rootfs-swap: backup failed ({e}) — aborting swap, booting current"));
+        return None;
+    }
+    if let Err(e) = blk_copy(fd, SWAP_OFF + SWAP_HDR, 0, payload_len) {
+        klog(&format!("rootfs-swap: copy-in failed ({e}) — restoring backup"));
+        let _ = blk_copy(fd, BAK_OFF, 0, old_len);
+        return None;
+    }
+    let zero = vec![0u8; SWAP_HDR as usize];
+    pwrite_at(fd, &zero, SWAP_OFF);
+    unsafe { libc::fsync(fd) };
+    klog("rootfs-swap: new rootfs written, marker cleared — mounting");
+    Some(SwapCtx { fd, old_len })
+}
+
+/// switch_to_rootfs mount-failure path: put the pre-swap fs back.
+fn restore_rootfs_backup(ctx: &SwapCtx) {
+    klog("rootfs-swap: mount failed — restoring pre-swap fs from backup");
+    if let Err(e) = blk_copy(ctx.fd, BAK_OFF, 0, ctx.old_len) {
+        klog(&format!("rootfs-swap: RESTORE FAILED ({e}) — device needs host rescue"));
+        return;
+    }
+    klog("rootfs-swap: backup restored");
+}
+
+/// SHA-256 (FIPS 180-4), streaming — same in-crate implementation as
+/// agupd (the trampoline verifies what the updater staged).
+struct Sha256 {
+    h: [u32; 8],
+    len: u64,
+    buf: [u8; 64],
+    n: usize,
+}
+
+const SHA_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+impl Sha256 {
+    fn new() -> Sha256 {
+        Sha256 { h: [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19], len: 0, buf: [0; 64], n: 0 }
+    }
+
+    fn block(&mut self, b: &[u8]) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let mut v = self.h;
+        for i in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ ((!v[4]) & v[6]);
+            let t1 = v[7].wrapping_add(s1).wrapping_add(ch).wrapping_add(SHA_K[i]).wrapping_add(w[i]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let t2 = s0.wrapping_add(maj);
+            v[7] = v[6]; v[6] = v[5]; v[5] = v[4];
+            v[4] = v[3].wrapping_add(t1);
+            v[3] = v[2]; v[2] = v[1]; v[1] = v[0];
+            v[0] = t1.wrapping_add(t2);
+        }
+        for i in 0..8 {
+            self.h[i] = self.h[i].wrapping_add(v[i]);
+        }
+    }
+
+    fn update(&mut self, mut d: &[u8]) {
+        self.len = self.len.wrapping_add(d.len() as u64);
+        while !d.is_empty() {
+            let take = (64 - self.n).min(d.len());
+            self.buf[self.n..self.n + take].copy_from_slice(&d[..take]);
+            self.n += take;
+            d = &d[take..];
+            if self.n == 64 {
+                let b = self.buf;
+                self.block(&b);
+                self.n = 0;
+            }
+        }
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        let bits = self.len.wrapping_mul(8);
+        self.update(&[0x80]);
+        while self.n != 56 {
+            self.update(&[0]);
+        }
+        let mut b = self.buf;
+        b[56..64].copy_from_slice(&bits.to_be_bytes());
+        self.block(&b);
+        let mut out = [0u8; 32];
+        for (i, h) in self.h.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&h.to_be_bytes());
+        }
+        out
+    }
+}
+
 /// /aginxos/rootfs: mount the ext4 rootfs on userdata, switch_root into it,
 /// exec busybox init as the new PID 1. Everything that can fail runs while
 /// the console is still alive; only the irreversible tail (MS_MOVE, chroot,
@@ -833,11 +1067,14 @@ fn switch_to_rootfs() -> ! {
     };
     let devpath = format!("/dev/{dev}");
     klog(&format!("rootfs: userdata is {devpath}"));
+    // M22: perform a staged rootfs swap if agupd left a marker — this is
+    // the only pre-mount moment offset 0 of the partition is writable.
+    let swap_ctx = maybe_swap_rootfs(&devpath);
     mkdir_p(NEWROOT);
     let src = std::ffi::CString::new(devpath.clone()).unwrap();
     let tgt = std::ffi::CString::new(NEWROOT).unwrap();
     let fst = std::ffi::CString::new("ext4").unwrap();
-    let rc = unsafe {
+    let mut mount_once = || unsafe {
         libc::mount(
             src.as_ptr(),
             tgt.as_ptr(),
@@ -846,6 +1083,15 @@ fn switch_to_rootfs() -> ! {
             std::ptr::null(),
         )
     };
+    let mut rc = mount_once();
+    if rc != 0 {
+        if let Some(ctx) = &swap_ctx {
+            // A swap just happened — the new image may be mount-broken.
+            // Put the pre-swap fs back and try again before giving up.
+            restore_rootfs_backup(ctx);
+            rc = mount_once();
+        }
+    }
     if rc != 0 {
         hold_forever(&format!(
             "rootfs: mount {devpath} ext4 rw: {}",

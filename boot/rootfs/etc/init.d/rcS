@@ -8,6 +8,11 @@ export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/system/bin
 /bin/busybox --install -s /bin 2>/dev/null
 mdev -s 2>/dev/null
 
+# M22: restore state captured before a rootfs swap (no-op on normal
+# boots; must run before chown and before any service needs /home,
+# /etc/wifi.conf or /var).
+/etc/init.d/state-restore
+
 # Host mke2fs -d stored the macOS build user (uid 501) as owner - the
 # filesystem is rw, so the first boot normalizes it for good.
 chown -R 0:0 /bin /sbin /etc /aginxos /system /home /root /var /opt /srv /media 2>/dev/null
