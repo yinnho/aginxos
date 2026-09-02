@@ -28,14 +28,17 @@ suite_require_device() {
 
 # drv '<shell-cmd>' — run on device, capture exit code and stdout.
 # Sets DRV_RC / DRV_OUT. PATH mirrors provision's so /var/bin faces and
-# /usr/bin tools resolve. The trailing __RC= echo survives adb's
-# historic non-propagation of device exit codes. The bionic linker
-# noise lines ("libc: Access denied finding property …") that this
-# adb injects into every shell stream are stripped — same filter the
-# bring-up sessions have always used by hand.
+# /usr/bin tools resolve. HOME is pinned to /home — adbd spawns shells
+# with HOME=/ (M30 bring-up finding), which made the carrier CLI carve
+# a stray registry out of /.aginx instead of the daemon's /home/.aginx;
+# /etc/aginx/env only reaches units, not adb. The trailing __RC= echo
+# survives adb's historic non-propagation of device exit codes. The
+# bionic linker noise lines ("libc: Access denied finding property …")
+# that this adb injects into every shell stream are stripped — same
+# filter the bring-up sessions have always used by hand.
 drv() {
   local raw
-  raw="$(adbx shell "export PATH=/usr/bin:/bin:/sbin:/var/bin; $1; echo __RC=\$?" 2>&1 || true)"
+  raw="$(adbx shell "export HOME=/home PATH=/usr/bin:/bin:/sbin:/var/bin; $1; echo __RC=\$?" 2>&1 || true)"
   raw="${raw//$'\r'/}"
   DRV_RC="$(printf '%s\n' "${raw}" | sed -n 's/^__RC=//p' | tail -1)"
   # `|| true`: a command with no stdout empties the last grep -v, which

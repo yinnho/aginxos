@@ -1,9 +1,8 @@
 #!/bin/sh
 # ag:summary=avatar (clone) lifecycle: install/list/remove/update
-# ag:args=install <name> | list [--json] | remove <name> | update <name>
-# ag:examples=list
+# ag:args=install <name> [--file <tar>] [--dry-run] | list [--json] | remove <name> | update <name> | remote add <name> <url> | remote remove <name>
+# ag:examples=list --json
 # ag:group=agent
 # Pass-through to the provisioned carrier binary (/var/bin/aginx-carrier,
-# first-boot must-exist) — no ag:exec here because the target is not in
-# the baked tree; M30 upgrades this to a real builtin.
+# first-boot must-exist). M30: install --file 本地 tar 源 + --dry-run 权限预览。
 exec /var/bin/aginx-carrier agent "$@"
