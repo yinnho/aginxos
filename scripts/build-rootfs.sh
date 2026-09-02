@@ -35,12 +35,14 @@ mkdir -p "${TREE}"
 
 # Mountpoints (and /var/log — the only place boot evidence survives; the
 # kernel has no pstore, so /var/adbd.log is our cross-boot record).
-# /var/power + /var/lib/agpkg/{skills,units,stamps}: state-tar members
-# that only existed on the running fs before bake #9 — busybox tar exits
-# 1 on a missing member, which the hardened agupd rightly treats as
-# fatal (observed 2026-09-03).
+# /var/power + /var/lib/agpkg/{skills,units,stamps} + /var/lib/ag/done:
+# state-tar members that only existed on the running fs before bake #9 —
+# busybox tar exits 1 on a missing member, which the hardened agupd
+# rightly treats as fatal (observed 2026-09-03). /var/lib/ag/done is the
+# agdone marker home (M27); provision seeds it at runtime too.
 mkdir -p "${TREE}"/{dev,proc,sys,etc,home,media,mnt,opt,root,run,srv,tmp,var/log,var/power}
 mkdir -p "${TREE}"/var/lib/agpkg/{skills,units,stamps}
+mkdir -p "${TREE}"/var/lib/ag/done
 
 # Android pieces: /system (adbd + linker config + lib64) and the root-level
 # property/SELinux files adbd reads at startup.
@@ -232,6 +234,9 @@ cp "${TARGET}/agupd" "${TREE}/usr/bin/agupd"
 # pkg.toml + SKILL.md). The recipe's sh agpkg is gone; this binary is
 # the only face.
 cp "${TARGET}/agpkg" "${TREE}/usr/bin/agpkg"
+# agdone (M27) — provision done-markers for one-shot boot steps
+# (/var/lib/ag/done). The ag-done shim rides along via the cp -R above.
+cp "${TARGET}/agdone" "${TREE}/usr/bin/agdone"
 # package manifest rides SIGNED: the on-device default path requires a
 # detached sig or every `agpkg sync` refuses (fail-closed). Resign when
 # the manifest is newer than its sig; no key = hard error, not a silent
@@ -267,7 +272,7 @@ chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/aterm-handoff" \
   "${TREE}/etc/init.d/camera-bringup" "${TREE}/etc/init.d/cell-bringup" \
   "${TREE}/etc/init.d/state-restore" \
-  "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdl" "${TREE}/usr/bin/aterm" \
+  "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdone" "${TREE}/usr/bin/agdl" "${TREE}/usr/bin/aterm" \
   "${TREE}/usr/bin/wifi-wizard" "${TREE}/usr/bin/agsvc" \
   "${TREE}/usr/bin/agctl" "${TREE}/usr/bin/agboot-ok" \
   "${TREE}/usr/bin/agupd" \

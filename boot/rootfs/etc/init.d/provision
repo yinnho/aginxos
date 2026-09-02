@@ -1,22 +1,44 @@
 #!/bin/sh
-# First-boot provisioning + per-boot self-heal (M10, docs/SYSTEM.md §9.3).
+# Provision (v2, M27, docs/SYSTEM.md §9): three explicit layers, all
+# idempotent, none of which ever blocks the boot.
 #
-# Waits for net-bringup to prove internet (its boot.state verdict), then:
-# every manifest entry whose installed sha256 differs gets re-downloaded and
-# atomically installed. That single path is both first-boot install and
-# self-heal — a corrupt/missing binary recovers on the next boot with
-# network. No network / no active manifest entries = quiet no-op; failures
-# here never block the boot.
+#   seed      — scaffold the state tree /var/lib/ag + agpkg dirs. Pure
+#               mkdir, no markers: a wiped or partial tree just gets
+#               re-created next boot. (The baked image scaffolds these
+#               too — M26 made them state-tar members, and busybox tar
+#               exits 1 on a missing member. Seed is the runtime half
+#               of that belt-and-braces.)
+#   resync    — agpkg sync EVERY boot (first install and self-heal are
+#               one path: an entry whose installed sha256 differs gets
+#               re-downloaded atomically). Output goes to a log, not
+#               boot.state — the boot line only records ok/fail.
+#               app-registry always runs after it (launcher entries for
+#               whatever is installed, even if sync failed on one
+#               package), and any unit whose binary THIS boot installed
+#               gets `agctl restart` — agsvc restart-exhausted it during
+#               the empty-/var/bin window of earlier boots (observed
+#               2026-09-03: aginx 5 restarts -> failed, manual revive).
+#   finalize  — one-shot steps, gated by `agdone` markers in
+#               /var/lib/ag/done: run only while unmarked, mark only on
+#               success, so a failed step retries next boot and a wiped
+#               marker (state-tar loss) means a clean re-run. First
+#               real tenant is M28 (python + pip). Structure here now.
+#
+# net-bringup writes "internet ok|fail ..." and finally "done ok|fail" —
+# this script writes ONLY the pkg lines.
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/var/bin
 
 STATE=/run/boot.state
 say() { echo "$@" >>"$STATE"; }
 
+# ---- seed -----------------------------------------------------------------
+mkdir -p /var/lib/ag/done /var/lib/agpkg/skills /var/lib/agpkg/units /var/lib/agpkg/stamps
+
 [ -f /etc/agpkg.manifest ] || exit 0
 grep -qE '^[a-z]' /etc/agpkg.manifest || exit 0   # all entries commented
 
-# net-bringup writes "internet ok|fail ..." and finally "done ok|fail".
-# Give it up to 6 minutes (radio + join + dhcp on a cold boot), then bail.
+# ---- wait for internet (resync + finalize both need it) -------------------
+# Give net-bringup up to 6 minutes (radio + join + dhcp on a cold boot).
 n=0
 while [ $n -lt 180 ]; do
   grep -q '^internet ok' "$STATE" 2>/dev/null && break
@@ -25,12 +47,23 @@ while [ $n -lt 180 ]; do
 done
 grep -q '^internet ok' "$STATE" || exit 0
 
+# ---- resync ---------------------------------------------------------------
+LOG=/var/tmp/agpkg-sync.log
 say pkg run
-if agpkg sync; then
+if agpkg sync >"$LOG" 2>&1; then
   say pkg ok
-  # new/refreshed binaries -> launcher registry entries (M16)
-  /etc/init.d/app-registry
 else
-  say pkg fail "see /var/tmp/agpkg"
+  say pkg fail "see $LOG"
 fi
+# launcher entries for whatever is installed — even a partial sync
+/etc/init.d/app-registry
+# a binary installed this boot may belong to a unit that already gave up
+# restarting during the empty-/var/bin window; revive what we refreshed
+for u in $(sed -n 's/^agpkg: installed \([^ ]*\).*/\1/p' "$LOG" 2>/dev/null); do
+  agctl restart "$u" 2>/dev/null
+done
+
+# ---- finalize (one-shot steps, agdone-gated; first tenant M28) ------------
+# Pattern:  if agdone check <name>; then :; else <step> && agdone mark <name>; fi
+
 exit 0

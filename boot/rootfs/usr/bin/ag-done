@@ -1,0 +1,8 @@
+#!/bin/sh
+# ag:summary=provision done-markers: check/mark/ensure/reset one-shot boot steps
+# ag:args=check <name> | mark <name> | ensure <name> | reset <name>|reset --all | list
+# ag:examples=list
+# ag:examples=check python-finalize
+# ag:group=sys
+# ag:exec=agdone
+exec /usr/bin/agdone "$@"
