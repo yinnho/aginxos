@@ -1,0 +1,21 @@
+#!/bin/sh
+# carrier-panel — launcher tile for the carrier platform layer (2026-09-02
+# user request: carrier must be visible and testable on the phone — it is a
+# daemon, so the tile shows a live status panel instead of spawning a
+# second instance). Auto-refreshes every 10s; the launcher BACK tile is the
+# exit (aterm drops back to the launcher when the child dies).
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/var/bin
+
+while :; do
+  clear
+  echo "=== AGINX CARRIER ==="
+  /var/bin/aginx-carrier info
+  echo
+  agctl status aginx-carrier
+  echo
+  echo "--- log tail ---"
+  tail -12 /var/log/agsvc/aginx-carrier.log 2>/dev/null
+  echo
+  echo "[$(date +%H:%M:%S)] auto 10s - BACK to exit"
+  sleep 10
+done

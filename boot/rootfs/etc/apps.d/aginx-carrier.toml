@@ -1,0 +1,7 @@
+# carrier — platform-layer daemon (M8). Unlike codex/grok this is not an
+# interactive CLI: it runs as an agsvc unit. The tile opens carrier-panel,
+# a live status view (info + agctl state + log tail), so the platform layer
+# is visible and testable from the phone (user request 2026-09-02).
+name = CARRIER
+binary = /usr/bin/carrier-panel
+scale = 3
