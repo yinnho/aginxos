@@ -4198,3 +4198,33 @@ export。④ 烤进文件 owner=501（mke2fs -d 从 macOS 树保 uid；agupd 等
 ~7.5h 偏（AP 死→ntpd 没跑；pm8xxx set_time 政策门见上条）。**设备终
 态**：slot _a active 跑 8c7c00d，aginx/aginx-carrier/net-watch ready，
 ABL 7 次未标记自回滚兜底在岗，旧 rootfs 备份在 32GiB。
+
+**M25 — HOME 统一 /home + agio 信封 + carrier retrofit（2026-09-03，设备
+实测收口）。** **HOME**：aterm(main.rs setenv) 与 agsvc(spawn 默认) 原指
+/var/home 而 carrier 单位走 /etc/aginx/env 的 /home——终端里的 agent 与
+daemon 对 ~ 不一致；且设备上 /var/home 从未存在（无孤儿数据要迁），
+/home/.aginx 才是真数据（state tar 覆盖 /home，旧路径反而不在备份里）。
+两处改 /home 后推新二进制：agsvc 经 inittab respawn 轮换（kill 后 8s 内
+回岗，四单元 ready），**/proc/<carrier>/environ 实测 HOME=/home** ✓；
+aterm kill 后 handoff 循环 2s respawn（新 pid，md5 验），二进制字符串
+/var/home 0 处、/home 在 ✓——aterm 里 shell 的运行时 $HOME 观察需屏幕
+开终端（留用户手指，同"+"砖先例）。ATERM 运行时观察待手指。**agio**
+（crates/agio，仅 serde_json）：ok/ok_meta/fail/fail_hint + exit 助手，
+error.type 封闭集（usage→exit2 余 1），stdout 永远可解析、stderr 归人；
+`ag commands --json` 改经 agio，形状与 M24 手写版逐字节同构（16/16 测试
+不变）。**carrier v0.2.1**（aginx-carrier 仓库 9a2b10b，release 已切）：
+`agent list --json` 与 `cron list` 从 JSON Lines 归一为 D1 信封——设备经
+烤入路由器实测 `ag agent list --json` →
+{"data":[],"meta":{"count":0,"local":0,"remote":0},"ok":true} rc=0、
+`ag cron list` → {"data":[],"meta":{"count":0},"ok":true} rc=0（空列表
+提示走 stderr）✓；无存量机器消费方（carrier-panel 只吃人读 info，实测
+info 面不受影响；aclone 未落地）故直切不加兼容层。**manifest v0.1.0→
+v0.2.1**（设备 /etc/agpkg.manifest + 仓库配方同步）：v0.1.0 无 agent/cron
+子命令（M24 收口时发现，clap 报错穿透即其证），不升则下次 provision 把
+手机上的信封版静默降回；现推送二进制=release 资产（sha bbac1017…），
+provision 对它是 no-op。**adb 壳假象记录**：adb mksh 无 HOME，从 adb 跑
+`aginx-carrier info` 显示"数据目录 /.aginx/carrier"——仅当前 CLI 进程
+的显示，daemon（/proc 实测 HOME=/home）不受影响。aterm/agsvc 为推送到
+运行 fs 的覆盖（/usr 持久，重启不丢）；**烤 #8（M26 时点）折入**：
+aterm/agsvc/ag(agio)/manifest v0.2.1/ag-sys-rtc 头。设备终态：8c7c00d
+烤 + 推送覆盖，aginx/aginx-carrier/net-watch ready。
