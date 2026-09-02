@@ -17,3 +17,6 @@ agio = { path = "../agio" }
 [[bin]]
 name = "agdone"
 path = "src/main.rs"
+
+[dev-dependencies]
+testkit = { path = "../testkit" }

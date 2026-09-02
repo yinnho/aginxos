@@ -14,6 +14,7 @@ members = [
     "crates/agupd",
     "crates/aterm",
     "crates/wifi-wizard",
+    "crates/testkit",
 ]
 default-members = ["crates/aginxos-probe"]
 

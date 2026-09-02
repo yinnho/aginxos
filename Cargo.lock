@@ -9,6 +9,7 @@ dependencies = [
  "agio",
  "libc",
  "serde_json",
+ "testkit",
 ]
 
 [[package]]
@@ -16,6 +17,15 @@ name = "agdl"
 version = "0.1.0"
 dependencies = [
  "ureq",
+]
+
+[[package]]
+name = "agdone"
+version = "0.1.0"
+dependencies = [
+ "agio",
+ "serde_json",
+ "testkit",
 ]
 
 [[package]]
@@ -63,6 +73,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "testkit",
  "toml",
 ]
 
@@ -727,6 +738,10 @@ dependencies = [
  "libc",
  "xattr",
 ]
+
+[[package]]
+name = "testkit"
+version = "0.1.0"
 
 [[package]]
 name = "tokio"

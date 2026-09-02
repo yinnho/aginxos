@@ -7,31 +7,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-static SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
-    let n = SEQ.fetch_add(1, Ordering::SeqCst);
-    let d = std::env::temp_dir().join(format!("ag-router-{}-{name}-{n}", std::process::id()));
-    let _ = fs::remove_dir_all(&d);
-    fs::create_dir_all(&d).unwrap();
+    let d = testkit::tmp(&format!("router-{name}"));
     for (f, c) in files {
-        let p = d.join(f);
-        if let Some(par) = p.parent() {
-            fs::create_dir_all(par).unwrap();
-        }
-        fs::write(&p, c).unwrap();
-        make_exec(&p);
+        testkit::write_exec(&d.join(f), c.as_bytes());
     }
     d
-}
-
-fn make_exec(p: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let mut pm = fs::metadata(p).unwrap().permissions();
-    pm.set_mode(0o755);
-    fs::set_permissions(p, pm).unwrap();
 }
 
 fn ag(cmd_path: &str, args: &[&str]) -> Command {
@@ -283,8 +265,7 @@ fn check_reports_each_lint_class() {
     );
     // compiled command without .agmd sidecar (non-shebang bytes)
     let binp = d.join("ag-bad-bin");
-    fs::write(&binp, b"\x7fELF-not-really\x00\x01").unwrap();
-    make_exec(&binp);
+    testkit::write_exec(&binp, b"\x7fELF-not-really\x00\x01");
 
     let out = run(d.to_str().unwrap(), &["commands", "--check"]);
     assert_eq!(out.status.code(), Some(1));

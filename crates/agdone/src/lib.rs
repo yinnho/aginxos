@@ -113,21 +113,19 @@ mod tests {
     use super::*;
 
     /// dir() reads a process-global env var, so tests that point it
-    /// anywhere must not overlap — take the lock for the whole test.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// anywhere must serialize (testkit convention #2: only when the
+    /// code reads a global env var by design). The guard is part of
+    /// the return so the lock lives as long as the test.
     fn tmp(tag: &str) -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
-        let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let d = std::env::temp_dir().join(format!("agdone-test-{}-{tag}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
+        let g = testkit::env_lock();
+        let d = testkit::tmp(&format!("agdone-{tag}"));
         std::env::set_var("AGDONE_DIR", &d);
         (g, d)
     }
 
     #[test]
     fn mark_check_reset_cycle() {
-        let (_g, d) = tmp("cycle");
+        let (_g, _d) = tmp("cycle");
         assert!(!is_marked("python-finalize"));
         let at = mark("python-finalize").unwrap();
         assert!(is_marked("python-finalize"));
@@ -135,21 +133,19 @@ mod tests {
         assert!(reset("python-finalize"));
         assert!(!is_marked("python-finalize"));
         assert!(!reset("python-finalize")); // idempotent
-        let _ = d;
     }
 
     #[test]
     fn bad_marker_reads_as_unmarked() {
-        let (_g, d) = tmp("bad");
+        let (_g, _d) = tmp("bad");
         fs::create_dir_all(dir().join("wedge")).unwrap(); // a directory squatting the path
         assert!(!is_marked("wedge"));
         assert_eq!(marked_at("wedge"), None);
-        let _ = d;
     }
 
     #[test]
     fn traversal_and_weird_names_rejected() {
-        let (_g, d) = tmp("names");
+        let (_g, _d) = tmp("names");
         for bad in ["", "..", "../escape", "a/b", "with space"] {
             assert!(mark(bad).is_err(), "{bad:?} should be refused");
         }
@@ -160,13 +156,12 @@ mod tests {
 
     #[test]
     fn reset_all_takes_only_regular_files() {
-        let (_g, d) = tmp("all");
+        let (_g, _d) = tmp("all");
         mark("a").unwrap();
         mark("b").unwrap();
         fs::create_dir_all(dir().join("keepdir")).unwrap();
         assert_eq!(reset_all(), 2);
         assert!(list().is_empty());
         assert!(dir().join("keepdir").is_dir()); // untouched, not our business
-        let _ = d;
     }
 }

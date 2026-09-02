@@ -863,18 +863,9 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rand_core::{OsRng, RngCore};
     use std::fs;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static DIRS: AtomicU32 = AtomicU32::new(0);
 
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "agpkg-test-{}-{tag}-{}",
-            std::process::id(),
-            DIRS.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&d).unwrap();
-        d
+        testkit::tmp(&format!("agpkg-{tag}"))
     }
 
     fn paths(root: &Path) -> Paths {

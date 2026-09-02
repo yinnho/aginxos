@@ -10,7 +10,7 @@ fn agpkg() -> Command {
 
 #[test]
 fn list_json_envelope_and_usage_exit_codes() {
-    let tmp = std::env::temp_dir().join(format!("agpkg-cli-{}", std::process::id()));
+    let tmp = testkit::tmp("agpkg-cli");
     std::fs::create_dir_all(tmp.join("bin")).unwrap();
     std::fs::write(tmp.join("bin/tool"), b"BIN").unwrap();
     let out = agpkg()

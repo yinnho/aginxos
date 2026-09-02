@@ -57,6 +57,12 @@ Two targets, never mix them up:
 
 Use the existing wrappers instead of raw commands:
 
+- `./scripts/check.sh` — host gate (M29): cargo test over the host-compatible
+  crates + `ag commands --check` over a scratch shim tree. Run before adb
+  pushes and before commits; `check.sh lint` skips the cargo half.
+- `./scripts/accept/*.sh` — device acceptance suites (M29): `smoke.sh` (boot
+  health) plus one per milestone (m24–m28). Every adb call is pinned to the
+  experiment serial; suites are read-only apart from named scratch markers.
 - `./scripts/build-phone.sh musl` — build Rust crates for the initramfs target
 - `./boot/fetch-tools.sh` → `./boot/unpack-boot.sh <img>` → `./boot/pack-boot.sh` — boot.img pipeline
 - `./scripts/pack-vendor-boot.sh` (env flags `HOLD/SPLASH/MODULES/MODULES_FULL`) — build patched vendor_boot
