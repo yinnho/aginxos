@@ -4256,3 +4256,44 @@ provision 绿未单独验**（需重启；签名 manifest+新 agpkg 已在位，
 provision 即走签名门——留 bake #8 重启观察）。设备终态：8c7c00d 烤 +
 /usr/bin/agpkg(Rust)、/etc/agpkg.manifest{,.sig}、demo 四件套（一次性
 验收件）推送在位。
+
+**M26 续 — 烤 #8 换机 ×3：/var/lib 存活闭环 + 两处换机洞（2026-09-03，
+设备实测）。** 烤 #8（SIZE=1g，rootfs sha a5fc358c…，流式 dd 到 swap body
++ 读回 sha 精确匹配；boot.img 取自 boot_b 槽读回=镜像、vendor_boot 复用
+#7 的 d80b80…——分区整读含填充勿比对）。**第一次换机 /var/lib 未存活**：
+/var/lib/agpkg 全无。三重根因实证：(1) 64GiB 残留 tar（marker 只清头、包
+体还在）TOC 只有 etc/home/root/var/log/var/power——无 var/lib，apply 时
+跑的是旧 fs 的旧 agupd（8c7c00d 烤，旧 scope）；(2) 烤 #8 镜像内的 agupd
+md5=62a39294 与新源码构建一致——新二进制在镜像里，只是没在 apply 前到旧
+fs 上；(3) 烤 #8 树本无 /var/lib 目录。**trampoline 时序**：换机开机 rcS
+state-restore 在 up≈69s 才跑（1GiB 拷贝吃掉前一分钟），解包+marker 清零
+已由 trampoline 完成——/var/state-restore.log 只剩一行 start（kmsg 路径
+吞掉其余），marker 区读回 0xFF=已消费、无悬挂 commit 头。**第二次换机
+state tar 截断事故**：/root/bin 预置 330MB 二进制后 apply，tar 建在
+staging_root（/tmp=tmpfs）上死于 235491328 字节（内存压力杀 tar），agupd
+只验 0<len≤512MiB → 部分包照收，swap 开机解出截断 codex（134529536B、
+mtime 1970-01-21=未校时钟期写入）。apply 尾部自带 `reboot2 reboot`
+（--no-reboot 可关）——事后 adb 读数全落在竞态窗口里才显得灵异。
+**修复 1（agupd 硬化，已实测）**：state tar 改落 /var/tmp（真 fs）+ tar
+退出码非零即 die（"would ship a torn state"）。实测：tar 因烤 #8 无
+/var/power 退 1 → 拒绝 ✓（顺带暴露：旧 fs 的 /var/power 是 M23a 采样器
+运行期建的，烤树从未有过）；补 mkdir 后 apply 干净（4,869,632B）。烤树补
+var/power + var/lib/agpkg/{skills,units,stamps}。**第三次换机（--no-reboot
+受控）成**：预检 tar TOC rc=0、105 条、var/lib/agpkg/stamps×4+skills+
+units 俱在包内；reboot2 后 up=151s 时 **stamps 四枚全在**（mtime 由 tar
+保留）——**/var/lib 随 state tar 存活闭环 ✓**。**修复 2（agpkg sync 自愈
+洞，已实测）**：stamps 存活而 /var/bin 被换机清空 → sync 只比 stamp 报
+"up to date"，一件都不重装（三换后 /var/bin 空、provision pkg fail）。
+up-to-date 判据补 binary 存在性（单测：stamp+无 binary→走下载路径、
+stamp 保留）；推送后 sync 实测四件全重装（aginx 走 gh-proxy 重试落
+1f8134d0…）。**aginx-carrier v0.2.1 资产漂移**：GitHub release 重切于
+2026-09-02T16:41Z，资产 sha=c0d490d3…（API digest 佐证），manifest 旧 pin
+bbac1017=本地构建 → sync sha mismatch。manifest 重 pin c0d490d3 + 重签。
+**结构性发现：state tar 只带 wifi.conf+/etc/aginx，不带
+/etc/agpkg.manifest——换机后 manifest 回退烤内版本**（第三次换机又翻回
+bbac pin 即此）；烤 #9 折入新 manifest。provision pkg fail 后仍写 done ok
+（失败不重试——正是 M27 标记纪律要立的洞）。AP DNS 阵发失联
+（github/gh-proxy 双双 Try again，后自愈）；codex 233MB 在换机后完整重下
+成功过一次。/root/bin 垫片用完即删。设备终态：烤 #8 fs（第三次换机后）+
+推送覆盖 agupd(9434a35d)/agpkg(d7d57e9d)/manifest(c0d490d3 pin)+sig；
+stamps×4；/var/bin 四件经修复后 sync 重装。
