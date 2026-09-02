@@ -4089,3 +4089,19 @@ $2}'` 取空 → susp 全记 0s；时长由 arm 差恢复，无需重跑（下�
 4418.8→4399.6mV 是拔线后弛豫，非耗量证据。**结论记为区间/上限，非点值**；
 拿点值的路径：≥3h 连续浸泡（Δ~10mAh 量级）——可被动挂机过夜跑
 ~100 循环版 v7。
+
+**rtcal 转正 + RTC 写时间被策略门挡（2026-09-02）。** /tmp 的 zig 一次性
+rtcal 转正为 `boot/rootfs/src/rtcal.c`（zig cc musl static，进 rootfs 配方
+→ /bin/rtcal），子命令：无参=dump（since_epoch+alarm）、`set <epoch>`=
+布防（沿旧语义，探针不换脚本）、`arm <+delta|epoch>`、`sync`=系统时间
+写入 RTC（先解除残留闹钟防时跳后立即触发）。设备实测：`arm +15` 醒态
+准点触发（IRQ 203 计数 0→1，触发后 enabled 自动归 0），dump 正常；
+设备 /var/tmp/rtcal 已换 C 版（zig 版备份为 -zig.bak，源已失传）。
+**`sync` 被拒：RTC_SET_TIME → EACCES** —— pm8xxx_rtc 驱动的 allow_set_time
+策略门（DT 未声明 `qcom,allow-set-time`，set_time 按设计返回 -EACCES；
+读时间/闹钟布防不受限，与我们的醒/唤醒路径无冲突）。net-bringup 的
+ntpd 后 `rtcal sync` 钩子已埋（best-effort），在 DTB 补丁打开开关前
+静默失败。**待办：如需真时间进 RTC，给 vendor_boot/boot DTB 的 rtc
+节点加 qcom,allow-set-time 再刷**——收益仅限开机早期 wall 正确（ntpd
+本就纠正）与刻度整洁，不在关键路径上，暂不做。−53y 偏置下闹钟自洽
+刻度已验证精确（v7 十二循环 121s 全准点）。
