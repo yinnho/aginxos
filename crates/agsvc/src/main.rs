@@ -40,6 +40,10 @@ const READY_TIMEOUT_S: u64 = 60;
 /// SIGTERM -> SIGKILL escalation window on stop.
 const STOP_KILL_MS: u64 = 2_000;
 const TICK_MS: u64 = 200;
+/// M20c watchdog: timeout held on /dev/watchdog, and pet cadence (12x
+/// margin, so a busy loop may skip pets without tripping the dog).
+const WDT_TIMEOUT_S: i32 = 180;
+const WDT_PET_MS: u64 = 15_000;
 
 static TERM: AtomicBool = AtomicBool::new(false);
 
@@ -693,6 +697,89 @@ fn next_deadline(runs: &BTreeMap<String, Run>, now: Instant) -> Option<Instant> 
         .map(|d| d.max(now))
 }
 
+// M20c: software-watchdog heartbeat. /dev/watchdog on this platform is
+// softdog behind the watchdog_v2 (platform:msm_watchdog) driver — dmesg
+// says "wdog absent resource not present" (the APPS-side hardware bark
+// resources are missing from this DT, which is why the M14 bad-kernel
+// hang sat dark with no rescue), and the 2026-09-02 starve test proved
+// the soft dog still hard-resets an unpetted box. Contract: agsvc pets
+// from its supervision loop, so "supervisor alive" keeps the box up and
+// a wedged supervisor (STOP, deadlock, a runaway unit starving the
+// loop) resets it — ABL drains a boot try and M14's rollback takes
+// over. A hung KERNEL is outside this dog's reach (the timer dies with
+// it); that class is fenced by agupd's verify-before-write instead.
+// Opening arms the dog for the life of the kernel (nowayout — the
+// starve test never closed and still reset), which is what we want:
+// there is no legitimate state where agsvc stops petting.
+struct Wdt {
+    fd: Option<RawFd>,
+    last: Instant,
+    warned: bool,
+}
+
+// <linux/watchdog.h> numbers (no libc crate bindings for these). NB:
+// SETTIMEOUT is _IOWR (0xC0.., the driver writes back the timeout it
+// accepted) — a _IOW guess gets ENOTTY from this driver, measured
+// 2026-09-02. KEEPALIVE is _IOR. c_int because musl's ioctl takes the
+// request as int (unlike glibc's unsigned long).
+const WDIOC_SETTIMEOUT: libc::c_int = 0xC004_5706u32 as libc::c_int;
+const WDIOC_KEEPALIVE: libc::c_int = 0x8004_5705u32 as libc::c_int;
+
+impl Wdt {
+    fn new() -> Self {
+        Wdt {
+            fd: None,
+            last: Instant::now(),
+            warned: false,
+        }
+    }
+
+    // Lazy open: watchdog_v2 loads during the vendor module pass, which
+    // races our start — retry quietly on each pet until the node appears.
+    fn arm(&mut self) {
+        let path = b"/dev/watchdog\0";
+        let fd = unsafe {
+            libc::open(path.as_ptr() as *const libc::c_char, libc::O_WRONLY | libc::O_CLOEXEC)
+        };
+        if fd < 0 {
+            if !self.warned {
+                kmsg("agsvc: wdt: /dev/watchdog not there yet — petting starts when it appears\n");
+                self.warned = true;
+            }
+            return;
+        }
+        let mut t = WDT_TIMEOUT_S;
+        let rc = unsafe { libc::ioctl(fd, WDIOC_SETTIMEOUT, &mut t as *mut libc::c_int) };
+        match rc {
+            0 => kmsg(&format!("agsvc: wdt armed, timeout={t}s, petting every {}s\n", WDT_PET_MS / 1000)),
+            _ => {
+                let e = std::io::Error::last_os_error();
+                kmsg(&format!("agsvc: wdt: SETTIMEOUT: {e} (continuing armed at driver default)\n"));
+            }
+        }
+        self.fd = Some(fd);
+    }
+
+    fn pet(&mut self, now: Instant) {
+        if self.fd.is_none() {
+            self.arm();
+            if self.fd.is_none() {
+                return;
+            }
+        }
+        if now.duration_since(self.last).as_millis() < WDT_PET_MS as u128 {
+            return;
+        }
+        self.last = now;
+        let fd = self.fd.unwrap();
+        if unsafe { libc::ioctl(fd, WDIOC_KEEPALIVE, 0) } < 0 && !self.warned {
+            let e = std::io::Error::last_os_error();
+            kmsg(&format!("agsvc: wdt: keepalive: {e}\n"));
+            self.warned = true;
+        }
+    }
+}
+
 fn main() {
     setup_signals();
     std::fs::create_dir_all("/run/svc").ok();
@@ -727,6 +814,7 @@ fn main() {
         }
     }
     kmsg(&format!("agsvc: supervisor up, {n} units\n"));
+    let mut wdt = Wdt::new();
 
     loop {
         if TERM.load(Ordering::SeqCst) {
@@ -784,6 +872,7 @@ fn main() {
         }
         svc.reap(Instant::now());
         svc.tick(Instant::now());
+        wdt.pet(Instant::now());
     }
 
     // shutdown: TERM everyone, escalate, exit. Reboot takes the machine

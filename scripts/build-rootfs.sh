@@ -120,6 +120,12 @@ echo "built preload helpers (trace_open.so, fake-props.so)"
 # args it plain-reboots; "bootloader" lands in fastboot for re-flashing.
 "${ZIG}" cc -target aarch64-linux-musl -static -O2 \
   -o "${TREE}/bin/reboot2" "${RECIPE}/src/reboot2.c"
+# wdt (M20c): watchdog probe/arm/starve for /dev/watchdog. The dog itself
+# is armed and petted by agsvc (crates/agsvc); this is the diagnostics
+# tool that proved the platform story (softdog behind msm_watchdog,
+# hardware bark resources absent) and the live-fire starve reset.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/wdt" "${RECIPE}/src/wdt.c"
 # nlscan: nl80211 trigger-scan + dump client — busybox has no wireless tools
 # and we ship no libnl. Our WLAN operability check (M3f).
 "${ZIG}" cc -target aarch64-linux-musl -static -O2 \
@@ -220,7 +226,8 @@ chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/usr/bin/wifi-wizard" "${TREE}/usr/bin/agsvc" \
   "${TREE}/usr/bin/agctl" "${TREE}/usr/bin/agboot-ok" \
   "${TREE}/usr/bin/agupd" \
-  "${TREE}/usr/bin/net-rejoin" "${TREE}/usr/bin/net-watch"
+  "${TREE}/usr/bin/net-rejoin" "${TREE}/usr/bin/net-watch" \
+  "${TREE}/bin/wdt"
 # NB: wifi.conf.example rides along in ${RECIPE}/etc — the real
 # /etc/wifi.conf (with the passphrase) is pushed by hand, never committed.
 cp "${TARGET}/aginxos-init" "${TARGET}/aginxos-agent" "${TREE}/aginxos/"
