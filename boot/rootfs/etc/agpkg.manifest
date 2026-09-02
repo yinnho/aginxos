@@ -16,7 +16,7 @@
 # (M10, /health + /fetch ok). All sha256 match the on-device installs.
 
 aginx          https://github.com/yinnho/aginx/releases/download/v0.3.2/aginx-aarch64-unknown-linux-musl 1f8134d0d7bbead9ffcff9c7c1cb1499f3fcc10b4c7f3db7f44e41d658991690
-aginx-carrier  https://github.com/yinnho/aginx-carrier/releases/download/v0.1.0/aginx-carrier-v0.1.0-aarch64-unknown-linux-musl 6fbf5c9cb73c5a3ab8b6e8c58dd5de0165499bed357eb1667054b33569be53d0
+aginx-carrier  https://github.com/yinnho/aginx-carrier/releases/download/v0.2.1/aginx-carrier-v0.2.1-aarch64-unknown-linux-musl bbac10170c4645d0e0df374bbf10d6ca2edb8992c9cb5ce5933cff981a008d02
 aginxbrowser   https://github.com/yinnho/aginxos/releases/download/aginxbrowser-v0.2.5/aginxbrowser-v0.2.5-aarch64-unknown-linux-musl 5561e6287d6b146a94170bb71fc2c5b0ff0e9e6cfd0aa0a8ea84a21d630a99e6
 codex          https://github.com/yinnho/aginxos/releases/download/codex-v0.151.0/codex-v0.151.0-aarch64-unknown-linux-musl 56f026015ccc3ebc12895282200d89c216892bf6fa15fa7f228e6e0c6ad6ce76
 # grok is optional since M23 (选装 tier): an agent CLI like codex, but
