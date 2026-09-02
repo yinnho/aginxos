@@ -328,6 +328,15 @@ ROOTFS="${ROOTFS:-0}"
 if [[ "${ROOTFS}" == "1" ]]; then
   : >"${WORK}/aginxos/rootfs"
   echo "note: ROOTFS=1 → aginxos-init switch_roots into the userdata rootfs"
+  # The rootfs world's adbd re-opens the ffs endpoints the trampoline's
+  # console set up; without USBADB there is no gadget at all and the
+  # booted system is unreachable (observed 2026-09-02: a ROOTFS=1-only
+  # image bootlooped slot b to rollback — no modules.usb, no toybox sh,
+  # no props). The working set is HOLD=1 USBADB=1 ROOTFS=1.
+  if [[ "${USBADB}" != "1" ]]; then
+    echo "error: ROOTFS=1 without USBADB=1 produces an unreachable system — refusing (use HOLD=1 USBADB=1 ROOTFS=1)" >&2
+    exit 1
+  fi
 fi
 # KEEPADBD=1 (diagnostic): with ROOTFS, do not kill the trampoline's adbd at
 # the switch — it survives chroot and keeps the console alive in the new root.

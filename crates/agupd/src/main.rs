@@ -209,7 +209,9 @@ fn stage_state_tar(staging_root: &str) {
 /// the bytes, the manifest says what they must hash to.
 fn commit_rootfs_swap(img: &Image) {
     let dev = "/dev/block/by-name/userdata";
-    let dst = OpenOptions::new().write(true).open(dev)
+    // read+write: the pre-staged body is verified by pread ON the blkdev —
+    // a write-only fd fails that pread with EBADF (observed 2026-09-02).
+    let dst = OpenOptions::new().read(true).write(true).open(dev)
         .unwrap_or_else(|e| die(&format!("open {dev} rw: {e}")));
     let fd = dst.as_raw_fd();
     let len = match std::fs::metadata(&img.url) {

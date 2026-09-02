@@ -259,5 +259,9 @@ cp "${CACERT}" "${TREE}/etc/ssl/certs/ca-certificates.crt"
 ln -sf certs/ca-certificates.crt "${TREE}/etc/ssl/cert.pem"
 
 mkdir -p "${ROOT}/out"
+# rm first: mke2fs never truncates an existing output file, so a SIZE
+# change leaves stale bytes past the new fs end (a 2g image stayed 2 GiB
+# after re-baking at 1g — the tail was the old image, 2026-09-02).
+rm -f "${IMG}"
 "${MKE2FS}" -t ext4 -b 4096 -F -d "${TREE}" "${IMG}" "${SIZE}"
 echo "built ${IMG} ($(du -h "${IMG}" | cut -f1)) from ${TREE}"

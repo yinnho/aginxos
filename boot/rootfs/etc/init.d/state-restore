@@ -11,37 +11,60 @@
 # Marker layout (must match agupd STATE_OFF): block 16777216 (64 GiB in
 # 4K blocks) holds the header; the tar follows at block 16777217.
 #
-# A stale marker (update crashed after the state write but before the
-# swap) restores the same data onto the same fs — a harmless no-op. An
-# old rootfs without this script simply ignores it.
-export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+# Logging contract: this runs BEFORE rcS mounts devtmpfs (line ~25), and
+# at that point /dev is still the initramfs bind — which has console,
+# null and the block nodes but NO /dev/kmsg. A bare `echo > /dev/kmsg`
+# redirect failure ABORTS the whole script in busybox ash: the first
+# swap boot (2026-09-02) died exactly there — "marker found" never
+# printed, the tar was never extracted, the marker survived the boot.
+# So every message goes through kmsg(), which picks a writable sink.
+kmsg() {
+  if [ -w /dev/kmsg ]; then echo "state-restore: $*" > /dev/kmsg
+  else echo "state-restore: $*" >> /var/state-restore.log 2>/dev/null || true
+  fi
+}
 
 UD=/dev/block/by-name/userdata
 BLK=16777216   # 64 GiB / 4096 — agupd STATE_OFF
 
-[ -b "$UD" ] || exit 0
+# Full self-capture: swap boots are rare and the kernel ring may be long
+# gone by the time anyone looks — this file is the durable receipt (ash's
+# own error lines land here too; they are what cracked the 2026-09-02
+# octal-abort mystery). Grows a few lines per swap boot only.
+exec >> /var/state-restore.log 2>&1
+echo "=== state-restore start $(date +%H:%M:%S) up=$(cut -d. -f1 /proc/uptime) ==="
+
+[ -b "$UD" ] || { kmsg "no $UD node — skipping"; exit 0; }
 # tr -d '\0' first: $( ) drops NUL bytes, which would shift every
 # following byte and corrupt the cut offsets below.
 hdr=$(dd if="$UD" bs=4096 skip=$BLK count=1 2>/dev/null | tr -d '\000')
 magic=$(printf '%s' "$hdr" | head -c 8)
-[ "$magic" = "AGXSTATE" ] || exit 0
+[ "$magic" = "AGXSTATE" ] || { kmsg "no marker (magic='${magic:-empty}') — fresh boot"; exit 0; }
 len=$(printf '%s' "$hdr" | cut -c9-24 | tr -d ' ')
+# busybox ash $(( )) parses leading-zero numbers as OCTAL — the marker
+# stores the length zero-padded to 16 digits, so the unstripped value
+# aborts this script with "arithmetic syntax error" at the first $(( ))
+# (proven on device 2026-09-02: three silent no-restore boots; the
+# manual runs that "worked" all went through toybox sh, which is
+# decimal-tolerant). Strip the padding before any arithmetic touches it.
+while [ "$len" != "${len#0}" ]; do len=${len#0}; done
+[ -n "$len" ] || len=0
 case "$len" in
-  ''|*[!0-9]*) echo "state-restore: bad length field" >&2; exit 1 ;;
+  ''|*[!0-9]*) kmsg "bad length field — keeping marker for manual retry"; exit 1 ;;
 esac
-[ "$len" -gt 0 ] || exit 1
+[ "$len" -gt 0 ] || { kmsg "zero length — keeping marker"; exit 1; }
 
 nblk=$(( (len + 4095) / 4096 ))
-echo "state-restore: marker found (${len} B tar) — restoring" > /dev/kmsg
+kmsg "marker found (${len} B tar) — restoring"
 dd if="$UD" of=/tmp/state.tar bs=4096 skip=$((BLK + 1)) count=$nblk 2>/dev/null
 truncate -s "$len" /tmp/state.tar 2>/dev/null || dd if=/dev/zero of=/tmp/state.tar bs=1 seek="$len" count=0 2>/dev/null
 if tar -xf /tmp/state.tar -C / 2>/dev/null; then
-  echo "state-restore: ok" > /dev/kmsg
+  kmsg "ok"
 else
-  echo "state-restore: tar extract FAILED — keeping marker for manual retry" > /dev/kmsg
+  kmsg "tar extract FAILED — keeping marker for manual retry"
   rm -f /tmp/state.tar
   exit 1
 fi
 rm -f /tmp/state.tar
 dd if=/dev/zero of="$UD" bs=4096 seek=$BLK count=1 conv=notrunc 2>/dev/null
-echo "state-restore: marker cleared" > /dev/kmsg
+kmsg "marker cleared"
