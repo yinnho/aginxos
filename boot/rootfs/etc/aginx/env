@@ -1,0 +1,7 @@
+# aginx unit env (M20a, 2026-09-02). The original env was lost before the
+# 0831 backup; the minimal working set proven on device is HOME alone —
+# everything else (relay endpoint, identity) lives in $HOME/.aginx/
+# (config.toml/binding.json), which is per-device data restored from the
+# pre-bake backup, never baked. If a unit needs more vars later, add them
+# here; secrets still belong on the device only, not in this file.
+HOME=/home

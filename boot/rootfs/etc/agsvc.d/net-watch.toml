@@ -1,0 +1,10 @@
+# net-watch (M20b) — steady-state network self-heal. Rejoins the AP in
+# place when the link dies (net-rejoin), so an unattended device rides
+# out AP flaps without a human. type = simple: a sleeping shell loop is
+# the service; agsvc's init-respawn chain covers the supervisor itself.
+[unit]
+name = net-watch
+
+[service]
+cmd = /usr/bin/net-watch
+type = simple

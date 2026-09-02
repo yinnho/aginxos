@@ -4,8 +4,8 @@
 // /etc/wifi.conf is missing, and it keeps a "WIFI SETUP" button for
 // re-config). Flow: nlscan -> numbered AP list -> password prompt ->
 // write /etc/wifi.conf (0600) -> run net-bringup in the foreground so the
-// user sees join/dhcp/internet live -> offer reboot so the services that
-// were skipped at boot get started.
+// user sees join/dhcp/internet live -> nudge the relay units in place
+// (M20b: never a whole-device reboot; net-watch owns steady-state).
 //
 // ASCII only (v1 has no CJK input): SSIDs that nlscan renders with '?'
 // can't be selected — they are shown but marked unjoinable.
@@ -182,11 +182,13 @@ fn main() {
                     if connect() {
                         println!();
                         println!("network is up.");
-                        if prompt("reboot now so services start? [y/N]: ")
-                            .eq_ignore_ascii_case("y")
-                        {
-                            let _ = Command::new("/bin/reboot2").arg("reboot").status();
-                        }
+                        // No reboot offer anymore (M20b): the relay units
+                        // reconnect on their own retry loops, a restart
+                        // covers anything the circuit breaker parked, and
+                        // net-watch owns steady-state healing from here.
+                        let _ = Command::new("/usr/bin/agctl").arg("restart").arg("aginx").status();
+                        let _ = Command::new("/usr/bin/agctl").arg("restart").arg("aginx-carrier").status();
+                        println!("relay services nudged in place (agctl restart) — no reboot needed.");
                         return;
                     }
                     println!();
