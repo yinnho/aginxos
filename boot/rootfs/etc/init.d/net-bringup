@@ -115,6 +115,12 @@ if HTTP=$(/bin/httpget http://www.baidu.com/ /tmp/baidu.html 2>&1); then
   if ntpd -q -n -p ntp.aliyun.com >/dev/null 2>&1; then
     say time ok "$(date +%Y-%m-%d)"
     echo "clock synced: $(date)"
+    # M23b: push the corrected clock into the PMIC RTC. It lives on its own
+    # -53y scale until this runs, so early-boot wall time is 1970 and RTC
+    # alarm math needs the offset carried around. Best-effort like ntpd.
+    if [ -x /bin/rtcal ]; then
+      /bin/rtcal sync && echo "rtc synced to system time"
+    fi
   else
     say time fail "ntpd"
     echo "ntpd failed — TLS validation may break until the clock is fixed"

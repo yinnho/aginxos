@@ -126,6 +126,12 @@ echo "built preload helpers (trace_open.so, fake-props.so)"
 # hardware bark resources absent) and the live-fire starve reset.
 "${ZIG}" cc -target aarch64-linux-musl -static -O2 \
   -o "${TREE}/bin/wdt" "${RECIPE}/src/wdt.c"
+# rtcal (M23b): pm8xxx RTC alarm arm/read + `sync` — the suspend probes' wake
+# path ("set <epoch>" semantics kept from the /tmp zig one-off). net-bringup
+# runs `rtcal sync` after ntpd to fix the RTC's -53y offset, which also makes
+# early-boot wall time true on the next HCTOSYS pass.
+"${ZIG}" cc -target aarch64-linux-musl -static -O2 \
+  -o "${TREE}/bin/rtcal" "${RECIPE}/src/rtcal.c"
 # nlscan: nl80211 trigger-scan + dump client — busybox has no wireless tools
 # and we ship no libnl. Our WLAN operability check (M3f).
 "${ZIG}" cc -target aarch64-linux-musl -static -O2 \
