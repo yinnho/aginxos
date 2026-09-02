@@ -4334,3 +4334,45 @@ date"（M26 的 stamp+binary 双闸在位，零重下）；/var/lib/ag/done 由 
 clone-creator running。**第二启 77s 到位（与首启同速）**、四件仍全 up
 to date、单元全 ready、标记区空——幂等快道 ✓。设备终态：烤 #8 fs +
 推送 agdone/ag-done shim/provision v2；slot _b；无悬挂 swap 头。
+
+### M28 — python3 core tier（musl CPython 四件套树包 + finalize 首租户）（2026-09-03）
+
+**件**：agpkg 长出**树包**（四件套扩展）：tar 内 `files/` 整树流式落
+`/var/lib/agpkg/pkgfiles/<name>/`（保留 tar mode + 树内软链；拒绝绝对
+链目标；单成员仍限 256MiB；整树不进内存——CPython 树 45MB 起步），
+pkg.toml `exec = "bin/python3"` 声明脸位 → `/var/bin/python3` 是指向树内
+的**相对软链**（CPython 走 /proc/self/exe 定位 stdlib，无需 PYTHONHOME；
+软链锚点是链接所在目录——首版按链接全路径算 `..` 数错了一层，host
+装真工件时抓到）。exec 与平铺 bin/<name> 二选一，都有即拒；错误码
+pkg_face_twice/pkg_exec/pkg_unsafe_link。sync 的 up-to-date 闸（M26）
+对树包自然成立：树被抹 → 脸悬空 → exists()=false → 重下。
+
+**工件**：astral python-build-standalone `cpython-3.12.14+20260901`
+aarch64-unknown-linux-musl install_only_**stripped**（上游 sha256
+a0ad6f01…），裁 86M→45M：去 tkinter/tcl/tk 链（~9.7M）、include/、
+share/、libpython3.12.so.1.0（exe 静态链 libpython，lib-dynload NEEDED
+只有 libc.so——22M 白送）。**关键坑：PBS musl 构建是动态链
+`/lib/ld-musl-aarch64.so.1`**（内核 ELF 解释器路径，写死）——本机全家
+静态、无 musl 加载器。解法：树内带 Alpine 3.20 musl 1.2.5 的
+ld-musl-aarch64.so.1（723KB，musl 无符号版本化，1.2.5 跑 Clang 22 新构
+无缺符号——实测），finalize 链到 /lib。镜像 yinnho/aginxos
+python3-v3.12.14（GitHub API digest=sha256:23923ffe… 与本地一致）；
+manifest 加 core 行 + 重签。
+
+**provision finalize 首租户**（agdone 纪律实战）：python3 在 → 链
+loader → `python3 -c 'import sys,ssl,sqlite3,socket,json'` + `pip
+--version` 双验 → 过才 `ag done mark python-finalize`；sync 失败/离线
+→ python3 缺 → 不落标，下靴重试。_system SKILL（"保证 python3，不保
+证 node"）每靴覆写种子。
+
+**实测**：设备 sync 经 gh-proxy 兜底装成（直连 github TLS 又掉，
+retry 兜住——M10 的韧性路径）；手动链 loader 后 `python3 -V` =
+3.12.14、ssl/sqlite3/socket/json 全过、pip 26.2.1 可用、
+`pip install six` 装成 import 1.17.0（musllinux wheel 链路通）。
+**删标 + 删 /lib loader + 重启**：finalize 经 provision 真跑——
+boot.state 出 `py ok 3.12.14 (main, Sep 1 2026…`、loader 重链、标重写、
+python3 可用 ✓。带标靴 finalize 静默跳过（纪律目的）；81s 靴无回归；
+`ag pkg list` 出 python3（skill 标）；`ag commands --check` 18 OK。
+设备终态：烤 #8 fs + 推送 agpkg(90f3f5d8)/provision/manifest(c0d490d3
++python3 23923ffe)+sig；pkgfiles/python3 54.9M；标 python-finalize；
+slot _b。离线靴：python3 运行路径无网依赖（标在则 finalize 都不跑）。
