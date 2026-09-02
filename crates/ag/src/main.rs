@@ -305,16 +305,16 @@ fn print_json(all: bool) -> i32 {
         }));
     }
     let count = recs.len();
-    let env = serde_json::json!({
-        "ok": true,
-        "data": recs,
-        "meta": {
+    // D1 信封转正走 agio（M25）——形状与 M24 的手写版逐字节同构。
+    let env = agio::ok_meta(
+        serde_json::Value::Array(recs),
+        serde_json::json!({
             "count": count,
             "cmd_path": cmd_path_env(),
             "groups_desc": meta::load_groups().len(),
-        },
-    });
-    println!("{}", serde_json::to_string(&env).unwrap_or_default());
+        }),
+    );
+    agio::print(&env);
     0
 }
 

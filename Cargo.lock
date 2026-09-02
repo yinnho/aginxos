@@ -6,6 +6,7 @@ version = 4
 name = "ag"
 version = "0.1.0"
 dependencies = [
+ "agio",
  "libc",
  "serde_json",
 ]
@@ -40,6 +41,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
+]
+
+[[package]]
+name = "agio"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
