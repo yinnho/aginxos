@@ -4418,3 +4418,56 @@ m27 13、m28 11 = 63 断言。m24 头条照旧是 Omarchy 事故类：
 
 设备终态：无变化（套件只读 + accept-m27 草稿标已自清）；烤 #8 fs、
 slot _b、python-finalize 带标不变。
+
+### M30 — 化身注册 + agent install --file + dup 上机（首个四件套包）（2026-09-03）
+
+三件：dup CLI 搬进 aginx-carrier workspace（M30a，carrier 仓提交
+9f05566）、`agent install --file <tar>` + `--dry-run` 权限预览（M30b，
+carrier 仓提交 fd8a712）、dup 作为第一个四件套 agpkg 包上机 + 全链
+设备验收（M30c，本条）。
+
+**构建**：cargo zigbuild aarch64-unknown-linux-musl 双产物——
+aginx-carrier 27.6MB、dup 4.6MB，均 static stripped。四件套 tar
+（bin/dup + pkg.toml + SKILL.md）sha256
+652f9d58…c32a82；**首包被 agpkg 拒**：flat bin/dup 成员 + pkg.toml
+`exec` 同时存在 = pkg_face_twice（exec 只用于 files/ 树 symlink 面，
+python3 形态）——去 exec 行后装成。macOS 打 tar 必 COPYFILE_DISABLE=1
+（AppleDouble ._ 成员；carrier 侧 tar_source 也已卫生跳过）。
+
+**上机实测**（均 adb 推 + md5 验证 + chmod 755）：
+- `agpkg install dup /data/local/tmp/dup-4pc.tar <sha>` rc 0 →
+  /var/bin/dup 755、`dup 0.2.0`、SKILL.md 落 /var/lib/agpkg/skills/dup/、
+  无 agsvc 单元（pkg.toml 无 [service]，预期）。
+- dup 离线本地环全通：dummy env（OPENCARRIER_URL/KEY）`dup init`
+  落 .dup/state.json → 加文件 `dup commit` 出短 id、`dup log` 带
+  消息、`dup status` 干净。网络面（pull/push）未测——duphub auth 等
+  M36 sidecar。
+- 新 aginx-carrier（HOME=/home 面）`ag agent install accept-m30
+  --file clone.tar --dry-run` → 预检通过 + flow/shell 权限预览 +
+  未安装（workspace 确实没落）；真装 → 已安装 + workspace 全树
+  （AGENT.json/agent.toml/flows/history/knowledge/logs/profile.md/
+  sessions）；坏 tar（flow 缺 description）--dry-run rc 1 报
+  「预检未通过」；remove 干净。
+- ag-agent shim 元数据升 v1 全景（--file/--dry-run/remote）；
+  `ag agent --help` 拦截出 usage、`ag commands --check` 18 OK。
+
+**真缺陷（M30c 实测抓到）**：adb shell 的 HOME=/（adbd 原生，不读
+/etc/aginx/env——那只喂 agsvc 单元）→ CLI 面 `ag agent install` 把
+注册表/workspace 劈到 **/.aginx** 开了第二真源（daemon 在
+/home/.aginx）。已清：HOME=/ 卸载 + rm -rf /.aginx，重装落
+/home/.aginx/carrier/workspaces/。**修复**：accept lib drv() 钉
+HOME=/home（aterm 面本就设 /home 不受影响）；裸 adb 手工操作须自觉
+export HOME=/home。
+
+**验收**：新增 scripts/accept/m30-agent.sh 30 断言全绿（dup 产物 4 +
+离线环 9 + install --file 12 + 清理 5）；六存量套件回归无恙（63 断
+言）；host `check.sh lint` 18 OK。套件自举期抓到 dev 侧错一处：
+expect_py 参数序（name, expr）我写反——bash -x 才看见 expr 被展开成
+名字。
+
+设备终态：dup 四件套装成（/var/bin/dup，v0 手装、不在 manifest）；
+/var/bin/aginx-carrier = 本地 v0.2.0-dev 构建（27.6MB，daemon pid 1254
+仍执旧 inode 至下次重启；manifest 仍钉 v0.2.1 release——下次
+provision sync 或换机自愈会拉回，**manifest 行 + release 资产待
+「推送」后补**）；/usr/bin/ag-agent shim 已更新（烤盘同款，重烤折叠）。
+注册表终态 = clone-creator + me（accept-m30 已卸），/.aginx 已清。
