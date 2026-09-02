@@ -1,36 +1,61 @@
-// agboot-ok — mark the active A/B slot boot-successful in the GPT
-// partition-table attributes (M16; the fastboot-loop fix).
+// agboot-ok — A/B slot attribute maintenance in the GPT (M16/M14).
 //
 // On redfin the slot state is NOT a bootloader_control block in misc —
 // misc's vendor space holds recovery's "theme-dark" string and nothing
-// else (probed 2026-08-31: no TCAB anywhere in misc, devinfo, ssd,
-// uefivarstore, klog; only klog's UEFI log tail changes across boots).
-// The store is the GPT itself: bootctrl.lito.so links gpt_disk_*/gpt_utils_*
-// and keeps the slot flags in the partition-entry attribute u64 of every
-// *_a / *_b entry, replicated across the per-LUN GPTs of /dev/sda../sdf
-// (sdb/sdc carry the xbl chains). Observed bits:
+// else (probed 2026-08-31). The store is the GPT itself: the partition
+// entry attribute u64 of every *_a / *_b entry, replicated across the
+// per-LUN GPTs of /dev/sda../sdf (sdb/sdc carry the xbl chains).
 //
-//   48-51  priority
-//   52-55  tries remaining (drains one per unmarked-successful boot)
-//   56     successful boot
+// The attribute layout is Qualcomm's uefi.lnx.3.0 one (ABL r3-0.6 on
+// this device), NOT the AOSP boot_control layout. Verified on device
+// 2026-09-02 against QRD ABL r12 source (PartitionTableUpdate.c) and
+// the observed attr transitions of live slot switches and rollbacks:
 //
-// Before this tool our boots ran unmarked: boot_a sat at pri=15 tries=0
-// succ=0, one ABL view away from "slot a unbootable" — after which it
-// falls through to slot b (stock boot_b + stock vendor_boot_b on our ext4
-// userdata, which Android first_stage would format).
+//   bits 48-49  priority        (max 3, MAX_PRIORITY)
+//   bit  50     ACTIVE          — the slot selector's gate: GetActiveSlot()
+//                                 only considers entries with this bit;
+//                                 priority alone selects nothing
+//   bits 51-53  tries remaining (max 7; drained one per unmarked boot)
+//   bit  54     successful boot
+//   bit  55     unbootable
+//   bits 56-63  unused by ABL (60 is the GPT-spec readonly bit)
 //
-// `agboot-ok` sets successful + tries=7 on every *<suffix> entry of the
-// active slot (suffix from androidboot.slot_suffix on the kernel cmdline),
-// rewriting the primary and backup entry arrays with refreshed CRCs and
-// both GPT headers. Attribute bits only — start/length/name are never
-// touched, so the running kernel's partition view stays valid.
-// `agboot-ok status` dumps the whole slot table read-only.
+// A full switch in newer ABLs additionally swaps the _a/_b type GUIDs
+// and flips the UFS boot LUN (SwitchPtnSlots/ValidateSlotGuids in the
+// r12 source). This device's older ABL does not gate on either — proven
+// 2026-09-02: attrs-only `set-active` switched the OS slot a→b and b→a
+// with full bringup, MarkPtnActive flipping ACTIVE on every LUN, and
+// ABL's own rollback (tries=0 → unbootable → alternate → cold reboot)
+// running to completion. So userspace owns the whole switch here; we
+// leave the GUID swap to ABL's rollback path, which performs it itself
+// when it needs to.
+//
+// Modes:
+//   agboot-ok                 mark the ACTIVE slot successful (rcS, after
+//                             a `done ok` boot): succ+tries+ACTIVE on its
+//                             boot entry, ACTIVE on its other entries —
+//                             this is what stops ABL's per-boot tries drain
+//   agboot-ok status          dump the whole slot table, read-only
+//   agboot-ok set-active X    switch the boot target to slot X: per ABL
+//                             SetActiveSlot — boot entry of X gets pri 3 +
+//                             ACTIVE + tries 7 (succ cleared, unbootable
+//                             cleared), X's other entries get ACTIVE, the
+//                             other boot entry loses ACTIVE and drops to
+//                             pri 2. Takes effect on the next reboot; the
+//                             drain then gives 7 unmarked boots before ABL
+//                             rolls back to the other slot on its own.
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
 
+const PRI_MAX: u64 = 3;
+const PRI_DEMOTE: u64 = 2; // MAX_PRIORITY - 1, per ABL SetActiveSlot
 const TRIES: u64 = 7;
-const ATTR_TRIES: u64 = 52;
-const ATTR_SUCCESS: u64 = 56;
+
+const ATTR_PRIORITY: u64 = 0x3 << 48;
+const ATTR_ACTIVE: u64 = 1 << 50;
+const ATTR_TRIES: u64 = 0x7 << 51;
+const ATTR_SUCCESS: u64 = 1 << 54;
+const ATTR_UNBOOTABLE: u64 = 1 << 55;
 
 struct Gpt {
     dev: String,
@@ -85,11 +110,11 @@ impl Gpt {
         .unwrap_or(512);
         let mut hdr = vec![0u8; lbs as usize];
         if !rd(&f, &mut hdr, lbs) {
-            if std::env::var("AGBOOT_DEBUG").is_ok() { eprintln!("dbg: {dev}: header read failed"); }
+            if dbg() { eprintln!("dbg: {dev}: header read failed"); }
             return None; // not a GPT disk (or not a disk at all)
         }
         if &hdr[0..8] != b"EFI PART" {
-            if std::env::var("AGBOOT_DEBUG").is_ok() { eprintln!("dbg: {dev}: bad sig {:?}", &hdr[0..8]); }
+            if dbg() { eprintln!("dbg: {dev}: bad sig {:?}", &hdr[0..8]); }
             return None;
         }
         let num = u32at(&hdr, 80) as usize;
@@ -100,7 +125,7 @@ impl Gpt {
         let entry_lba = u64at(&hdr, 72);
         let mut entries = vec![0u8; num * esz];
         if !rd(&f, &mut entries, entry_lba * lbs) {
-            if std::env::var("AGBOOT_DEBUG").is_ok() { eprintln!("dbg: {dev}: entries read failed at lba {entry_lba}"); }
+            if dbg() { eprintln!("dbg: {dev}: entries read failed at lba {entry_lba}"); }
             return None;
         }
         if u32at(&hdr, 88) != crc32(&entries) {
@@ -110,7 +135,7 @@ impl Gpt {
         let bak_hdr_lba = u64at(&hdr, 32);
         let mut bak_hdr = vec![0u8; lbs as usize];
         if !rd(&f, &mut bak_hdr, bak_hdr_lba * lbs) || &bak_hdr[0..8] != b"EFI PART" {
-            if std::env::var("AGBOOT_DEBUG").is_ok() { eprintln!("dbg: {dev}: backup header unreadable at lba {bak_hdr_lba}"); }
+            if dbg() { eprintln!("dbg: {dev}: backup header unreadable at lba {bak_hdr_lba}"); }
             return None; // truncated tail read; skip disk rather than guess
         }
         let bak_entries_lba = u64at(&bak_hdr, 72);
@@ -163,27 +188,13 @@ impl Gpt {
     }
 }
 
-fn main() {
-    let dbg = std::env::var("AGBOOT_DEBUG").is_ok();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let status = args.first().map(String::as_str) == Some("status");
+fn dbg() -> bool {
+    std::env::var("AGBOOT_DEBUG").is_ok()
+}
 
-    let suffix = std::fs::read_to_string("/proc/cmdline")
-        .ok()
-        .and_then(|c| {
-            c.split_whitespace().find_map(|t| {
-                let v = t.strip_prefix("androidboot.slot_suffix=")?;
-                let v = v.trim_matches('"');
-                (v == "_a" || v == "_b").then(|| v.to_string())
-            })
-        })
-        .unwrap_or_else(|| {
-            eprintln!("agboot-ok: no androidboot.slot_suffix on cmdline, assuming _a");
-            "_a".to_string()
-        });
-
-    // Every LUN holding an A/B GPT. Names, not /dev/sdX guesses: resolve
-    // through /dev/block/by-name so we only touch disks we can see.
+/// Every LUN holding an A/B GPT. Names, not /dev/sdX guesses: resolve
+/// through /dev/block/by-name so we only touch disks we can see.
+fn ab_disks() -> Vec<String> {
     let mut disks: Vec<String> = Vec::new();
     if let Ok(rd) = std::fs::read_dir("/dev/block/by-name") {
         for e in rd.filter_map(|e| e.ok()) {
@@ -199,62 +210,197 @@ fn main() {
         }
     }
     disks.sort();
-    if dbg {
-        eprintln!("dbg: suffix={suffix} disks={disks:?}");
-    }
+    disks
+}
 
+/// Active slot from the kernel cmdline — `_a`/`_b`.
+fn slot_suffix() -> Option<String> {
+    std::fs::read_to_string("/proc/cmdline").ok().and_then(|c| {
+        c.split_whitespace().find_map(|t| {
+            let v = t.strip_prefix("androidboot.slot_suffix=")?;
+            let v = v.trim_matches('"');
+            (v == "_a" || v == "_b").then(|| v.to_string())
+        })
+    })
+}
+
+fn print_table(g: &Gpt) {
+    for (n, a, _) in g.entries() {
+        if n.ends_with("_a") || n.ends_with("_b") {
+            println!(
+                "{:14} {:18} pri={} act={} tries={} succ={} unboot={} raw={:016x}",
+                g.dev,
+                n,
+                (a >> 48) & 0x3,
+                (a >> 50) & 1,
+                (a >> 51) & 0x7,
+                (a >> 54) & 1,
+                (a >> 55) & 1,
+                a
+            );
+        }
+    }
+}
+
+/// Switch the boot target to slot `tgt` — ABL SetActiveSlot's attribute
+/// rewrite, which on this device is the whole switch (see header). Takes
+/// effect at the next reboot; give the new slot a `done ok` boot within
+/// `tries` boots or ABL rolls back to the other slot by itself.
+fn set_active(tgt: &str, other: &str, tries: u64) -> i32 {
+    let mut staged = 0usize;
+    for dev in ab_disks() {
+        let mut g = match Gpt::open(&dev) {
+            Some(g) => g,
+            None => continue,
+        };
+        let ents = g.entries();
+        let mut changed = false;
+
+        // SetActiveSlot: target boot entry gets pri=MAX | ACTIVE | tries
+        // (clears unbootable and success); every other slot's boot entry
+        // loses ACTIVE and is demoted to pri = MAX-1.
+        for (n, a, off) in &ents {
+            let mut na = *a;
+            if n == &format!("boot{tgt}") {
+                na = (na & !ATTR_PRIORITY) | (PRI_MAX << 48);
+                na |= ATTR_ACTIVE;
+                na = (na & !ATTR_TRIES) | (tries << 51);
+                na &= !(ATTR_SUCCESS | ATTR_UNBOOTABLE);
+            } else if n == &format!("boot{other}") {
+                na &= !ATTR_ACTIVE;
+                na = (na & !ATTR_PRIORITY) | (PRI_DEMOTE << 48);
+            } else if n.ends_with(tgt) {
+                // MarkPtnActive: ACTIVE rides on every entry of the target
+                na |= ATTR_ACTIVE;
+            } else if n.ends_with(other) {
+                na &= !ATTR_ACTIVE;
+            }
+            if na != *a {
+                if dbg() {
+                    println!("stage {dev} {n}: {a:016x} → {na:016x}");
+                }
+                g.set_attrs(*off, na);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            continue;
+        }
+        let f = OpenOptions::new().write(true).open(&dev).unwrap_or_else(|e| {
+            eprintln!("agboot-ok: open {dev} rw: {e}");
+            std::process::exit(1);
+        });
+        match g.commit(&f) {
+            Ok(()) => staged += 1,
+            Err(e) => {
+                eprintln!("agboot-ok: {dev}: {e} — NOT committed");
+                return 1;
+            }
+        }
+    }
+    if staged == 0 {
+        eprintln!("agboot-ok: no *{tgt} entries found — nothing staged");
+        return 1;
+    }
+    println!(
+        "agboot-ok: slot {tgt} set active on {staged} disks — reboots into it; {} unmarked boot{} before ABL auto-rolls-back",
+        tries,
+        if tries == 1 { "" } else { "s" }
+    );
+    0
+}
+
+/// Mark the active slot successful — the userspace half of the A/B
+/// contract (stock Android's bootctl does this from userspace too; ABL
+/// never sets the success bit itself). Boot entry of the running
+/// suffix: succ + fresh tries + ACTIVE, clear unbootable. Other entries
+/// of the suffix: ACTIVE only (MarkPtnActive keeps that every boot
+/// anyway; ABL reads tries/succ from the boot entry alone).
+fn mark_success(suffix: &str) -> i32 {
     let mut marked = 0usize;
-    for dev in &disks {
-        let mut g = match Gpt::open(dev) {
+    for dev in ab_disks() {
+        let mut g = match Gpt::open(&dev) {
             Some(g) => g,
             None => continue,
         };
         let targets: Vec<(String, u64, usize)> = g
             .entries()
             .into_iter()
-            .filter(|(n, _, _)| n.ends_with(&suffix))
+            .filter(|(n, _, _)| n.ends_with(suffix))
             .collect();
         if targets.is_empty() {
             continue;
         }
-        if status {
-            for (n, a, _) in g.entries() {
-                if n.ends_with("_a") || n.ends_with("_b") {
-                    println!(
-                        "{:14} {:18} pri={} tries={} succ={} unboot={}",
-                        dev,
-                        n,
-                        (a >> 48) & 0xF,
-                        (a >> 52) & 0xF,
-                        (a >> 56) & 1,
-                        (a >> 57) & 1
-                    );
-                }
-            }
-            continue;
-        }
-        let f = OpenOptions::new().write(true).open(dev).unwrap_or_else(|e| {
+        let f = OpenOptions::new().write(true).open(&dev).unwrap_or_else(|e| {
             eprintln!("agboot-ok: open {dev} rw: {e}");
             std::process::exit(1);
         });
+        let boot_name = format!("boot{suffix}");
         for (n, a, off) in &targets {
-            let na = ((*a & !(0xF << ATTR_TRIES)) | (TRIES << ATTR_TRIES)) | (1 << ATTR_SUCCESS);
+            let na = if *n == boot_name {
+                ((a & !ATTR_TRIES) & !ATTR_UNBOOTABLE) | (TRIES << 51) | ATTR_SUCCESS | ATTR_ACTIVE
+            } else {
+                *a | ATTR_ACTIVE
+            };
+            if na == *a {
+                continue;
+            }
             g.set_attrs(*off, na);
-            println!("agboot-ok: {dev} {n}: tries {}→{} succ {}→1", (a >> 52) & 0xF, TRIES, (a >> 56) & 1);
+            println!("agboot-ok: {dev} {n}: {a:016x} → {na:016x}");
+            marked += 1;
         }
-        match g.commit(&f) {
-            Ok(()) => marked += targets.len(),
-            Err(e) => eprintln!("agboot-ok: {dev}: {e} — NOT committed"),
+        if let Err(e) = g.commit(&f) {
+            eprintln!("agboot-ok: {dev}: {e} — NOT committed");
         }
     }
-    if !status {
-        if marked == 0 {
-            eprintln!("agboot-ok: no *{suffix} entries found — nothing marked");
-            std::process::exit(1);
-        }
+    if marked == 0 {
+        eprintln!("agboot-ok: slot {suffix} already marked, nothing to do");
+    } else {
         println!("agboot-ok: slot {suffix} marked successful on {marked} entries");
-        let _ = dbg;
     }
+    0
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mode = args.first().map(String::as_str);
+
+    if mode == Some("set-active") {
+        // `agboot-ok set-active <a|b> [tries]` — stage the given slot for
+        // the next boot (M14). See set_active() for exactly what this
+        // covers and what it deliberately cannot (the UFS boot LUN).
+        let tgt = match args.get(1).map(String::as_str) {
+            Some("a") => "_a",
+            Some("b") => "_b",
+            _ => {
+                eprintln!("usage: agboot-ok set-active <a|b> [tries]");
+                std::process::exit(2);
+            }
+        };
+        let other = if tgt == "_a" { "_b" } else { "_a" };
+        let tries: u64 = args.get(2).and_then(|t| t.parse().ok()).unwrap_or(TRIES).min(7);
+        std::process::exit(set_active(tgt, other, tries));
+    }
+    let status = mode == Some("status");
+
+    let suffix = slot_suffix().unwrap_or_else(|| {
+        eprintln!("agboot-ok: no androidboot.slot_suffix on cmdline, assuming _a");
+        "_a".to_string()
+    });
+    if dbg() {
+        eprintln!("dbg: suffix={suffix} disks={:?}", ab_disks());
+    }
+
+    if status {
+        for dev in ab_disks() {
+            if let Some(g) = Gpt::open(&dev) {
+                print_table(&g);
+            }
+        }
+        return;
+    }
+    std::process::exit(mark_success(&suffix));
 }
 
 /// Standard CRC-32 (reflected 0xEDB88320, init/xorout 0xFFFFFFFF) — the
