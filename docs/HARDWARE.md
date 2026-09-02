@@ -4148,3 +4148,53 @@ app.toml 未动，启动器砖恢复）。**跟进两项（用户指示晚点处
 终端显示区一点没动）；hit-test 与渲染同一套网格数学。设备：新二进制
 md5 5524d84a…推 /usr/bin/aterm（旧版备份 /var/tmp/aterm.bak），
 handoff 拉起新 pid 11776，**用户看过确认"现在键盘挺好的"**。
+
+**M24 — `ag` 单入口路由器 + 元数据协议 v1 + 重烤 #7 收口（2026-09-02/03，
+全程设备实测）。** `crates/ag`（libc+serde_json，无 tokio/clap）→
+/usr/bin/ag（musl static 427KB）：execve 派发退出码与信号直通；AG_CMD_PATH
+默认 /var/bin:/usr/bin；最长前缀（argv[1..k] 连 '-'，k=n..1，stat 命中即
+停，余参原样）；精确命中只 stat 不读元数据（快路径）；`--help/-h` 任意位置
+拦截（解析+打印+exit 0，目标绝不执行）；`ag:args=` 含 `<x>` 裸调用拒
+exit 2；未知 → 前缀列表+did-you-mean（编辑距离≤2）exit 127；`ag commands
+[--all|--json|--check]`（--json 出 D1 信封；--check 五类 lint：碰撞/缺
+summary/坏布尔/ag:exec 目标缺失/编译件缺 .agmd，组未注册仅警告）。
+首批 17 个 sh shim（cam/snd/net/sys/pkg/svc/agent/cron）+ /etc/ag/
+groups.desc；build-rootfs.sh 挂 `ag commands --check` 门禁（对构建树跑
+host 版 ag，17/17 过才 mke2fs）。host 16 个子进程测试（哨兵文件/信号
+直通/信封往返）全绿。**设备验收（换机前 adb 推二进制 590edc5 上）**：
+菜单分组渲染 ✓；`ag sys reboot --help` 拦截且 uptime 6:39→6:40 不变
+（reboot2 未执行——Omarchy 事故类）✓；`ag snd-cap` 裸调 exit 2 ✓；
+`ag cam-sho` → 127+前缀匹配 ✓；`ag svc list` 真穿透 ✓；`ag svc status
+bogus-unit` → ERR exit 1 直通 ✓；信封合法 ✓；路由器 CPU 开销 x50 实测
+~0.5ms/次（0.04s vs 0.03s）。**重烤 #7（1GiB，stamp "aginxos 8c7c00d
+2026-09-02"，sha 2289d728…e34ba9）走 M22 换机路径**：manifest+ed25519
+签名（agsign）；boot=stock（e2ce2f17…）+ vendor_boot 重打包
+HOLD=1 USBADB=1 ROOTFS=1（unpack-diff vs 运行槽文件清单一致，sha
+d80b8098…）；rootfs body `dd bs=4096 seek=2097153`（=8GiB+4096）流灌
+47.7s@21MB/s，回读 sha 相符后 `agupd apply`：boot_a/vb_a 写入+校验、
+state tar 5169152B 落 64GiB、pre_staged body 复验、swap header 最后
+落（len 1073741824，old fs 1020702720）、agboot-ok 置 _a active、自
+reboot2。**换机后 clean 验收全绿（烤进 /usr/bin 的 ag，非 adb 推）**：
+开 15×5s 回网，/etc/aginx-version=8c7c00d；菜单/17 OK check/拦截
+（uptime 3min→3min）/裸调 exit 2/127+建议/信封/穿透 exit 1 直通全过；
+rtcal 在位（换机前 check 曾正确抓到 590edc5 烤里缺 rtcal 的真漂移，
+#7 解决）；x50 路由 0.04s wall（≈0.8ms/次，热缓存下与直执不可分辨）。
+**插曲与诚实记录**：① 换机后 Legrand AP 半死（assoc+M4 成功但网关
+不可达、dhcp leasefail、静态 IP 也不通）——provision 6 分钟门到点静默
+退出，未装 /var/bin；按"大包走 adb push"回执恢复：主机 gh-proxy.com
+下载 manifest 钉住的 v0.1.0 资产（GitHub 直连 10 分钟超时），aginx+
+aginx-carrier sha256/md5 双验后推 /var/bin，agctl start 双单元 ready；
+aginxbrowser/codex 留给有网下次启动自愈。② **carrier v0.1.0 无
+agent/cron 子命令**（只有 start/web/acp/info/probe/notify/qr-login/
+ticket）——agent/cron CLI 面在源码 v0.2.0（8e1b2d2 已打 musl 资产）；
+`ag agent list --json` 目前穿透为 clap 错误 exit 2（路由本身行为正确）；
+**manifest 升 v0.2.0 归 M25**（carrier retrofit 里程碑，顺手做，避免
+push 高版本被 provision 按 v0.1.0 sha 打回）。③ adb shell（/system/bin
+mksh）PATH 无 /usr/bin——系统 PATH（PID1 environ
+/sbin:/bin:/usr/sbin:/usr/bin:/system/bin）正确，纯 adb 测试要手动
+export。④ 烤进文件 owner=501（mke2fs -d 从 macOS 树保 uid；agupd 等
+先例相同，root 执行不受影响，mode 755 已核）。⑤ 烤 #7 里的 ag-sys-rtc
+还是旧 args（裸调会被误拒）——树里 c58264f 已修，进 #8。⑥ 墙钟
+~7.5h 偏（AP 死→ntpd 没跑；pm8xxx set_time 政策门见上条）。**设备终
+态**：slot _a active 跑 8c7c00d，aginx/aginx-carrier/net-watch ready，
+ABL 7 次未标记自回滚兜底在岗，旧 rootfs 备份在 32GiB。
