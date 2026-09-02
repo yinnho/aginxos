@@ -5,6 +5,7 @@ members = [
     "crates/aginxos-agent",
     "crates/aginxos-init",
     "crates/agdl",
+    "crates/agsign",
     "crates/agsvc",
     "crates/agupd",
     "crates/aterm",

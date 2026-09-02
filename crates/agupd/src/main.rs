@@ -34,6 +34,13 @@
 //!     "vbmeta":        { … },   // optional — must chain with the images
 //!     "vbmeta_system": { … } }  // optional
 //!
+//! M21: every manifest must have a detached ed25519 signature — base64
+//! in `<manifest>.sig` next to it (local sibling file, or URL + ".sig")
+//! — verified against the public key compiled in below BEFORE the
+//! manifest is parsed or a single image byte is fetched. Sign with the
+//! host tool: `agsign sign .local/keys/agupd.key manifest.json`. The
+//! private key never leaves the developer machine.
+//!
 //! HTTPS goes through agdl (M10) — the phone's only TLS fetcher.
 
 use std::fs::{File, OpenOptions};
@@ -41,7 +48,16 @@ use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
+
+/// Update-signing public key (ed25519, base64). The matching private
+/// key lives only in `.local/keys/agupd.key` on the developer machine.
+/// Rotation = ship an update (old key) embedding the next key; for now
+/// there is exactly one.
+const AGUPD_PUBKEY_B64: &str = "N/qhN+0s1P0GOJjvpcyQjxAYmwHT00z09p2+6JA5nns=";
 
 #[derive(Deserialize)]
 struct Image {
@@ -187,13 +203,40 @@ fn staging_root() -> String {
     die("no usable staging directory")
 }
 
+/// M21 signature gate: the detached sig must verify over the RAW
+/// manifest bytes (no canonicalization — the file is signed exactly as
+/// fetched) against the compiled-in key. Called before parse, so an
+/// unsigned or tampered manifest dies without a single download.
+fn verify_manifest_sig(body: &str, sig_b64: &str) {
+    let key_b: [u8; 32] = B64
+        .decode(AGUPD_PUBKEY_B64)
+        .unwrap_or_else(|e| die(&format!("internal: pubkey decode: {e}")))
+        .try_into()
+        .unwrap_or_else(|v: Vec<u8>| die(&format!("internal: pubkey {} bytes", v.len())));
+    let vk = VerifyingKey::from_bytes(&key_b).unwrap_or_else(|e| die(&format!("internal: pubkey: {e}")));
+    let sig_b: [u8; 64] = B64
+        .decode(sig_b64.trim())
+        .unwrap_or_else(|e| die(&format!("manifest sig: not base64 ({e})")))
+        .try_into()
+        .unwrap_or_else(|v: Vec<u8>| die(&format!("manifest sig: want 64 bytes, got {}", v.len())));
+    vk.verify(body.as_bytes(), &Signature::from_bytes(&sig_b))
+        .unwrap_or_else(|_| die("manifest signature INVALID — refusing this update"));
+}
+
 fn fetch_manifest(src: &str) -> Manifest {
-    let body = if src.starts_with('/') {
-        std::fs::read_to_string(src).unwrap_or_else(|e| die(&format!("read {src}: {e}")))
+    let (body, sig) = if src.starts_with('/') {
+        let body = std::fs::read_to_string(src).unwrap_or_else(|e| die(&format!("read {src}: {e}")));
+        let sig = std::fs::read_to_string(format!("{src}.sig"))
+            .unwrap_or_else(|e| die(&format!("read {src}.sig: {e} — unsigned manifests are rejected (M21)")));
+        (body, sig)
     } else {
         let staged = stage(src, &format!("{}/manifest.json", staging_root()));
-        std::fs::read_to_string(&staged).unwrap_or_else(|e| die(&format!("read {staged}: {e}")))
+        let body = std::fs::read_to_string(&staged).unwrap_or_else(|e| die(&format!("read {staged}: {e}")));
+        let sig_staged = stage(&format!("{src}.sig"), &format!("{}/manifest.json.sig", staging_root()));
+        let sig = std::fs::read_to_string(&sig_staged).unwrap_or_else(|e| die(&format!("read {sig_staged}: {e}")));
+        (body, sig)
     };
+    verify_manifest_sig(&body, &sig);
     serde_json::from_str(&body).unwrap_or_else(|e| die(&format!("manifest parse: {e}")))
 }
 

@@ -1,0 +1,15 @@
+[package]
+name = "agsign"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Host-side update-signing tool (M21). The private key never leaves the
+# developer machine / CI; the phone only carries the public key, baked
+# into agupd at build time.
+[dependencies]
+ed25519-dalek = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"

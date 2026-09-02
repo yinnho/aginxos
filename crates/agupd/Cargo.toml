@@ -10,6 +10,10 @@ authors.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = { workspace = true }
+# M21: manifest signature verification. Verify-only, no std features
+# needed — the phone never signs anything.
+ed25519-dalek = { version = "2", default-features = false }
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "agupd"
