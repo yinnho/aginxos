@@ -267,7 +267,7 @@ fn spawn_shell(cols: u16, rows: u16, argv: &[&str]) -> Result<Child, String> {
                 b"xterm-256color\0".as_ptr() as *const _,
                 1,
             );
-            libc::setenv(b"HOME\0".as_ptr() as *const _, b"/var/home\0".as_ptr() as *const _, 1);
+            libc::setenv(b"HOME\0".as_ptr() as *const _, b"/home\0".as_ptr() as *const _, 1);
             let prog = std::ffi::CString::new(argv[0]).unwrap();
             let owned: Vec<std::ffi::CString> =
                 argv.iter().map(|a| std::ffi::CString::new(*a).unwrap()).collect();

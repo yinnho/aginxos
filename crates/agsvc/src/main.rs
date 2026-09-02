@@ -157,7 +157,7 @@ fn spawn_unit(u: &Unit) -> Result<(Child, Option<File>), String> {
     cmd.args(&u.args)
         .env_clear()
         .env("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/var/bin")
-        .env("HOME", "/var/home")
+        .env("HOME", "/home")
         .current_dir("/")
         .stdin(Stdio::null());
     for e in &u.envs {
