@@ -35,7 +35,12 @@ mkdir -p "${TREE}"
 
 # Mountpoints (and /var/log — the only place boot evidence survives; the
 # kernel has no pstore, so /var/adbd.log is our cross-boot record).
-mkdir -p "${TREE}"/{dev,proc,sys,etc,home,media,mnt,opt,root,run,srv,tmp,var/log}
+# /var/power + /var/lib/agpkg/{skills,units,stamps}: state-tar members
+# that only existed on the running fs before bake #9 — busybox tar exits
+# 1 on a missing member, which the hardened agupd rightly treats as
+# fatal (observed 2026-09-03).
+mkdir -p "${TREE}"/{dev,proc,sys,etc,home,media,mnt,opt,root,run,srv,tmp,var/log,var/power}
+mkdir -p "${TREE}"/var/lib/agpkg/{skills,units,stamps}
 
 # Android pieces: /system (adbd + linker config + lib64) and the root-level
 # property/SELinux files adbd reads at startup.

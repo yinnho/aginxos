@@ -154,16 +154,31 @@ fn pwrite_file_at(fd: i32, staged: &str, off: u64) -> u64 {
 /// stage it at STATE_OFF with an ASCII header: magic(8) + 16 decimal
 /// digits of length + newline — parseable by /etc/init.d/state-restore
 /// with nothing but dd/head/cut. Marker last = crash-safe.
-fn stage_state_tar(staging_root: &str) {
-    let tar_path = format!("{staging_root}/state.tar");
-    let _ = std::fs::remove_file(&tar_path);
+///
+/// The tar builds on the REAL fs (/var/tmp), never on the manifest's
+/// staging dir: that sits on tmpfs, and on 2026-09-03 tar died mid-file
+/// there (tmpfs/memory pressure, killed at 235491328 bytes into
+/// /root/bin/codex) — a partial tar the swap boot then extracted,
+/// leaving a truncated codex. tar's exit status is now fatal: a killed
+/// or ENOSPC'd capture must refuse the update, not ship half a state.
+fn stage_state_tar() {
+    let _ = std::fs::create_dir_all("/var/tmp");
+    let tar_path = "/var/tmp/agupd-state.tar";
+    let _ = std::fs::remove_file(tar_path);
     // best-effort: an agent mid-write means one file is torn, not lost
-    let _ = Command::new("/bin/sh")
+    let st = Command::new("/bin/sh")
         .arg("-c")
         .arg(format!(
             "tar -cf {tar_path} /etc/wifi.conf /etc/aginx /home /root /var/log /var/power /var/lib 2>/dev/null"
         ))
-        .status();
+        .status()
+        .unwrap_or_else(|e| die(&format!("spawn tar: {e}")));
+    if !st.success() {
+        die(&format!(
+            "state capture tar exited {:?} — refusing to update (would ship a torn state)",
+            st.code()
+        ));
+    }
     let len = match std::fs::metadata(&tar_path) {
         Ok(m) => m.len(),
         Err(_) => die("state capture produced no tar — refusing to update (would be a factory reset)"),
@@ -509,7 +524,7 @@ fn cmd_apply(src: &str, no_reboot: bool) {
         if m.vendor_boot.is_none() {
             die("manifest has rootfs but no vendor_boot — the swap trampoline must ship with it");
         }
-        stage_state_tar(&root);
+        stage_state_tar();
         if img.pre_staged {
             commit_rootfs_swap(img);
         } else {
