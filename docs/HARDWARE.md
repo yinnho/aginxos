@@ -4376,3 +4376,45 @@ python3 可用 ✓。带标靴 finalize 静默跳过（纪律目的）；81s 靴
 设备终态：烤 #8 fs + 推送 agpkg(90f3f5d8)/provision/manifest(c0d490d3
 +python3 23923ffe)+sig；pkgfiles/python3 54.9M；标 python-finalize；
 slot _b。离线靴：python3 运行路径无网依赖（标在则 finalize 都不跑）。
+
+### M29 — 测试纪律成形（check.sh + accept 套件）（2026-09-03）
+
+骨架收口件：host 门禁 + 设备验收单从"每次手敲"变成可重跑的脚本。
+不改 boot 行为，全部是 dev 侧工具；设备观察 = 套件本身在机跑绿。
+
+**host 侧 `scripts/check.sh`**：
+- cargo test 主机集 = ag/agio/agpkg/agdone/agdl/agsign/aterm/
+  wifi-wizard/aginxos-probe/aginxos-agent（10 个，40 用例绿）。Linux 上
+  跑 --workspace；macOS 上 agupd/agsvc/aginxos-init 编不过（prctl/
+  SO_PEERCRED/ioctl c_ulong Linux-only libc 面，agupd 自 M14 如此），
+  显式列出主机集。
+- `ag commands --check` 对 scratch shim 树：cp boot/rootfs/usr/bin +
+  chmod 755（git 存 644，路由器只认可执行）+ 15 个 ag:exec 目标打桩
+  （C 工具只在烤盘里编译，--check 只查存在性）→ 18 commands OK，
+  与机上 `ag commands --check` 同数。
+- `check.sh lint` 跳过 cargo 半场（改 shim 后秒级反馈）。
+
+**testkit crate（fixture 统一）**：tmp(tag)/write_exec/env_lock 三件；
+约定两级——优先注入路径（agpkg::Paths）或子进程 `.env()`（ag 路由
+测试，天然并行），只有代码按设计读全局 env（agdone::dir）才用
+env_lock 串行。ag/agdone/agpkg 四处测试已迁。
+
+**设备 accept 套件 `scripts/accept/`**：lib.sh 全 adb 调用钉实验机串
+号 aginxosredfin（日常机永不沾）；drv 用尾行 `__RC=$?` 抓设备退出码
+（adb 历史上不透传），滤 bionic linker 噪声行；expect_py 用 host
+python3 验 D1 信封（取最后一条可解析 JSON 行——carrier 面允许人读
+提示行在前）。六套件实测全绿：smoke 11、m24 14、m25 6、m26 8、
+m27 13、m28 11 = 63 断言。m24 头条照旧是 Omarchy 事故类：
+`ag sys reboot --help` 拦截 + uptime 单调证明 reboot2 没跑。
+
+**套件自举期抓到的真缺陷**（dev 侧，非设备回归）：
+1. lib.sh drv 的输出管道在 set -o pipefail 下，设备命令零 stdout 时
+   末级 grep -v 空输出退 1 → set -e 静默杀脚本（首跑 smoke 前 11 行
+   正常是因为 libc 噪声行恰好撑着管道非空）。`|| true` 修复。
+2. 测试断言错两处（设备行为本来对）：agdone --json 的 rc=3 只在
+   未标记时（我在已标记态断言 rc3）；SKILL.md 只有四件套 tar 才有
+   （裸二进制包没有——aginxbrowser 断言改 python3）；cron list 无
+   --json 旗标（信封是默认输出形状）。
+
+设备终态：无变化（套件只读 + accept-m27 草稿标已自清）；烤 #8 fs、
+slot _b、python-finalize 带标不变。
