@@ -249,6 +249,17 @@ fn is_tar(path: &Path) -> std::io::Result<bool> {
     Ok(got == 5 && &magic == b"ustar")
 }
 
+/// A gzipped tar has no ustar magic at 257 and would silently fall through
+/// `install_file` to the v0 flat-binary path — raw gzip copied to /var/bin
+/// (M32c receipt: "installed" fine, `agf` then died with `magic 1F8B`).
+/// Sniff it up front so the failure is loud at install time, not boot time.
+fn is_gzip(path: &Path) -> std::io::Result<bool> {
+    let mut f = std::fs::File::open(path)?;
+    let mut magic = [0u8; 2];
+    let got = f.read(&mut magic).unwrap_or(0);
+    Ok(got == 2 && &magic == b"\x1f\x8b")
+}
+
 /// Install a local artifact (already downloaded or adb-pushed) whose
 /// content must hash to `sha256`. Writes the stamp on success so
 /// `sync` can see this exact version as current.
@@ -266,7 +277,13 @@ pub fn install_file(p: &Paths, name: &str, src: &Path, sha256: &str) -> Result<K
         )
         .with_hint("the file is not what the caller pinned — re-download or fix the pin"));
     }
-    let kind = if is_tar(src).map_err(|e| io_fail("sniff", format!("{}: {e}", src.display())))? {
+    let kind = if is_gzip(src).map_err(|e| io_fail("sniff", format!("{}: {e}", src.display())))? {
+        return Err(io_fail(
+            "pkg_gzip",
+            format!("{name}: gzipped artifact refused — agpkg bundles are uncompressed ustar tar (or a flat binary)"),
+        )
+        .with_hint("repack without -z: tar --format=ustar -cf out.tar bin/<name> pkg.toml SKILL.md"));
+    } else if is_tar(src).map_err(|e| io_fail("sniff", format!("{}: {e}", src.display())))? {
         install_bundle(p, name, src)?
     } else {
         place_binary(p, name, &std::fs::read(src).map_err(|e| io_fail("read", format!("{}: {e}", src.display())))?)?;
@@ -281,7 +298,7 @@ pub fn install_file(p: &Paths, name: &str, src: &Path, sha256: &str) -> Result<K
 /// reject absolute paths / ".." walk-outs before anything is buffered.
 fn member_path(raw: &str) -> Result<String, Fail> {
     let parts: Vec<&str> = raw.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.iter().any(|s| *s == "..") || raw.starts_with('/') {
+    if parts.contains(&"..") || raw.starts_with('/') {
         return Err(io_fail("pkg_unsafe_path", format!("bundle member escapes: {raw}"))
             .with_hint("packages must be relative tar trees"));
     }
@@ -911,9 +928,8 @@ mod tests {
         h[108..115].copy_from_slice(b"0000000"); // mtime
         h[156] = b'0'; // regular file
         h[257..263].copy_from_slice(b"ustar\0"); h[263..265].copy_from_slice(b"00");
-        for b in h.iter_mut().take(148) {
-            *b = *b;
-        }
+        // checksum field (148..156) counts as eight spaces; the sum below
+        // adds 8 * 32 for it directly
         let sum: u32 = h.iter().map(|b| *b as u32).sum::<u32>() + 8 * 32;
         let chk = format!("{sum:06o}\0 ");
         h[148..156].copy_from_slice(chk.as_bytes());
@@ -1015,6 +1031,34 @@ mod tests {
         // nothing landed
         assert!(!p.bindir.join("dup").exists());
         assert!(!p.skills.join("dup").exists());
+    }
+
+    #[test]
+    fn gzipped_tar_refused_loudly() {
+        // M32c receipt: a `tar -czf` bundle "installed" fine and died at
+        // exec with `magic 1F8B` — the gzip header hides ustar magic at
+        // 257, so it fell through to the v0 flat-binary path. It must be
+        // refused at install time instead.
+        let root = tmp("gzrefuse");
+        let p = paths(&root);
+        let inner = root.join("inner.tar");
+        build_tar(
+            &inner,
+            &[("bin/agf", b"BIN"), ("pkg.toml", PKG_TOML.as_bytes()), ("SKILL.md", b"# s\n")],
+        );
+        let gz = root.join("p.tar.gz");
+        // the sniff only reads the 2 magic bytes; a gzip header glued onto
+        // the tar body is enough to model a `tar -czf` artifact
+        let mut gzbytes = b"\x1f\x8b".to_vec();
+        gzbytes.extend_from_slice(&fs::read(&inner).unwrap());
+        fs::write(&gz, &gzbytes).unwrap();
+        let sha = sha256_file(&gz).unwrap();
+        let f = install_file(&p, "agf", &gz, &sha).unwrap_err();
+        assert_eq!(f.code, "pkg_gzip");
+        assert!(f.hint.as_deref().unwrap().contains("ustar"));
+        // nothing landed anywhere
+        assert!(!p.bindir.join("agf").exists());
+        assert!(!p.skills.join("agf").exists());
     }
 
     #[test]
