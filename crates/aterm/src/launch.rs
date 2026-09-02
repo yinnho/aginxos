@@ -12,6 +12,7 @@ use agsvc::{scan_apps, AppEntry, APPS_DIR};
 pub const BIN_SH: &str = "/bin/sh";
 pub const BIN_WIZARD: &str = "/usr/bin/wifi-wizard";
 pub const BIN_REBOOT2: &str = "/bin/reboot2";
+pub const BIN_AGPKG: &str = "/usr/bin/agpkg";
 
 pub struct Entry {
     pub label: String,
@@ -24,6 +25,9 @@ pub struct Entry {
     /// the big 5x touch glyphs, the PC-designed TUIs (codex/grok) need
     /// ~56 cols so they get 3.
     pub scale: usize,
+    /// "+" tile: instead of spawning, opens the optional-package picker
+    /// (M23 tiering — `agpkg available` / `opt-in`). No pty involved.
+    pub picker: bool,
 }
 
 /// Registry apps first (alphabetical by id), then the system actions.
@@ -43,27 +47,41 @@ fn app_entry(a: AppEntry) -> Entry {
         args: a.args,
         avail: std::path::Path::new(&a.binary).is_file(),
         scale: a.scale,
+        picker: false,
     }
 }
 
 fn builtins() -> Vec<Entry> {
-    [
-        ("SH", BIN_SH, &[][..], 5usize),
-        ("WIFI SETUP", BIN_WIZARD, &[][..], 5),
-        ("RESTART", BIN_REBOOT2, &["reboot"][..], 5),
-        ("POWER OFF", BIN_REBOOT2, &["poweroff"][..], 5),
-    ]
-    .into_iter()
-    .map(|(label, bin, args, scale)| Entry {
-        label: label.into(),
-        bin: bin.into(),
-        args: args.iter().map(|s| s.to_string()).collect(),
-        // sh and reboot2 ship in the base image; the wizard is a rootfs
-        // binary that always exists post-M5
-        avail: bin == BIN_SH || bin == BIN_REBOOT2 || std::path::Path::new(bin).is_file(),
-        scale,
-    })
-    .collect()
+    let mut v = vec![Entry {
+        label: "+".into(),
+        bin: BIN_AGPKG.into(),
+        args: vec![],
+        // dimmed if the installer itself is missing
+        avail: std::path::Path::new(BIN_AGPKG).is_file(),
+        scale: 5,
+        picker: true,
+    }];
+    v.extend(
+        [
+            ("SH", BIN_SH, &[][..], 5usize),
+            ("WIFI SETUP", BIN_WIZARD, &[][..], 5),
+            ("RESTART", BIN_REBOOT2, &["reboot"][..], 5),
+            ("POWER OFF", BIN_REBOOT2, &["poweroff"][..], 5),
+        ]
+        .into_iter()
+        .map(|(label, bin, args, scale)| Entry {
+            label: label.into(),
+            bin: bin.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            // sh and reboot2 ship in the base image; the wizard is a rootfs
+            // binary that always exists post-M5
+            avail: bin == BIN_SH || bin == BIN_REBOOT2 || std::path::Path::new(bin).is_file(),
+            scale,
+            picker: false,
+        })
+        .collect::<Vec<_>>(),
+    );
+    v
 }
 
 /// Scale for non-launcher spawns (ATERM_START debug path, the first-boot

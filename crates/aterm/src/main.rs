@@ -188,6 +188,23 @@ struct Child {
     pid: libc::pid_t,
 }
 
+/// `agpkg available` — optional packages not yet installed, capped at 12
+/// (picker row geometry is unsigned arithmetic; scrolling is later).
+fn read_available() -> Vec<String> {
+    std::process::Command::new(launch::BIN_AGPKG)
+        .arg("available")
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .take(12)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn spawn_shell(cols: u16, rows: u16, argv: &[&str]) -> Result<Child, String> {
     let mut master: libc::c_int = -1;
     let mut slave: libc::c_int = -1;
@@ -318,6 +335,10 @@ fn inject(mode: &mut Mode, term: &mut Term, parser: &mut vte::Parser, ev: &Input
 enum Mode {
     Launcher,
     Running(Child),
+    /// Optional-package picker (launcher "+" tile): rows come from
+    /// `agpkg available`; a tap runs `agpkg opt-in <name>` synchronously
+    /// (INSTALLING frame drawn first) and refreshes both lists.
+    Picker,
 }
 
 // ---------------- render ----------------
@@ -352,6 +373,42 @@ impl<'a> Render<'a> {
         }
         // hint line
         draw_centered(pix, self.pitch, self.w, self.h, self.font, g.kb_panel_y as i32 - 40, "TAP TO START", 3, UNAVAIL);
+    }
+
+    /// Optional-package picker ("+" tile): same row geometry as the
+    /// launcher. status_line is the last install result ("" = hint).
+    /// The caller caps the list at 12 rows — Geom arithmetic is unsigned
+    /// and a long list would underflow; scrolling is a later milestone.
+    fn picker(&self, pix: &mut [u32], names: &[String], status_line: &str, g: &launch::Geom) {
+        fill_rect(pix, self.pitch, self.w, self.h, 0, 0, self.w as i32, self.h as i32, BG);
+        self.toolbar(pix, g.m, g.toolbar_h);
+        draw_centered(pix, self.pitch, self.w, self.h, self.font, g.toolbar_h as i32 + 14, "SELECT PKGS", 5, GREEN);
+        if names.is_empty() {
+            draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 24) / 2, "(NONE AVAILABLE)", 3, UNAVAIL);
+        }
+        for (i, n) in names.iter().enumerate() {
+            let y0 = (g.by0 + i * (g.bh + g.gap)) as i32;
+            let c = DIM;
+            fill_rect(pix, self.pitch, self.w, self.h, g.bx as i32, y0, g.bw as i32, 3, c);
+            fill_rect(pix, self.pitch, self.w, self.h, g.bx as i32, y0 + g.bh as i32 - 3, g.bw as i32, 3, c);
+            fill_rect(pix, self.pitch, self.w, self.h, g.bx as i32, y0, 3, g.bh as i32, c);
+            fill_rect(pix, self.pitch, self.w, self.h, (g.bx + g.bw - 3) as i32, y0, 3, g.bh as i32, c);
+            let tw = text_w(n.as_str(), 5) as i32;
+            let ty = y0 + (g.bh as i32 - 8 * 5) / 2;
+            draw_text(pix, self.pitch, self.w, self.h, self.font, g.bx as i32 + (g.bw as i32 - tw) / 2, ty, n.as_str(), 5, GREEN);
+        }
+        let line = if status_line.is_empty() { "TAP TO INSTALL" } else { status_line };
+        let lc = if status_line.is_empty() { UNAVAIL } else { GREEN };
+        draw_centered(pix, self.pitch, self.w, self.h, self.font, g.kb_panel_y as i32 - 40, line, 3, lc);
+    }
+
+    /// Full-cover frame shown while `agpkg opt-in` runs (synchronous —
+    /// the event loop is blocked, so this must be painted + presented
+    /// before the Command).
+    fn installing(&self, pix: &mut [u32], name: &str) {
+        fill_rect(pix, self.pitch, self.w, self.h, 0, 0, self.w as i32, self.h as i32, BG);
+        draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 8 * 5) / 2 - 60, "INSTALLING", 5, GREEN);
+        draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 8 * 5) / 2 + 60, name, 5, WHITE);
     }
 
     /// Header strip: [BACK] at the right, like the launcher header —
@@ -593,6 +650,10 @@ fn main() {
     let mut kb = Kb::new();
     let kg = Kb::geom(w, h);
     let mut entries = launch::entries();
+    // Picker state ("+" tile): optional packages from `agpkg available`
+    // and the last install result line.
+    let mut pkgs: Vec<String> = Vec::new();
+    let mut pk_status = String::new();
     let lg = launch::Geom::new(w, h, kg.extra_y, entries.len());
 
     // Terminal geometry: glyph scale is per-app — sh keeps 5 (30x40 px
@@ -659,6 +720,7 @@ fn main() {
         let buf = &mut canvas[..];
         match &mode {
             Mode::Launcher => r.launcher(buf, &entries, &lg),
+            Mode::Picker => r.picker(buf, &pkgs, &pk_status, &lg),
             Mode::Running(_) => {
                 fill_rect(buf, pitch, w, h, 0, 0, w as i32, h as i32, BG);
                 r.toolbar(buf, lg.m, lg.toolbar_h);
@@ -769,18 +831,25 @@ fn main() {
                             }
                             if y < lg.toolbar_h {
                                 // BACK fires on press, same as keys
-                                if lg.toolbar_hit(x, y, matches!(mode, Mode::Running(_)))
+                                if lg.toolbar_hit(x, y, matches!(mode, Mode::Running(_) | Mode::Picker))
                                     == Some(launch::Toolbar::Back)
                                 {
                                     if let Mode::Running(c) = &mode {
                                         unsafe { libc::kill(c.pid, libc::SIGHUP) };
+                                    } else if matches!(mode, Mode::Picker) {
+                                        mode = Mode::Launcher;
                                     }
                                     redraw = true;
                                 }
                             } else if y < kg.extra_y {
                                 if let Mode::Launcher = &mut mode {
                                     if let Some(i2) = lg.button_at(x, y, entries.len()) {
-                                        if entries[i2].avail {
+                                        if entries[i2].picker {
+                                            pkgs = read_available();
+                                            pk_status.clear();
+                                            mode = Mode::Picker;
+                                            redraw = true;
+                                        } else if entries[i2].avail {
                                             let prog = entries[i2].bin.as_str();
                                             if prog == launch::BIN_REBOOT2 {
                                                 // these draw their own frame
@@ -823,6 +892,35 @@ fn main() {
                                                 }
                                                 Err(e) => eprintln!("aterm: spawn: {e}"),
                                             }
+                                            redraw = true;
+                                        }
+                                    }
+                                } else if let Mode::Picker = &mut mode {
+                                    if let Some(i2) = lg.button_at(x, y, pkgs.len()) {
+                                        if let Some(name) = pkgs.get(i2).cloned() {
+                                            // synchronous install: paint the
+                                            // frame first, the event loop is
+                                            // about to block on agdl
+                                            {
+                                                let r = Render { font: &font, w, h, pitch };
+                                                r.installing(&mut canvas[..], &name);
+                                                d.back_buf().copy_from_slice(&canvas);
+                                                d.present();
+                                            }
+                                            let out = std::process::Command::new(launch::BIN_AGPKG)
+                                                .arg("opt-in")
+                                                .arg(&name)
+                                                .output();
+                                            pk_status = match out {
+                                                Ok(o) if o.status.success() => format!("INSTALLED {name}"),
+                                                Ok(_) => format!("FAILED {name}"),
+                                                Err(e) => format!("FAILED {name}: {e}"),
+                                            };
+                                            // opt-in seeds /var/apps — the
+                                            // registry may have grown; the
+                                            // installed name leaves the list
+                                            entries = launch::entries();
+                                            pkgs = read_available();
                                             redraw = true;
                                         }
                                     }
@@ -989,6 +1087,10 @@ fn main() {
                 Mode::Launcher => {
                     // launcher() full-covers the canvas
                     r.launcher(buf, &entries, &lg);
+                }
+                Mode::Picker => {
+                    // picker() full-covers the canvas
+                    r.picker(buf, &pkgs, &pk_status, &lg);
                 }
                 Mode::Running(_) => {
                     r.terminal(buf, &term, area_top, area_bottom(kb_visible) - area_top, scale, blink_on, lg.m);

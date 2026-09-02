@@ -10,10 +10,18 @@
 # arrives with M10 — this busybox's wget segfaults and httpget is HTTP-only
 # (see src/httpget.c), so an HTTPS fetcher is an M10 deliverable.
 #
+# Manifest lines (M23 tiering): <name> <url> <sha256> [core|opt] — the 4th
+# field is optional, absent = core. `sync` self-heals core entries only;
+# opt entries are user-picked (`available` lists them, `opt-in` installs
+# one and seeds its launcher registry entry). '#' comments, blank ok.
+#
 # usage:
 #   agpkg install <name> <src-file> <sha256>
-#   agpkg sync [manifest]   — download + install every manifest entry whose
-#                             installed sha256 differs (M10 self-heal)
+#   agpkg sync [manifest]   — download + install every CORE manifest entry
+#                             whose installed sha256 differs (M10 self-heal)
+#   agpkg available [manifest] — opt entries not yet installed, one per line
+#   agpkg opt-in <name>     — download + install an opt entry and seed
+#                             /var/apps/<name>/app.toml (launcher shows it)
 #   agpkg rollback <name>
 #   agpkg list
 set -eu
@@ -26,6 +34,48 @@ DL=/var/tmp/agpkg
 
 cmd=${1:-}
 name=${2:-}
+
+# fetch_install <name> <url> <sha256> — shared by sync and opt-in.
+# Downloads (with the gh-proxy retry) then installs via `install`; returns
+# nonzero and keeps the previous binary on any failure.
+fetch_install() {
+  fp=$1; furl=$2; fsum=$3
+  mkdir -p "$DL"
+  f="$DL/$fp"
+  rm -f "$f"
+  # GitHub release downloads get TLS-reset on some networks; retry once
+  # through gh-proxy.com (content is sha256-pinned either way).
+  if ! agdl "$furl" "$f"; then
+    case "$furl" in
+      https://github.com/*) agdl "https://gh-proxy.com/$furl" "$f" || true ;;
+    esac
+  fi
+  if [ -f "$f" ] && "$0" install "$fp" "$f" "$fsum"; then
+    rm -f "$f"
+    return 0
+  fi
+  rm -f "$f"
+  return 1
+}
+
+# seed_app <name> — write the launcher registry entry (§12.3) so an
+# installed package appears on the launcher without an OS source change.
+# Known apps keep their /etc/apps.d seed (scale etc. stay curated); the
+# default assumes unknown UIs are PC-designed TUIs (codex/grok class).
+seed_app() {
+  if [ -f "/etc/apps.d/$1.toml" ]; then
+    mkdir -p "$APPDIR/$1"
+    cp "/etc/apps.d/$1.toml" "$APPDIR/$1/app.toml"
+    return
+  fi
+  mkdir -p "$APPDIR/$1"
+  cat > "$APPDIR/$1/app.toml" <<EOF
+name = "$1"
+binary = "/var/bin/$1"
+args = ""
+scale = 3
+EOF
+}
 
 case "$cmd" in
 install)
@@ -55,12 +105,12 @@ rollback)
 sync)
   mf=${2:-$MANIFEST}
   [ -f "$mf" ] || { echo "agpkg: no manifest $mf — nothing to sync"; exit 0; }
-  mkdir -p "$DL"
   rc=0
-  # manifest lines: <name> <url> <sha256>   ('#' comments, blank lines ok)
-  while read -r pname purl psum rest; do
+  # manifest lines: <name> <url> <sha256> [core|opt] — sync heals CORE only
+  while read -r pname purl psum ptier rest; do
     case "$pname" in ''|\#*) continue;; esac
     [ -n "$purl" ] && [ -n "$psum" ] || { echo "agpkg: bad manifest line: $pname" >&2; rc=1; continue; }
+    [ "$ptier" = "opt" ] && continue
     cur=
     [ -f "$BINDIR/$pname" ] && cur=$(sha256sum "$BINDIR/$pname" | cut -d' ' -f1)
     if [ "$cur" = "$psum" ]; then
@@ -72,24 +122,48 @@ sync)
     else
       echo "agpkg: $pname missing — downloading"
     fi
-    f="$DL/$pname"
-    rm -f "$f"
-    # GitHub release downloads get TLS-reset on some networks; retry once
-    # through gh-proxy.com (content is sha256-pinned either way).
-    if ! agdl "$purl" "$f"; then
-      case "$purl" in
-        https://github.com/*) agdl "https://gh-proxy.com/$purl" "$f" || true ;;
-      esac
-    fi
-    if [ -f "$f" ] && "$0" install "$pname" "$f" "$psum"; then
-      rm -f "$f"
-    else
+    if ! fetch_install "$pname" "$purl" "$psum"; then
       echo "agpkg: $pname sync FAILED (kept previous)" >&2
-      rm -f "$f"
       rc=1
     fi
   done < "$mf"
   exit $rc
+  ;;
+available)
+  mf=${2:-$MANIFEST}
+  [ -f "$mf" ] || exit 0
+  while read -r pname purl psum ptier rest; do
+    case "$pname" in ''|\#*) continue;; esac
+    [ "$ptier" = "opt" ] || continue
+    [ -f "$BINDIR/$pname" ] && continue
+    echo "$pname"
+  done < "$mf"
+  ;;
+opt-in)
+  [ -n "$name" ] || { echo "usage: agpkg opt-in <name>" >&2; exit 2; }
+  [ -f "$MANIFEST" ] || { echo "agpkg: no manifest $MANIFEST" >&2; exit 1; }
+  # field extraction via sed groups only — busybox awk segfaults on this
+  # build (see net-bringup); one leading space + `  *` anchors field bounds
+  # so "foo" never matches a "foobar ..." line.
+  purl=$(sed -n "s/^$name  *\([^ ]*\)  *.*/\1/p" "$MANIFEST" | head -1)
+  psum=$(sed -n "s/^$name  *[^ ]*  *\([^ ]*\).*/\1/p" "$MANIFEST" | head -1)
+  ptier=$(sed -n "s/^$name  *[^ ]*  *[^ ]*  *\([^ ]*\).*/\1/p" "$MANIFEST" | head -1)
+  [ -n "$purl" ] && [ -n "$psum" ] || { echo "agpkg: $name not in manifest" >&2; exit 1; }
+  [ "$ptier" = "opt" ] || { echo "agpkg: $name is not an opt entry (sync handles core)" >&2; exit 1; }
+  cur=
+  [ -f "$BINDIR/$name" ] && cur=$(sha256sum "$BINDIR/$name" | cut -d' ' -f1)
+  if [ "$cur" = "$psum" ]; then
+    seed_app "$name"
+    echo "agpkg: $name already installed — seeded launcher entry"
+    exit 0
+  fi
+  if fetch_install "$name" "$purl" "$psum"; then
+    seed_app "$name"
+    echo "agpkg: opted in $name"
+  else
+    echo "agpkg: $name install FAILED" >&2
+    exit 1
+  fi
   ;;
 list)
   for f in "$BINDIR"/*; do
@@ -99,7 +173,7 @@ list)
   done
   ;;
 *)
-  echo "usage: agpkg install <name> <src> <sha256> | sync [manifest] | rollback <name> | list" >&2
+  echo "usage: agpkg install <name> <src> <sha256> | sync [manifest] | available [manifest] | opt-in <name> | rollback <name> | list" >&2
   exit 2
   ;;
 esac
