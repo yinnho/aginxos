@@ -3766,3 +3766,51 @@ unrelated to M14; marker still fired after the 300 s timeout.
 Deployed: /usr/bin/agupd (md5 0b1daf0795e751d6b8eba595093bb43f),
 /usr/bin/agboot-ok (md5 8ac7d78e77cf491e401d94f6c8d1d6e8) — fold into
 next rootfs re-bake along with the /etc/aginx-version stamp.
+
+## 2026-09-02 — rootfs re-bake #5: agupd + agboot-ok v2 folded in, version stamp, provision shakeout
+
+`scripts/build-rootfs.sh` unchanged from 0f4b1ea (recipe already had the
+agupd/agboot-ok copy lines + `git log -1` → `/etc/aginx-version`); full
+musl rebuild then bake → flash userdata → first-boot verify.
+
+- **Bake**: version stamp `aginxos c95e7c1 2026-09-02` (HEAD is the
+  local docs commit; image code content = pushed 0f4b1ea). `/etc/wifi.conf`
+  (Legrand AP, mode 600) baked in for the first time instead of pushed
+  post-flash. md5 on device after boot: agupd 0b1daf0795e751d6b8eba595093bb43f,
+  agboot-ok 8ac7d78e77cf491e401d94f6c8d1d6e8, wifi.conf 6405ac38494d315c77a058d912e3ac91 — all match the deployed set.
+- **First boot**: auto-joined Legrand AP from the baked wifi.conf, DHCP
+  192.168.0.166, internet ok (baidu), ntp ok, `done ok` at ~t+45 s.
+  Slot a was already marked (attrs survive a userdata flash — they live
+  in the GPT, not userdata); boot_a pri3/ACTIVE/tries7/succ1 confirmed
+  via `agupd status` from the baked image, which prints
+  `slot _a version aginxos c95e7c1 2026-09-02` + the full slot table.
+- **provision first-boot**: aginx, aginx-carrier, aginxbrowser
+  downloaded + sha256-verified + installed over the network (the
+  provision path itself proven end-to-end). codex (223 MB) truncated at
+  163 MB: the AP dropped the wlan0 association under sustained transfer
+  (NO-CARRIER, then DNS "Try again" for everything — AP as resolver died
+  with the link). In-place recovery that worked (no reboot): `ip addr
+  flush dev wlan0` + `/bin/wifi-join` + `udhcpc -n` → same lease
+  re-obtained. Retried codex: AP dropped the link again ~2 min in.
+  Sidestep: host-side download + `adb push` (USB is immune) +
+  `agpkg install` sha256-verified — codex 56f02601… and grok dac1ccb20…
+  (from out/m13) installed. All 5 manifest packages present in /var/bin,
+  app-registry refreshed.
+- **New #76 evidence (twice in one session)**: the Legrand AP kills
+  long wlan transfers; after a drop there is no auto-rejoin — wifi-join
+  + udhcpc by hand restores the link in ~10 s. A background rejoin/
+  watch loop in net-bringup or agsvc would make provision self-healing.
+  Also observed: agdl does not resume its `.part` on retry (restarts
+  from 0), and agpkg leaves orphaned `$DL/<name>.part` after failure
+  (`rm -f $f` misses it).
+- **Pre-existing gap (not caused by this flash)**: `/etc/aginx/env`
+  (relay creds, aginx unit's env_file) is absent — and was absent
+  pre-flash too (pre-flash /etc listing has no aginx/). aginx /
+  aginx-carrier units fail-fast: running the binary by hand prints
+  "未检测到已配置的 Agent" and exits. Restoring the relay identity is a
+  separate task (secret lives outside the repo).
+
+Session end state: AginxOS rootfs #5 on slot a (active + marked, succ1);
+slot b = healthy byte-mirror (pri2/succ1); vendor_boot = ROOTFS=1 build
+(the standing operating state; stock copies untouched in boot/). All 5
+manifest packages installed; aginxbrowser ready, codex/grok registered.
