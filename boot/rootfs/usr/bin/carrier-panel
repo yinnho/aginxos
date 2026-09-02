@@ -1,20 +1,31 @@
 #!/bin/sh
-# carrier-panel — launcher tile for the carrier platform layer (2026-09-02
-# user request: carrier must be visible and testable on the phone — it is a
-# daemon, so the tile shows a live status panel instead of spawning a
-# second instance). Auto-refreshes every 10s; the launcher BACK tile is the
-# exit (aterm drops back to the launcher when the child dies).
+# carrier-panel — launcher tile for the carrier platform layer (M8). The
+# carrier is a daemon (agsvc unit), so the tile shows a live status panel
+# instead of spawning a second instance. v2 (2026-09-02, after first tap
+# test): `info` alone is two lines and the daemon only logs on events, so
+# the panel leads with the whole unit set and agent workspaces, and the
+# log section carries its own last-write stamp (pre-ntpd lines read 1970 —
+# that is the boot-time clock scale, not an error). Auto-refreshes 10s;
+# BACK (launcher toolbar) exits.
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/var/bin
+
+LOG=/var/log/agsvc/aginx-carrier.log
 
 while :; do
   clear
   echo "=== AGINX CARRIER ==="
   /var/bin/aginx-carrier info
   echo
-  agctl status aginx-carrier
+  echo "--- units ---"
+  agctl list
   echo
-  echo "--- log tail ---"
-  tail -12 /var/log/agsvc/aginx-carrier.log 2>/dev/null
+  echo "--- agents ---"
+  ls /home/.aginx/carrier/workspaces 2>/dev/null
+  echo
+  echo "--- log (last write $(stat -c %y "$LOG" 2>/dev/null | cut -d. -f1)) ---"
+  # strip ANSI: tr drops the ESC bytes, sed eats the [NNm fragments left
+  # behind (busybox sed has no \x escapes — see net-bringup precedent)
+  tail -10 "$LOG" 2>/dev/null | tr -d "\033" | sed "s/\[[0-9;]*m//g"
   echo
   echo "[$(date +%H:%M:%S)] auto 10s - BACK to exit"
   sleep 10
