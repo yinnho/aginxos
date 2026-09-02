@@ -222,6 +222,34 @@ cp "${TARGET}/agsvc" "${TARGET}/agctl" "${TARGET}/agboot-ok" "${TREE}/usr/bin/"
 # slot, flips it active (agboot-ok set-active), reboots; rollback rides on
 # ABL's tries counter as above.
 cp "${TARGET}/agupd" "${TREE}/usr/bin/agupd"
+# agpkg (M26) — package installer, Rust rewrite of the sh v0: signed
+# manifest chain (same ed25519 key as agupd) + 四件套 tars (bin/<name> +
+# pkg.toml + SKILL.md). The recipe's sh agpkg is gone; this binary is
+# the only face.
+cp "${TARGET}/agpkg" "${TREE}/usr/bin/agpkg"
+# package manifest rides SIGNED: the on-device default path requires a
+# detached sig or every `agpkg sync` refuses (fail-closed). Resign when
+# the manifest is newer than its sig; no key = hard error, not a silent
+# unsigned image.
+# Content-based check (git does not carry mtimes): resign when the sig
+# is missing, or when it no longer verifies against the manifest (a
+# machine with the pubkey can prove staleness; without it we ship the
+# committed sig as-is — it is a public artifact, safe to commit).
+AGPKG_KEY=".local/keys/agupd.key"
+AGPKG_PUB=".local/keys/agupd.pub"
+AGPKG_MF="${RECIPE}/etc/agpkg.manifest"
+AGPKG_SIG="${RECIPE}/etc/agpkg.manifest.sig"
+AGPKG_NEED_SIGN=0
+[[ -f "${AGPKG_SIG}" ]] || AGPKG_NEED_SIGN=1
+if [[ "${AGPKG_NEED_SIGN}" -eq 0 && -f "${AGPKG_PUB}" ]] \
+   && ! cargo run -q -p agsign -- verify "${AGPKG_PUB}" "${AGPKG_MF}" >/dev/null 2>&1; then
+  AGPKG_NEED_SIGN=1
+fi
+if [[ "${AGPKG_NEED_SIGN}" -eq 1 ]]; then
+  [[ -f "${AGPKG_KEY}" ]] || { echo "FATAL: ${AGPKG_MF} needs signing but ${AGPKG_KEY} is missing" >&2; exit 1; }
+  cargo run -q -p agsign -- sign "${AGPKG_KEY}" "${AGPKG_MF}"
+  echo "==> signed ${AGPKG_MF}"
+fi
 # ag (M24) — single-entry command router: flat ag-* universe, filename is
 # the route, filesystem is the registry. The ag-* sh shims in the recipe
 # ride along via the cp -R above; groups.desc in /etc/ag.

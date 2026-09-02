@@ -9,6 +9,7 @@ members = [
     "crates/agdl",
     "crates/agsign",
     "crates/agsvc",
+    "crates/agpkg",
     "crates/agupd",
     "crates/aterm",
     "crates/wifi-wizard",

@@ -48,16 +48,7 @@ use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
 
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Deserialize;
-
-/// Update-signing public key (ed25519, base64). The matching private
-/// key lives only in `.local/keys/agupd.key` on the developer machine.
-/// Rotation = ship an update (old key) embedding the next key; for now
-/// there is exactly one.
-const AGUPD_PUBKEY_B64: &str = "N/qhN+0s1P0GOJjvpcyQjxAYmwHT00z09p2+6JA5nns=";
 
 #[derive(Deserialize)]
 struct Image {
@@ -114,8 +105,11 @@ const BAK_OFF: u64 = 32 << 30;
 const SWAP_MAGIC: &[u8; 8] = b"AGXROOT1";
 // Irreplaceable device state (Wi-Fi psk, relay identity in /home/.aginx,
 // logs) staged at 64 GiB with its own ASCII marker — MUST match
-// /etc/init.d/state-restore. Re-downloadable things (/var/lib/agpkg
-// packages) deliberately do NOT ride along: the new rootfs re-provisions.
+// /etc/init.d/state-restore. M26 added /var/lib: agpkg skills/units/stamps
+// and the ag done markers live there and are NOT re-downloadable (a rootfs
+// swap without them would silently wipe every package's skill + provision
+// memory). Re-downloadable things (/var/bin binaries) deliberately still
+// do NOT ride along: the new rootfs re-provisions them.
 const STATE_OFF: u64 = 64 << 30;
 const STATE_MAGIC: &[u8; 8] = b"AGXSTATE";
 const STATE_MAX: u64 = 512 << 20;
@@ -167,7 +161,7 @@ fn stage_state_tar(staging_root: &str) {
     let _ = Command::new("/bin/sh")
         .arg("-c")
         .arg(format!(
-            "tar -cf {tar_path} /etc/wifi.conf /etc/aginx /home /root /var/log /var/power 2>/dev/null"
+            "tar -cf {tar_path} /etc/wifi.conf /etc/aginx /home /root /var/log /var/power /var/lib 2>/dev/null"
         ))
         .status();
     let len = match std::fs::metadata(&tar_path) {
@@ -440,20 +434,11 @@ fn staging_root() -> String {
 /// manifest bytes (no canonicalization — the file is signed exactly as
 /// fetched) against the compiled-in key. Called before parse, so an
 /// unsigned or tampered manifest dies without a single download.
+/// M26: the key + verify live in the agsign lib — one key, one chain,
+/// shared with agpkg's package manifest gate.
 fn verify_manifest_sig(body: &str, sig_b64: &str) {
-    let key_b: [u8; 32] = B64
-        .decode(AGUPD_PUBKEY_B64)
-        .unwrap_or_else(|e| die(&format!("internal: pubkey decode: {e}")))
-        .try_into()
-        .unwrap_or_else(|v: Vec<u8>| die(&format!("internal: pubkey {} bytes", v.len())));
-    let vk = VerifyingKey::from_bytes(&key_b).unwrap_or_else(|e| die(&format!("internal: pubkey: {e}")));
-    let sig_b: [u8; 64] = B64
-        .decode(sig_b64.trim())
-        .unwrap_or_else(|e| die(&format!("manifest sig: not base64 ({e})")))
-        .try_into()
-        .unwrap_or_else(|v: Vec<u8>| die(&format!("manifest sig: want 64 bytes, got {}", v.len())));
-    vk.verify(body.as_bytes(), &Signature::from_bytes(&sig_b))
-        .unwrap_or_else(|_| die("manifest signature INVALID — refusing this update"));
+    agsign::verify(body.as_bytes(), sig_b64)
+        .unwrap_or_else(|e| die(&format!("manifest signature INVALID — refusing this update ({e})")));
 }
 
 fn fetch_manifest(src: &str) -> Manifest {

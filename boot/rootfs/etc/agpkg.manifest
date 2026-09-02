@@ -3,9 +3,20 @@
 # absent = core. core self-heals via `agpkg sync`; opt is user-picked
 # (launcher "+" tile -> `agpkg opt-in`). ('#' comments, blank lines ok)
 #
+# M26: the default manifest is SIGNED — /etc/agpkg.manifest.sig holds a
+# detached ed25519 sig over these raw bytes (same key/chain as agupd
+# updates). sync/available/opt-in refuse an unsigned or tampered file;
+# an explicit path argument stays unsigned (adb dev loop). Edit here =>
+# re-sign on the host: agsign sign .local/keys/agupd.key <this file>
+# (scripts/build-rootfs.sh does it automatically when the sig is stale).
+#
 # The sha256 pins content, so transport honesty is not load-bearing — but
 # the canonical source is GitHub releases. On networks where GitHub stalls,
 # prefix the URL with https://gh-proxy.com/ (sha256 still verified).
+#
+# An artifact may be a bare musl binary (v0 path) or a 四件套 tar
+# (bin/<name> + pkg.toml + SKILL.md, required) — agpkg tells them apart
+# by the ustar magic.
 #
 # aginx v0.3.2 and aginx-carrier v0.1.0 musl assets shipped 2026-08-30.
 # codex/grok have no usable upstream raw-musl asset (codex ships a tarball,

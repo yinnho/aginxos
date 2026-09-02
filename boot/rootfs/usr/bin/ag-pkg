@@ -1,7 +1,9 @@
 #!/bin/sh
-# ag:summary=package manager: install/sync/available/opt-in/rollback/list
-# ag:args=install <name> <src> <sha256> | sync [manifest] | available [manifest] | opt-in <name> | rollback <name> | list
+# ag:summary=package manager: install/sync/available/opt-in/rollback/list (signed manifest, 四件套 tars)
+# ag:args=install <name> <src> <sha256> | sync [manifest] | available [manifest] [--json] | opt-in <name> | rollback <name> | list [--json]
 # ag:examples=list
+# ag:examples=list --json
+# ag:examples=available
 # ag:group=pkg
 # ag:exec=agpkg
 exec /usr/bin/agpkg "$@"

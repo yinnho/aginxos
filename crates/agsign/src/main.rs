@@ -1,16 +1,17 @@
-//! agsign — update manifest signer (M21, host tool).
+//! agsign — update/package signer CLI (M21, host tool; M26 grew a lib).
 //!
-//! Signs update manifests for agupd with ed25519. The phone-side
-//! contract: a detached signature in `<manifest>.sig` (base64 of the
-//! 64-byte ed25519 signature over the RAW manifest bytes — no JSON
-//! canonicalization anywhere), verified by agupd against a public key
-//! compiled into the binary before anything is parsed, downloaded, or
-//! written to a partition.
+//! Signs update manifests for agupd (and, M26 on, package manifests for
+//! agpkg) with ed25519. The phone-side contract: a detached signature
+//! in `<file>.sig` (base64 of the 64-byte ed25519 signature over the
+//! RAW file bytes — no JSON canonicalization anywhere), verified against
+//! a public key compiled into the binaries (lib `AGUPD_PUBKEY_B64`,
+//! M26 moved out of agupd — one key, one chain) before anything is
+//! parsed, downloaded, or written.
 //!
 //! The private key is a local secret (.local/keys/, gitignored); the
-//! public key is committed in agupd's source and rotated only by
-//! shipping an update signed with the old key that embeds the new one
-//! (key rotation is a v2 problem — one key for now).
+//! public key lives in the agsign lib and is rotated only by shipping
+//! an update signed with the old key that embeds the new one (key
+//! rotation is a v2 problem — one key for now).
 //!
 //! Usage:
 //!   agsign keygen <dir>              # writes <dir>/agupd.key (0600 hex
@@ -22,7 +23,7 @@ use std::process::exit;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 
 fn die(msg: &str) -> ! {
     eprintln!("agsign: {msg}");
@@ -58,7 +59,7 @@ fn keygen(dir: &str) {
     fs::write(&pub_path, format!("{pub_b64}\n")).unwrap_or_else(|e| die(&format!("write {pub_path}: {e}")));
     println!("private: {key_path} (0600 — never leaves this machine)");
     println!("public : {pub_path}");
-    println!("embed in agupd: AGUPD_PUBKEY_B64 = \"{pub_b64}\"");
+    println!("embed in agsign lib: AGUPD_PUBKEY_B64 = \"{pub_b64}\" (crates/agsign/src/lib.rs)");
 }
 
 fn set_0600(path: &str) {
@@ -96,21 +97,13 @@ fn verify(pub_path: &str, file: &str, sig_path: Option<&str>) {
         .unwrap_or_else(|e| die(&format!("read {pub_path}: {e}")))
         .trim()
         .to_string();
-    let key_bytes = B64.decode(pub_b64).unwrap_or_else(|e| die(&format!("pubkey: {e}")));
-    let key_bytes: [u8; 32] = key_bytes.try_into().unwrap_or_else(|v: Vec<u8>| die(&format!("pubkey: want 32 bytes, got {}", v.len())));
-    let vk = VerifyingKey::from_bytes(&key_bytes).unwrap_or_else(|e| die(&format!("pubkey: {e}")));
-
     let sig_file = sig_path.unwrap_or(&format!("{file}.sig")).to_string();
     let sig_b64 = fs::read_to_string(&sig_file)
         .unwrap_or_else(|e| die(&format!("read {sig_file}: {e}")))
         .trim()
         .to_string();
-    let sig_bytes = B64.decode(&sig_b64).unwrap_or_else(|e| die(&format!("sig: {e}")));
-    let sig_bytes: [u8; 64] = sig_bytes.try_into().unwrap_or_else(|v: Vec<u8>| die(&format!("sig: want 64 bytes, got {}", v.len())));
-    let sig = Signature::from_bytes(&sig_bytes);
-
     let bytes = fs::read(file).unwrap_or_else(|e| die(&format!("read {file}: {e}")));
-    match vk.verify(&bytes, &sig) {
+    match agsign::verify_with_key(&pub_b64, &bytes, &sig_b64) {
         Ok(()) => println!("valid"),
         Err(e) => die(&format!("INVALID: {e}")),
     }
