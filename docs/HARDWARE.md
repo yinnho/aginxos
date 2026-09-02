@@ -3851,3 +3851,45 @@ empty output — use plain `ip addr`), and a stray "Segmentation fault"
 line appears after wifi-join's "keys installed" during rejoin — join
 still returns 0 and the link comes up; suspect a busybox applet or
 wifi-join teardown; harmless to the outcome, left as a watch item.
+
+## 2026-09-02 — M20c: watchdog — softdog proven, agsvc armed, wedge E2E reset
+
+**Why the M14 bad-kernel hang sat dark.** dmesg at every boot:
+`msm_watchdog 17c10000.qcom,wdt: wdog absent resource not present` —
+the APPS-side bark/bite IRQ resources are absent from this DT, so the
+hardware watchdog never engages and nothing rescues a dead kernel. That
+class stays unrescuable on this platform; the defense is agupd's
+verify-before-write (and M21 signing). But `/dev/watchdog` still exists
+(10:130, devtmpfs): it is the **softdog fallback inside watchdog_v2**
+(identity "Software Watchdog", options 0x8180, module [permanent],
+used-by msm_poweroff) — a kernel hrtimer + emergency_restart, NOT a
+PMIC dog. It has NO watchdog-core sysfs attributes
+(/sys/class/watchdog/watchdog0/ is an empty dir) — it is a hand-rolled
+qcom misc device, so ioctl numbers must be exact: WDIOC_SETTIMEOUT is
+**_IOWR (0xC0045706)**; a _IOW guess (0x40045706) returns ENOTTY
+(measured; zig's uapi header has it right).
+
+**Live-fire proof.** `wdt probe` (new /bin/wdt, boot/rootfs/src/wdt.c):
+identity/options read fine, timeout set 128 OK, pet 5x. `wdt starve 15`:
+countdown stopped at ~8 s remaining → box hard-reset itself, adb
+re-attached, log survived — softdog resets an unpetted but kernel-alive
+system. `/dev/watchdog` never closed (nowayout) and the reset still
+landed.
+
+**Production arming: agsvc is the petter.** crates/agsvc main loop now
+opens /dev/watchdog lazily, SETTIMEOUT 180 s, KEEPALIVE every 15 s (12x
+margin against the 200 ms poll loop). Contract: supervisor alive ⇒ box
+stays up; supervisor wedged (STOP, deadlock, starved loop) ⇒ softdog
+reset ⇒ ABL tries/rollback semantics from M14 take over.
+
+**E2E wedge test — PASS.** `kill -STOP $(pidof agsvc)` at 01:37:04
+(process alive so init does not respawn — exactly the wedge class).
+Pulse: still up at t0+150 s, then `up 1 min` on the next poll. Kernel
+restart computed from `01:41:49 − /proc/uptime 101.8 s` = **01:40:07 =
+t0+183 s**, dead center in the predicted [t0+165, t0+195] window
+(180 s timeout + ≤15 s since last pet). Post-reset self-heal chain all
+green without human input: agsvc up 32.7 s, wdt armed 32.9 s
+(`agsvc: wdt armed, timeout=180s, petting every 15s` in kmsg), net-watch
+rejoined WLAN, ntpd re-synced (device GMT == host wall clock to the
+second). Power sampler (M23a) restarted post-test; idle draw ~79-91 mA
+@ ~4.46 V while "Charging" status.
