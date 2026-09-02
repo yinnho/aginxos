@@ -11,3 +11,4 @@ svc=supervised service units
 agent=avatar (clone) lifecycle
 cron=scheduled tasks
 web=browser, search and fetch tools (agb package)
+files=file read/write/list/convert tools (agf package)

@@ -1,0 +1,10 @@
+#!/bin/sh
+# ag:summary=file read/write/list/convert and image inspect (agf package)
+# ag:args=read <path> | ls <path> | write <path> [--content <text>] | convert <input> <fmt> [--out <path>] | inspect <image> | tool <name>
+# ag:examples=read output/notes.md
+# ag:examples=ls output
+# ag:examples=write output/draft.md --content "hello"
+# ag:group=files
+# Pass-through to the provisioned agf CLI (M32 D3 批2 — file tools moved out
+# as a package). Machine face `agf tool file_read` serves the runtime bridge.
+exec /var/bin/agf "$@"
