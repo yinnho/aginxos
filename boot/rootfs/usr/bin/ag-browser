@@ -1,0 +1,9 @@
+#!/bin/sh
+# ag:summary=browser automation on AginxBrowser: navigate/read/click/eval/type/scroll/wait (agb package)
+# ag:args=navigate <url> [--format markdown|html|text] [--selector <css>] [--wait-secs N] [--proxy] | read <url> [--selector <css>] | click <url> --selector <css> | eval <url> --script <js> | type <url> --selector <css> --text <t> | scroll <url> [--direction up|down] | wait <url> [--selector <css>] | back <url> | close | screenshot <url>
+# ag:examples=navigate https://example.com
+# ag:examples=read https://example.com
+# ag:group=web
+# Pass-through to the provisioned agb CLI (M31 D3 批1 — browser_* 工具外置
+# 成包). 机读面 `agb tool browser_navigate` 供 runtime 桥调用。
+exec /var/bin/agb "$@"

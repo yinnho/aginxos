@@ -1,0 +1,9 @@
+#!/bin/sh
+# ag:summary=web search (aggregated) and URL fetch with SSRF protection (agb package)
+# ag:args=search <q> [--fetch-top N] [--categories general|news|images] [--max-results N] | fetch <url> [--method GET|POST|PUT|PATCH|DELETE] [--header k=v] [--body <s>]
+# ag:examples=search aginx
+# ag:examples=fetch https://example.com
+# ag:group=web
+# Pass-through to the provisioned agb CLI (M31 D3 批1 — web_search/web_fetch
+# 工具外置成包). 风控站（微信/知乎/JD/GitHub）自动走 AginxBrowser。
+exec /var/bin/agb "$@"
