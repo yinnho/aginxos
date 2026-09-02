@@ -4105,3 +4105,20 @@ ntpd 后 `rtcal sync` 钩子已埋（best-effort），在 DTB 补丁打开开关
 节点加 qcom,allow-set-time 再刷**——收益仅限开机早期 wall 正确（ntpd
 本就纠正）与刻度整洁，不在关键路径上，暂不做。−53y 偏置下闹钟自洽
 刻度已验证精确（v7 十二循环 121s 全准点）。
+
+**选装"+"（M23 tiering）：agpkg 分层 + aterm 选装页。** manifest 行加
+第 4 栏 `[core|opt]`（缺省=core，旧行为兼容）：`sync` 只自愈 core；新增
+`available`（列未装 opt）与 `opt-in <name>`（下载安装 + 播种
+/var/apps/<id>/app.toml；已知应用优先复用 /etc/apps.d 种子保留原
+scale）。解析全 sed 组（busybox awk 在本机段错误，案底见 net-bringup）。
+aterm 启动器 builtins 头部加 "+" 砖 → `Mode::Picker`（SELECT PKGS 列表，
+点击行同步跑 opt-in，先画 INSTALLING 帧再阻塞；装毕双列表刷新、注册表
+即现启动器；BACK 返回）。**CLI E2E 全绿（2026-09-02）**：adb reverse
+隧道 + 本机 http.server 喂 corehello(3 栏)/opthello(4 栏 opt) 测试包——
+`available` 只列 opt ✓、`sync` 只装 core ✓、`opt-in` 下载+sha 校验+安装+
+播种 ✓、`available` 清空 ✓、二进制运行 ✓。测试包已清理。**grok 转
+opt tier**（manifest 第 4 栏 + 注释，/var/bin/grok 已移除备份
+/var/tmp/grok.bak）作为真实选装候选：`agpkg available` 现列 grok，
+经 "+" 装回走真 GitHub 路径。**UI 触点未上机**（无触摸注入）：aterm
+新二进制已部署并由 respawn 拉起（pid 4527，无崩溃循环），"+" 砖与
+选装页的目击验证待用户手指。
