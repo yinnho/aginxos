@@ -81,7 +81,11 @@ SYSEOF
 # interpreter path, hardcoded); the loader rides the package tree, this
 # step links it into /lib. python3 absent (sync failed/offline) => no
 # mark, retried next boot — the M27 discipline.
-if ! agdone check python-finalize; then
+# The `-e /lib/...` re-check: the marker lives in /var/lib (state tar,
+# survives rootfs swaps) but the link itself does not — after a swap the
+# marker would lie and python3 would die on a missing musl interpreter
+# (bake #9 receipt, 2026-09-03). Trust the artifact, not the mark.
+if ! agdone check python-finalize || [ ! -e /lib/ld-musl-aarch64.so.1 ]; then
   if [ -x /var/bin/python3 ]; then
     LOADER=/var/lib/agpkg/pkgfiles/python3/lib/ld-musl-aarch64.so.1
     if [ -f "$LOADER" ] \
