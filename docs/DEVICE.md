@@ -274,3 +274,5 @@ OpenDuck（[CITGuru/openduck](https://github.com/CITGuru/openduck)，
   （两层都是我们的，boot 挂载即可，见 [TERMUX-STUDY.md](TERMUX-STUDY.md)）；
   recipes 仓与分发 fallback 仍然有效
 - 商业闭环：分身进化 → 分享活实例 → 卖肉身（本卡）→ 远程使用收费
+- 竞品参照：[VIOLOOP-STUDY.md](VIOLOOP-STUDY.md)——RK3576 与 BYOK
+  双撞款验证（亿元融资竞品同选型同架构）；carrier 侧五条可学清单
