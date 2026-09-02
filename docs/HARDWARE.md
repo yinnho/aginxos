@@ -3966,3 +3966,126 @@ EBADF——pre_staged 校验路径改 read+write（设备 /usr/bin/agupd 已更�
 接近 live fs 上限后无法走 staging）；super 挂的是写死的 _a 子分区（本次
 无影响，slot _b 运行时值得复查）；选装档（aginxbrowser/grok）未随 swap
 回归，需要"+"选装 UI 落地后按档重装。
+
+## 2026-09-02 — M23b: suspend 阻塞链逐层取证（s2idle/deep + wakeup 源）
+
+**基础设施先立住。** /sys/power/state=`freeze mem`；mem_sleep=`s2idle
+[deep]`（deep 默认）。唤醒源清单（sysfs wakeup enabled）：gpio-keys、
+qpnp_pon（电源键，PMIC 常供电域）、sec_touchscreen（触摸）；RTC 有
+ surprises——rtc0 无 sysfs wakealarm 属性，但 **RTC_WKALM_SET/RD ioctl
+可用**（/tmp/rtcal 工具，zig 静态），闹钟 IRQ #203 `pm8xxx_rtc_alarm`
+走 pmic_arb，PMIC 侧，wake-capable。CONFIG_PM_WAKELOCKS=y（无活跃锁）。
+
+**阻塞链逐层剥开（每层都有 kmsg/日志回执）：**
+
+1. **表层：** 裸 `echo mem` 报 "Some devices failed to suspend, or early
+   wake event detected"——无信息量。
+2. **网络层：** /sys/class/wakeup 计数器 diff 指向 qcom_rx_wakelock/
+   IPA_WS/wlan vdev_*（活流量事件）。agctl stop 三件套 + 20 次重试环后真凶
+   显形：`msm-dwc3 a600000.ssusb: Abort PM suspend!! (USB is outside LPM)`
+   → `Abort: Callback failed on a600000.ssusb ... returned -16`。
+   **dwc3 在 gadget 绑定且 host 活跃时拒绝系统挂起——这正是 Android
+   "插线即醒"的设计**，不是 bug。
+3. **解绑层（v4，失败但证据金贵）：** `echo "" >
+   /config/usb_gadget/g1/UDC`（configfs 挂在 **/config**，不是
+   /sys/kernel/config——后者是空的）瞬间撕掉 USB，**且写进程永久挂死**
+   （gadget teardown 死锁）：脚本日志止于 unbind 前一行；heartbeat 连续
+   走了 2h20m（wall 与 uptime 同速——系统全程醒着，并非睡死）；kmsg 里
+   v4 时段零 suspend 记录（连 entry 都没发起）。只能硬重启救回。教训：
+   **UDC 文件写入在这内核上不可用作运行时操作**。
+4. **理论修正：** 用户态 `sleep N` 不是唤醒源——CLOCK_MONOTONIC 在
+   suspend 中停走（rtcwake 全用 RTC 正因如此）。任何脚本化挂起必须先武装
+   RTC 闹钟。
+5. **意外发现（独立成立）：** configfs gadget **过不了 VBUS 拔插循环**——
+   拔线即断 adb，插回不重连（pullup/session 状态需要软件重建，Android 由
+   USB HAL 状态机做）。恢复=重启。产品含义：线缆热插拔需要一个
+   vbus-watch 自愈守护（后续任务）。
+
+v5 探针（断线门控 + RTC 武装 + 不碰 gadget + 120s 拔线窗）首次运行因拔线
+晚于窗口而干净放弃（零改动路径验证 ✓）。v5b：10 分钟窗 + 结尾自动
+reboot2 干净重启，测真实场景（电池供电 s2idle 75s + RTC 自唤醒）——结果
+见下。
+
+**v5b s2idle E2E — 全链闭环（14:00 左右实测）。** 拔线 13:58:03 →
+脚本检测断线（status=Discharging）→ agctl 静默三件套 → RTC 武装 +75s →
+`ENTERED try=2`（try=1 瞬退一次——挂起瞬间被残留事件踢醒，重试环必要）→
+kmsg 铁证：
+
+```
+PM: suspend entry (s2idle)
+pm_system_irq_wakeup: 203 triggered pm8xxx_rtc_alarm
+Resume caused by IRQ 203, pm8xxx_rtc_alarm
+PM: suspend exit 05:59:17     ← 恰好 75s
+```
+
+→ 唤醒后恢复服务、sync、`reboot2` 干净自重启 → 插回 USB 后 adb 直接回来
+（用户全程只做拔线/插回两个动作）。75s s2idle 耗电 < 1mAh（charge_counter
+分辨率以下）。**结论：电池供电 s2idle 入睡 + RTC 自主唤醒 + 干净退出 +
+自动恢复，全部成立。** deep 模式 + 15 分钟浸泡测功耗随后（结果续记）。
+
+**deep +900 实测（15:0x 一轮）：入睡 ✓、RTC 唤醒 ✓、但只睡 20.04s。**
+kmsg：`PM: suspend entry (deep)` → `pm_system_irq_wakeup: 203 triggered
+pm8xxx_rtc_alarm` → `Resume caused by IRQ 203`。printk 时间戳是
+CLOCK_MONOTONIC（不含挂起时间），不能用来判时长；判别器是采样器：
+`/proc/uptime` 在本内核含挂起时间（boottime），真挂起会冻结采样器的
+`sleep 10`，醒来后下一个样本的 uptime 出现 >10s 的跳变——实测 220→250
+（+10 sleep + **20s 挂起**）✓ 与 wall 差值 06:39:53.637→06:40:13.681
+（20.04s）互证。**由此校准：跨挂起的 wall 差值是真流逝**，回溯确认
+s2idle 的 +75s 是真睡满（且闹钟精确）；charge_counter 零增量诚实一致。
+
+**deep 20 秒早醒之谜（未解）**：闹钟按 RTC 自身刻度设 +900（刻度自洽：
+醒态 +60s 实测准点触发、`/proc/interrupts` 计数吻合；RTC 恒定偏置
+-53y、走时醒态精确），但 deep 下 +20.04s 就由 IRQ 203 唤醒——比刻度早
+~877s。怀疑内核挂起路径重排闹钟/PMIC 域切换副作用。下一轮 deep+120
+判别"20s 是否与闹钟时长无关"。另：RTC 偏置 -53y 与系统时间不一致本身
+就让 rtc suspend/resume 簿记失真——正解可能是启动时把 RTC 设为真时间
+（ntpd 后 settimeofday→RTC），列待办。
+
+**采样器 v2**：原 pwr-sample.sh 每次启动截断同名日志（deep 那轮的样本
+只是恰好没人覆盖才幸存）——改为 `idle-MMDD-HHMM.log` 唯一名。
+
+**deep 20s 早醒判别（deep+120 一轮）：系统性，与闹钟时长无关。**
+同样 try=2 入睡、同样 IRQ 203 `pm8xxx_rtc_alarm` 唤醒，wall 差
+07:39:22.836→07:39:42.643 = **+19.81s**（上一轮 +900 请求是 +20.04s）。
+两次闹钟刻度差 780s，实睡差 0.23s——deep 下唤醒时刻不跟随闹钟，恒定
+~20s。疑点方向：内核 alarmtimer 在挂起入口重排 RTC 闹钟（alarmtimer
+子系统会为内核侧 alarm 重编程 rtc0，覆盖我们 rtcal 设的值），或 PMIC
+power-collapse 下闹钟比较行为变化。判别实验（待办）：deep 完全不设闹钟
+看是否仍在 ~20s 醒（若是→RTC IRQ 线自身在 power-collapse ~20s 产生
+事件；若否→alarmtimer 重排是根因）。s2idle 不受影响（+75.0s 精确），
+故长浸泡功耗测量走 s2idle。
+
+**s2idle +900 首轮（15:47 拔线）：只睡 409.5s，alarmtimer 现身。**
+try-2 打出 `Abort: Callback failed on alarmtimer ... returned -16`
+（alarmtimer 子系统在挂起路径会重排 rtc0 闹钟——deep 20s 之谜的机制
+就在这里），try-3 入睡 07:47:06.089→07:53:55.611 = +409.5s 后被一个
+**非 IRQ 定时器**唤醒（无 pm_system_irq_wakeup/resume-cause 行）——
+s2idle/freeze 下 CLOCK_REALTIME 类定时器照常运行，长浸泡会被任意挂起
+不可停的定时器切短。我们的 RTC 闹钟（+900）没到点（刻度差 490s），
+不是它唤醒的。功耗数字未落地：charge Δ=0（409s@~8mA≈0.9mAh 在
+1mAh 分辨率下），采样器挂起中冻结、醒来后 reboot2 又跑赢下一个 10s
+采样。发现 `/sys/kernel/wakeup_reasons/{last_resume_reason,
+last_suspend_time}` 存在——v6 探针醒来即抓，点名唤醒者。
+
+**qg-fifo-done 静音尝试（败）+ v7 多循环绕行（成）。** 静音路线全部堵死：
+qg 平台设备 `c440000.qcom,spmi:...@2:qpnp,qg` 无 `power/` 目录；
+`/sys/kernel/irq/313/wakeup` 是 0444 只读（SELinux Disabled、root、sysfs rw
+下 chmod 644 成功但 store 全语法 `0/off/disabled/enabled/1` 一律 rc=1 静默
+失败——此内核把 irq wakeup 属性编成只读）。改绕：v7 每循环 RTC+120s 睡、
+醒后立即再睡，15 循环（2026-09-02 16:35 拔线 ~26.5min 窗口）。结果：
+**15/15 循环全部入睡+唤醒**；12 次被 IRQ 203 RTC 精确唤醒（arm 差 121s =
+120 睡 + ~1s 醒转），qg-fifo-done 只切短 c4/c8/c12 各 ~47s——arm 时间戳
+1761417→1761828→1762238，**tick 节拍实测 410/410s**，与此前两轮 409.5s
+切割互证。累计真睡 ≈ 12×120 + 3×47 ≈ **1575s（窗口占比 ~98.7%）**。
+脚本 bug：`last_suspend_time` 是两行（abort 行+duration 行），`awk '{print
+$2}'` 取空 → susp 全记 0s；时长由 arm 差恢复，无需重跑（下版取 `$1` 第二行）。
+
+**M23a 首个功耗界（s2idle）**：整窗 charge_counter 4187→4187 mAh **Δ=0**
+（1595s，FIFO 报告粒度 ~410s + 1mAh 分辨率，两端边界噪声 ~±0.9mAh）
+→ 窗口平均电流 **< ~2.3mA**，扣除醒转间隙（~20s×−60mA）后 **s2idle
+平均 < ~4mA ≈ <18mW @4.4V**（下界不可分辨）。醒转间隙实测：采样器唯一
+幸存帧 −59.8mA@4400mV（服务全停、灭屏醒态，含 modem/wifi 待机）；
+脚本醒后即读 −198mA 为 resume 瞬态（与 Δ=0 不相容，弃）。电压
+4418.8→4399.6mV 是拔线后弛豫，非耗量证据。**结论记为区间/上限，非点值**；
+拿点值的路径：≥3h 连续浸泡（Δ~10mAh 量级）——可被动挂机过夜跑
+~100 循环版 v7。
