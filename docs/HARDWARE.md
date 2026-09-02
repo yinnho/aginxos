@@ -4291,9 +4291,46 @@ stamp 保留）；推送后 sync 实测四件全重装（aginx 走 gh-proxy 重�
 bbac1017=本地构建 → sync sha mismatch。manifest 重 pin c0d490d3 + 重签。
 **结构性发现：state tar 只带 wifi.conf+/etc/aginx，不带
 /etc/agpkg.manifest——换机后 manifest 回退烤内版本**（第三次换机又翻回
-bbac pin 即此）；烤 #9 折入新 manifest。provision pkg fail 后仍写 done ok
-（失败不重试——正是 M27 标记纪律要立的洞）。AP DNS 阵发失联
+bbac pin 即此）；烤 #9 折入新 manifest。（更正 2026-09-03：本条原记
+"provision pkg fail 后仍写 done ok（失败不重试）"——归因错了。`done ok`
+是 net-bringup 的收尾行，不是 provision 写的；provision 无记忆、每靴
+重跑 sync，真正的洞是"一次性步骤没有标记纪律"（M27 立）+ 单元在空
+/var/bin 窗口重启耗尽后没人扶（M27 的 resync 后 restart 补）。）AP DNS 阵发失联
 （github/gh-proxy 双双 Try again，后自愈）；codex 233MB 在换机后完整重下
 成功过一次。/root/bin 垫片用完即删。设备终态：烤 #8 fs（第三次换机后）+
 推送覆盖 agupd(9434a35d)/agpkg(d7d57e9d)/manifest(c0d490d3 pin)+sig；
 stamps×4；/var/bin 四件经修复后 sync 重装。
+
+### M27 — provision 三层 + ag-done 标记纪律（2026-09-03）
+
+**件**：`crates/agdone`（Rust，agio 信封）→ /usr/bin/agdone + sh shim
+/usr/bin/ag-done（ag:group=sys）；标记态 /var/lib/ag/done/<name>（内容
+= mark 时刻 epoch 秒，仅人读，存在即真值）。语义：check rc 0=已标记 /
+3=未标记（查询合法答案，非失败）/ 1=io；坏标记（路径被目录占位）当
+未标记；名字限 [A-Za-z0-9._-]（遍历类 usage rc 2）；--json 出 ok:true
+信封但 rc 仍 3（脚本按 rc 分支、JSON 按 data 分支）。ensure 刻意区别于
+步骤惯用法——ensure 先盖戳再干活，步骤失败标记已在，恰是要堵的洞；
+步骤的正确姿势 `agdone check x || { step && agdone mark x; }`。
+
+**实测（adb 直跑 + ag done 路由）**：未标记 rc3 → mark rc0 → check rc0
+→ JSON 信封 {"ok":true,"data":{"marked":true},"meta":{"at":…}} →
+list → reset 幂等 rc0；目录占位标记 rc3 ✓；`mark ../escape` rc2 ✓；
+`ag commands --check` **18 OK**（ag-done 入册）。
+
+**provision v2 三层**（/etc/init.d/provision 重写，md5 推送验证）：
+- **seed**：mkdir /var/lib/ag/done + agpkg 三目录（烤树也补了——busybox
+  tar 缺成员退 1 的防线，M26）。
+- **resync**：agpkg sync 每靴跑，输出改落 /var/tmp/agpkg-sync.log
+  （boot.state 只记 pkg ok/fail 一行）；app-registry 无条件随后（原来
+  只在 sync 成功才跑）；**本靴装过的包解析 `^agpkg: installed (<name>)`
+  后 `agctl restart <name>`**——针对 2026-09-02 观察（空 /var/bin 窗口
+  aginx 5 次重启耗尽 → failed，人工 restart 才活）。
+- **finalize**：agdone-gated 一次性步骤位就绪，首个租户 M28（python+pip）。
+
+**双启验收**：首启 boot.state `pkg run → pkg ok → done ok`（done ok 是
+net-bringup 的行——上面那条更正的活证据）；sync log 四件全 "up to
+date"（M26 的 stamp+binary 双闸在位，零重下）；/var/lib/ag/done 由 seed
+本靴建（mtime 18:29）；agctl 四单元 ready 无人工干预；agent me +
+clone-creator running。**第二启 77s 到位（与首启同速）**、四件仍全 up
+to date、单元全 ready、标记区空——幂等快道 ✓。设备终态：烤 #8 fs +
+推送 agdone/ag-done shim/provision v2；slot _b；无悬挂 swap 头。
