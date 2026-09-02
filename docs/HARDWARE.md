@@ -3916,3 +3916,53 @@ agsign sign/verify/tamper passed first (Verification equation was not
 satisfied on tamper). Binary cost: agupd 281 KB → 482 KB (ed25519-
 dalek, static musl). Rootfs bake #6 will fold it in; until then the
 on-device binary is hand-swapped (state noted above).
+
+## 2026-09-02 — M22: rootfs 自更新 — staged swap E2E 全链路 PASS（三次失败取证）
+
+rootfs 换血成功：设备从 c95e7c1（bake #5）原地换成 590edc5（bake #6，1 GiB），
+wifi/relay/.aginx/日志全数回归，slot _b 标记 successful。协议链每一段都有
+设备回执：
+
+**agupd apply（pre_staged 路径）。** boot+vendor_boot 写 _b（sha256 校验）→
+state tar 4.9 MB 落 64 GiB → 对 userdata 块设备 pread 原位哈希 1 GiB body
+（manifest 签名锚定）→ swap 头最后落 8 GiB（commit 点）→ set-active _b。
+1 GiB 镜像体由 host 侧 `cat img | adb shell dd seek=2097153` 直灌块设备——
+Live fs 只有 926 MiB 空闲，稀疏镜像 adb push 会膨胀，直灌是唯一路径，且
+agupd 的块上哈希就是传输完整性证明。
+
+**trampoline swap（kmsg 回执）。** t+29.4 `rootfs-swap: pending (new
+1073741824 B, old fs 2040373248 B) — hashing staged body` → t+51.4 `body
+sha256 ok — backing up current fs` → t+73.5 `new rootfs written, marker
+cleared — mounting`。哈希 1 GiB ≈22 s，备份+拷入 ≈22 s。开机后 `/etc/
+aginx-version` = 590edc5，provision 重下 required 档（aginx/carrier/
+codex；browser/grok 选装档未装），agctl 全 ready，internet ok。
+
+**失败 1 — ROOTFS=1 少了 USBADB=1：slot _b 七连灭回滚。** 首次打包只给了
+ROOTFS=1，产出的 vendor_boot 缺 modules.usb/toybox/props/usb-adb/hold 五件
+（对比正在运行的 vb_a 解包差异定位）。_b 起不来（无 gadget、无 sh、无属性
+区），ABL 耗尽 7 tries 回滚 _a，swap 头和 state marker 原封未动——协议的
+crash-safe 设计经受住了这次真崩溃：旧 fs 无损。pack 脚本现在直接拒绝
+ROOTFS=1 而无 USBADB=1。教训：**打包 flag 集合以解包对比为准，不看脚本
+echo**（echo 全是 note 级，静默降级无报错）。
+
+**失败 2 — busybox ash 八进制陷阱：state-restore 三次静默不执行。** swap
+成功后 /home/.aginx、/var/power 未回归，marker 还在。root cause：marker 的
+16 位零填充长度 `0000000004896256` 进 `$(( ))` 被 busybox ash 按八进制解析
+（数字含 9）→ "arithmetic syntax error" → 整个脚本中止，且发生在任何输出
+之前。欺骗性在于：**手动 sh -x 全是通过 adb shell 的 toybox sh 跑的
+（十进制容忍），所以每次手动都"正常"**——用 /bin/busybox sh 复跑当场复现。
+修复：先剥前导零再算术。副产品：state-restore 全程自捕获到
+/var/state-restore.log（ash 自身的报错行正是破案证据），kmsg 输出改为
+先测可写的通道。修复后启动路径回执：t+32.6 `marker found (4901376 B tar)
+— restoring` → `ok` → `marker cleared`，状态全回。
+
+**附带修复。** mke2fs 从不 truncate 已存在的输出文件——SIZE=1g 重烤后 stat
+仍是 2 GiB（尾部是旧镜像字节）；build-rootfs.sh 现在先 rm。agupd
+commit_rootfs_swap 的 blkdev 原以 O_WRONLY 打开，pwrite 能过而 pread 直接
+EBADF——pre_staged 校验路径改 read+write（设备 /usr/bin/agupd 已更新为
+修复版）。
+
+后续待办（记入任务）：生产 https rootfs 更新需要 agdl 直灌偏移（镜像大小
+接近 live fs 上限后无法走 staging）；super 挂的是写死的 _a 子分区（本次
+无影响，slot _b 运行时值得复查）；选装档（aginxbrowser/grok）未随 swap
+回归，需要"+"选装 UI 落地后按档重装。
