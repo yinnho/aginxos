@@ -4122,3 +4122,15 @@ opt tier**（manifest 第 4 栏 + 注释，/var/bin/grok 已移除备份
 经 "+" 装回走真 GitHub 路径。**UI 触点未上机**（无触摸注入）：aterm
 新二进制已部署并由 respawn 拉起（pid 4527，无崩溃循环），"+" 砖与
 选装页的目击验证待用户手指。
+
+**"+" 触点上机（2026-09-02，用户手指）**：启动器 "+" 砖 → SELECT PKGS
+页渲染正常（列表/hit 区）→ 点击 GROK 行 → INSTALLING 帧出现、下载真实
+发生（grok.part 增长）。**大包慢源实测**：grok 172MB，GitHub 直连
+27KB/s → ETA 27 分钟——v0 同步阻塞安装 = 屏幕 27 分钟冻死无响应、
+无取消。止损：kill agdl/agpkg 重试链（agpkg 的 gh-proxy 回退会再拉一
+次，须连杀）→ aterm 弹回选装页（FAILED 路径，pid 稳定未崩）；grok
+从 /var/tmp/grok.bak 秒装回（sha 与 manifest 同，/var/apps/grok/
+app.toml 未动，启动器砖恢复）。**跟进两项（用户指示晚点处理）**：
+① aginx.net 软件镜像（#87，服务器侧，客户端零改动——治"慢"）；
+② aterm 异步安装+进度+取消（治"冻"）。carrier 非启动器应用属设计
+（agsvc 服务，pid 在跑），用户疑问已释。
