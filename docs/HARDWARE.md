@@ -4228,3 +4228,31 @@ provision 对它是 no-op。**adb 壳假象记录**：adb mksh 无 HOME，从 ad
 运行 fs 的覆盖（/usr 持久，重启不丢）；**烤 #8（M26 时点）折入**：
 aterm/agsvc/ag(agio)/manifest v0.2.1/ag-sys-rtc 头。设备终态：8c7c00d
 烤 + 推送覆盖，aginx/aginx-carrier/net-watch ready。
+
+**M26 — agpkg Rust 重写：签名 manifest + 四件套（2026-09-03，设备实测
+收口）。** **签名链**：agsign 长出 lib（AGUPD_PUBKEY_B64 挪入，agupd 内联
+副本删除——一钥匙一链，更新与包同源）；/etc/agpkg.manifest 现带 detached
+ed25519 .sig（build-rootfs.sh 内容校验式自动重签，git 不保 mtime 故不用
+时间戳判陈旧）。设备实测：.sig 挪走后 `agpkg sync` 拒（rc=1，auth/
+manifest_unsigned）✓；恢复后 sync 过签名门、aginx/aginx-carrier 报 up
+to date 并**落 stamps**（legacy 疗愈路径：无 stamp 时按二进制自身 sha 对
+manifest，M26 前安装即此愈合）✓；aginxbrowser/codex 缺失走下载（AP 仍
+拥塞，FAILED kept previous，rc=1——自愈语义正确）。**四件套**（手工 tar：
+bin/demo + pkg.toml[name/#[service] cmd/type/autostart] + SKILL.md，ustar
+格式）：`agpkg install demo <tar> <sha>` → /var/bin/demo(mode 755)、
+/var/lib/agpkg/skills/demo/SKILL.md、units/demo.toml（[unit]name+[service]
+原样序列化）、stamps/demo=tar sha，**agctl reload 即时生效——`agctl
+list` 无重启出现 demo 行**（M16 覆盖通道首次有写入者）✓。`ag pkg list`
+人读三行（demo 带 skill,unit 旗标）、`--json` D1 信封一条
+{"ok":true,"data":[…],"meta":{"count":3}} ✓——demo 的 stamp=tar sha 而
+binary sha 不同，正是 tar 包的 stamp 语义。**篡改拒绝**：假 sha 安装
+rc=1 + hint ✓。**回滚**：装 v2（SKILL 变 v2、.prev=v1 二进制）→
+`agpkg rollback demo` 二进制回 v1、stamp 作废（下次 sync 重愈）、skill
+保持 v2（回滚仅二进制，v0 语义不变）✓。**mode 修正**：首版 fs::write
+落 666（设备 umask 0）——skills/units/stamps 改显式 644（skill 文档是
+agent 消费面，不该全局可写），重推重装实测 644 ✓。`ag commands --check`
+17 OK（ag-pkg shim 头更新后）。sh agpkg（179 行）退役删除。**首启
+provision 绿未单独验**（需重启；签名 manifest+新 agpkg 已在位，下次开机
+provision 即走签名门——留 bake #8 重启观察）。设备终态：8c7c00d 烤 +
+/usr/bin/agpkg(Rust)、/etc/agpkg.manifest{,.sig}、demo 四件套（一次性
+验收件）推送在位。
