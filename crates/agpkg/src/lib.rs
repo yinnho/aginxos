@@ -552,10 +552,15 @@ pub fn cmd_sync(p: &Paths, manifest: Option<&Path>, pubkey_b64: &str) -> Result<
         if e.tier == Tier::Opt {
             continue;
         }
-        // up-to-date = stamp matches (tar or binary), else the v0
-        // legacy check on the binary's own hash, which also heals the
-        // stamp for pre-M26 installs.
-        if read_stamp(p, &e.name).as_deref() == Some(e.sha256.as_str()) {
+        // up-to-date = stamp matches AND the binary is actually there.
+        // Stamp alone is not enough: a rootfs swap (or any rm) wipes
+        // /var/bin while the stamps ride the state tar — trusting the
+        // stamp alone left the phone "up to date" with nothing installed
+        // (observed 2026-09-03, first swap with /var/lib in the state
+        // tar). Else the v0 legacy check on the binary's own hash, which
+        // also heals the stamp for pre-M26 installs.
+        let bin = p.bindir.join(&e.name);
+        if read_stamp(p, &e.name).as_deref() == Some(e.sha256.as_str()) && bin.exists() {
             println!("agpkg: {} up to date", e.name);
             continue;
         }
@@ -955,6 +960,14 @@ mod tests {
         // stamp match -> up to date even though bindir binary differs
         fs::write(p.bindir.join("old"), b"tar-extracted-different").unwrap();
         assert_eq!(cmd_sync(&p, Some(&m), &pub_b64).unwrap(), 0);
+
+        // stamp present but binary GONE — a rootfs swap wipes /var/bin
+        // while the stamps ride the state tar; up-to-date must require
+        // the binary too, so this takes the download path (agdl is a
+        // nonexistent path here -> rc 1, stamp kept for the next round).
+        fs::remove_file(p.bindir.join("old")).unwrap();
+        assert_eq!(cmd_sync(&p, Some(&m), &pub_b64).unwrap(), 1);
+        assert_eq!(fs::read_to_string(p.stamps.join("old")).unwrap().trim(), sha);
 
         // default manifest absent -> quiet no-op (v0), not an error
         assert_eq!(cmd_sync(&p, None, &pub_b64).unwrap(), 0);
