@@ -1,0 +1,8 @@
+#!/bin/sh
+# ag:summary=join a WPA2-PSK network (supplicant + EAPOL, then udhcpc)
+# ag:args=<ifname> <ssid> <passphrase>
+# ag:examples=wlan0 MyNet 'the passphrase'
+# ag:group=net
+# ag:requires-sudo=true
+# ag:exec=wifi-join
+exec /bin/wifi-join "$@"

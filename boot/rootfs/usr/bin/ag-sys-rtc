@@ -1,0 +1,7 @@
+#!/bin/sh
+# ag:summary=pm8xxx RTC alarm arm/read/sync (M23b suspend wake path)
+# ag:args=read | sync | set <epoch> | arm <epoch>
+# ag:examples=arm 1798761600
+# ag:group=sys
+# ag:exec=rtcal
+exec /bin/rtcal "$@"

@@ -25,6 +25,7 @@ test -x "${RAMDISK}/system/bin/adbd" || { echo "missing ${RAMDISK} — run boot/
 test -x "${RECIPE}/busybox" || { echo "missing ${RECIPE}/busybox" >&2; exit 1; }
 test -x "${TARGET}/aginxos-init" || { echo "missing musl binaries — run scripts/build-phone.sh musl first" >&2; exit 1; }
 test -x "${TARGET}/aterm" || { echo "missing aterm — run scripts/build-phone.sh musl first" >&2; exit 1; }
+test -x "${TARGET}/ag" || { echo "missing ag router — run scripts/build-phone.sh musl first" >&2; exit 1; }
 MKE2FS="$(command -v mke2fs || true)"
 test -z "${MKE2FS}" && MKE2FS=/opt/homebrew/bin/mke2fs
 test -x "${MKE2FS}" || { echo "mke2fs not found (android-platform-tools provides it)" >&2; exit 1; }
@@ -221,6 +222,10 @@ cp "${TARGET}/agsvc" "${TARGET}/agctl" "${TARGET}/agboot-ok" "${TREE}/usr/bin/"
 # slot, flips it active (agboot-ok set-active), reboots; rollback rides on
 # ABL's tries counter as above.
 cp "${TARGET}/agupd" "${TREE}/usr/bin/agupd"
+# ag (M24) — single-entry command router: flat ag-* universe, filename is
+# the route, filesystem is the registry. The ag-* sh shims in the recipe
+# ride along via the cp -R above; groups.desc in /etc/ag.
+cp "${TARGET}/ag" "${TREE}/usr/bin/ag"
 chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/touch-bringup" "${TREE}/etc/init.d/battery-bringup" \
   "${TREE}/etc/init.d/radio-bringup" "${TREE}/etc/init.d/audio-bringup" \
@@ -233,8 +238,12 @@ chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/usr/bin/wifi-wizard" "${TREE}/usr/bin/agsvc" \
   "${TREE}/usr/bin/agctl" "${TREE}/usr/bin/agboot-ok" \
   "${TREE}/usr/bin/agupd" \
+  "${TREE}/usr/bin/ag" \
   "${TREE}/usr/bin/net-rejoin" "${TREE}/usr/bin/net-watch" \
   "${TREE}/bin/wdt"
+# ag-* sh shims (M24): recipe files may not carry the exec bit through
+# git/cp, and a non-executable shim is invisible to the router.
+for s in "${TREE}/usr/bin/"ag-*; do chmod 755 "${s}"; done
 # NB: wifi.conf.example rides along in ${RECIPE}/etc — the real
 # /etc/wifi.conf (with the passphrase) is pushed by hand, never committed.
 cp "${TARGET}/aginxos-init" "${TARGET}/aginxos-agent" "${TREE}/aginxos/"
@@ -263,6 +272,18 @@ fi
 mkdir -p "${TREE}/etc/ssl/certs"
 cp "${CACERT}" "${TREE}/etc/ssl/certs/ca-certificates.crt"
 ln -sf certs/ca-certificates.crt "${TREE}/etc/ssl/cert.pem"
+
+# Registry gate (M24): lint the assembled command set with a host-built
+# ag before the image is packed. AG_CMD_PATH points at the tree's bin dirs
+# so ag:exec targets baked into /bin resolve; /var/bin is device-provisioned
+# (absent here), which is why the carrier pass-through shims declare no
+# ag:exec. Fails the build on collisions, missing summaries, bad metadata,
+# or missing exec targets.
+cargo build -p ag --release >/dev/null
+AG_CMD_PATH="${TREE}/usr/bin:${TREE}/bin:${TREE}/sbin" \
+AG_GROUPS_DESC="${TREE}/etc/ag/groups.desc" \
+  "${ROOT}/target/release/ag" commands --check \
+  || { echo "ag commands --check failed — fix the shims" >&2; exit 1; }
 
 mkdir -p "${ROOT}/out"
 # rm first: mke2fs never truncates an existing output file, so a SIZE

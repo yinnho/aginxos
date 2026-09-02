@@ -1,0 +1,15 @@
+[package]
+name = "ag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AginxOS single-entry command router: flat ag-* universe, file-is-registry, exec dispatch"
+
+[dependencies]
+libc = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,7 @@
+#!/bin/sh
+# ag:summary=supervised service units: list/status/start/stop/restart/reload/logs
+# ag:args=list | status <name> | start|stop|restart <name> | reload | logs <name>
+# ag:examples=logs aginx-carrier
+# ag:group=svc
+# ag:exec=agctl
+exec /usr/bin/agctl "$@"

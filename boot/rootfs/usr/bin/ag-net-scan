@@ -1,0 +1,7 @@
+#!/bin/sh
+# ag:summary=trigger an nl80211 scan and dump results (WLAN operability, M3f)
+# ag:args=<ifname>
+# ag:examples=wlan0
+# ag:group=net
+# ag:exec=nlscan
+exec /bin/nlscan "$@"

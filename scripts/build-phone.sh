@@ -34,7 +34,8 @@ build_musl() {
 
 pkgs=()
 case "${CRATE}" in
-  all) pkgs=(aginxos-probe aginxos-agent aginxos-init agdl agsvc agupd aterm wifi-wizard) ;;
+  all) pkgs=(ag aginxos-probe aginxos-agent aginxos-init agdl agsvc agupd aterm wifi-wizard) ;;
+  ag|router) pkgs=(ag) ;;
   probe|aginxos-probe) pkgs=(aginxos-probe) ;;
   agent|aginxos-agent) pkgs=(aginxos-agent) ;;
   init|aginxos-init) pkgs=(aginxos-init) ;;

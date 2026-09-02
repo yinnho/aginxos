@@ -1,0 +1,7 @@
+#!/bin/sh
+# ag:summary=send a raw QMI request over QRTR (single client, M7)
+# ag:args=<node> <port> <msgid> [hextlv|""] [msgid tlv ...]
+# ag:group=sys
+# ag:hidden=true
+# ag:exec=qmi-req
+exec /bin/qmi-req "$@"

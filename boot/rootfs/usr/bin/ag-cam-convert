@@ -1,0 +1,7 @@
+#!/bin/sh
+# ag:summary=convert a RAW10 dump to JPEG (companion to cam-shot, M19c)
+# ag:args=<raw> <w> <h> <stride> [q] [--gray|--color] [--cfa rggb|bggr|gbrg|grbg] [--out FILE]
+# ag:examples=/tmp/frame.raw 4032 3024 4032 85 --color --out /tmp/shot.jpg
+# ag:group=cam
+# ag:exec=raw2jpg
+exec /bin/raw2jpg "$@"

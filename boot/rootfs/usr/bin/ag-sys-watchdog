@@ -1,0 +1,7 @@
+#!/bin/sh
+# ag:summary=watchdog probe / arm / starve over /dev/watchdog (M20c)
+# ag:args=probe | arm <secs> | starve <secs>
+# ag:examples=probe
+# ag:group=sys
+# ag:exec=wdt
+exec /bin/wdt "$@"

@@ -1,0 +1,7 @@
+#!/bin/sh
+# ag:summary=play a raw S16_LE file to a PCM device (M18 speak path)
+# ag:args=<pcm-dev> <infile> [rate] [chans] [vol]
+# ag:examples=/dev/snd/pcmC0D0p /tmp/out.pcm 16000 1 80
+# ag:group=snd
+# ag:exec=snd-play
+exec /bin/snd-play "$@"

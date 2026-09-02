@@ -1,0 +1,12 @@
+# ag groups.desc — group key = one-line menu description (M24).
+# File-is-registry: a package introduces a new group by appending a line
+# here, no router reflash. Read by `ag` at menu time; AG_GROUPS_DESC
+# overrides for tests and the build-time --check gate.
+cam=camera capture and conversion
+snd=audio capture, playback, mixer
+net=wi-fi scan, join, trace
+sys=system control and hardware introspection
+pkg=package install and sync
+svc=supervised service units
+agent=avatar (clone) lifecycle
+cron=scheduled tasks

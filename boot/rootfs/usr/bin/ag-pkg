@@ -1,0 +1,7 @@
+#!/bin/sh
+# ag:summary=package manager: install/sync/available/opt-in/rollback/list
+# ag:args=install <name> <src> <sha256> | sync [manifest] | available [manifest] | opt-in <name> | rollback <name> | list
+# ag:examples=list
+# ag:group=pkg
+# ag:exec=agpkg
+exec /usr/bin/agpkg "$@"

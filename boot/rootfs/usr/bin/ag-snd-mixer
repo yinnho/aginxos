@@ -1,0 +1,7 @@
+#!/bin/sh
+# ag:summary=get or set an audio mixer control (get: 1 arg, set: 2 args)
+# ag:args=<ctl> [value]
+# ag:examples='RX Codec Gain' 6
+# ag:group=snd
+# ag:exec=snd-mixer
+exec /bin/snd-mixer "$@"

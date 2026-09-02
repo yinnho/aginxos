@@ -1,0 +1,8 @@
+#!/bin/sh
+# ag:summary=reboot the device, or land in fastboot with 'bootloader'
+# ag:args=[bootloader]
+# ag:examples=bootloader
+# ag:group=sys
+# ag:requires-sudo=true
+# ag:exec=reboot2
+exec /bin/reboot2 "$@"

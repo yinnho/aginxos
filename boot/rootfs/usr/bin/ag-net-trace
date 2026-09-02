@@ -1,0 +1,6 @@
+#!/bin/sh
+# ag:summary=flip QCA vendor dp-trace levels for WLAN TX/RX logs (M4)
+# ag:group=net
+# ag:hidden=true
+# ag:exec=wifi-trace
+exec /bin/wifi-trace "$@"

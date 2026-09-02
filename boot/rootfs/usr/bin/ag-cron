@@ -1,0 +1,8 @@
+#!/bin/sh
+# ag:summary=scheduled tasks owned by avatars
+# ag:args=list [--agent <name>]
+# ag:examples=list
+# ag:group=cron
+# Pass-through to the provisioned carrier binary (/var/bin/aginx-carrier,
+# first-boot must-exist) — no ag:exec for the same reason as ag-agent.
+exec /var/bin/aginx-carrier cron "$@"

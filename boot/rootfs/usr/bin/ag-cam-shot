@@ -1,0 +1,7 @@
+#!/bin/sh
+# ag:summary=capture a still from a camera sensor (M19 IFE/RDI path)
+# ag:args=[--stream] [--rear|--uw] [--slowrear] [--rawvendor] [--gain N] [--png] [--jpeg] [--out FILE]
+# ag:examples=--stream --rear --rawvendor --png --out /tmp/shot.png
+# ag:group=cam
+# ag:exec=cam-shot
+exec /bin/cam-shot "$@"

@@ -1,0 +1,8 @@
+#!/bin/sh
+# ag:summary=read/write codec registers over /dev/i2c-N (bring-up tool)
+# ag:args=[-w] <i2c-dev> <addr> <reg> [val...]
+# ag:examples=/dev/i2c-10 0x20 0x1000
+# ag:group=sys
+# ag:hidden=true
+# ag:exec=i2c-reg
+exec /bin/i2c-reg "$@"
