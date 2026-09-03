@@ -221,6 +221,9 @@ cp -R "${RECIPE}/usr/bin/." "${TREE}/usr/bin/"
 cp "${TARGET}/agdl" "${TREE}/usr/bin/agdl"
 # aterm (M11) — the on-device terminal UI: launcher + pty shell on the panel.
 cp "${TARGET}/aterm" "${TREE}/usr/bin/aterm"
+# CJK font subset (M38a) — aterm cjk.rs rasterizes through ab_glyph;
+# GB2312 full + ASCII + punct rows, ~1.5MB (scripts/subset-cjk-font.sh).
+cp -R "${RECIPE}/usr/share/fonts" "${TREE}/usr/share/fonts"
 # wifi-wizard (M10) — first-boot Wi-Fi setup TUI (scan/pick/password),
 # auto-started by aterm when /etc/wifi.conf is missing.
 cp "${TARGET}/wifi-wizard" "${TREE}/usr/bin/wifi-wizard"
