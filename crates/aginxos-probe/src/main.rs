@@ -30,7 +30,7 @@ fn main() {
                 std::process::exit(code);
             }
             other => {
-                eprintln!("unknown subcommand: {other} (try: vidc caps | vidc decode <in.h264> <out> [n])");
+                eprintln!("unknown subcommand: {other} (try: vidc caps | vidc decode <in.h264> <out> [n] | vidc show <in.h264>)");
                 std::process::exit(2);
             }
         }

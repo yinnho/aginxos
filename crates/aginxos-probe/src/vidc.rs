@@ -691,7 +691,14 @@ fn find_m2m_node() -> Result<String, String> {
     Err("no msm_vidc_vdec device found".into())
 }
 
-pub fn decode(stream_path: &str, out_prefix: &str, want_frames: usize, heap_mask: u32) -> Result<(), String> {
+pub fn decode(
+    stream_path: &str,
+    out_prefix: &str,
+    want_frames: usize,
+    heap_mask: u32,
+    disp: Option<&mut DrmDisplay>,
+) -> Result<(), String> {
+    let mut disp = disp;
     let stream = fs::read(stream_path).map_err(|e| format!("read {stream_path}: {e}"))?;
     let aus = split_access_units(&stream);
     // AU0 is codec config iff it holds no slice NAL (just leading SPS/PPS/SEI)
@@ -1082,14 +1089,38 @@ pub fn decode(stream_path: &str, out_prefix: &str, want_frames: usize, heap_mask
             };
             let start = unsafe { ib.ptr.add(pl.data_offset as usize) };
             let data = unsafe { std::slice::from_raw_parts(start, n) };
-            let path = format!("{out_prefix}.{}.p{i}", frames_done);
-            match fs::write(&path, data) {
-                Ok(()) => eprintln!("  wrote {path} ({n} B, doff={} len={})", pl.data_offset, pl.length),
-                Err(e) => eprintln!("  write {path} failed: {e}"),
+            if disp.is_none() {
+                let path = format!("{out_prefix}.{}.p{i}", frames_done);
+                match fs::write(&path, data) {
+                    Ok(()) => eprintln!("  wrote {path} ({n} B, doff={} len={})", pl.data_offset, pl.length),
+                    Err(e) => eprintln!("  write {path} failed: {e}"),
+                }
+                let _ = std::io::stdout().flush();
             }
-            let _ = std::io::stdout().flush();
         }
         frames_done += 1;
+
+        // zero-copy scanout: import this venus dmabuf straight into the DPU
+        // overlay plane (hardware-scaled), before the fw gets the buffer back
+        if let Some(d) = disp.as_deref_mut() {
+            let (nw, nh, nbpl) = (
+                cap_fmt.width,
+                cap_fmt.height,
+                cap_fmt.plane_fmt[0].bytesperline,
+            );
+            if let Err(e) = d.show_frame(
+                b.index as usize,
+                &cap_bufs[b.index as usize],
+                nw,
+                nh,
+                nbpl,
+                frame_len,
+            ) {
+                eprintln!("scanout: {e} (continuing decode)");
+            }
+            // ~30 fps pacing so the burst isn't a single flash
+            std::thread::sleep(std::time::Duration::from_millis(33));
+        }
 
         // requeue the capture buffer
         let ib = &cap_bufs[b.index as usize];
@@ -1112,6 +1143,717 @@ pub fn decode(stream_path: &str, out_prefix: &str, want_frames: usize, heap_mask
     let mut off: i32 = TYPE_OUTPUT_MPLANE as i32;
     let _ = ioctl(fd, VIDIOC_STREAMOFF, &mut off);
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DRM plane scanout — DPU zero-copy display of venus NV12 dmabufs
+// ---------------------------------------------------------------------------
+
+/// ioctl numbers from the device's own UAPI (android-4.19 drm.h; redbull is
+/// the redfin kernel tree). Mode ioctls all share base 'd' and the struct
+/// size is part of the request word, so it must match the kernel layout.
+const DRM_IOCTL_MODE_GETRESOURCES: u32 = ioc(3, b'd', 0xA0, 64);
+const DRM_IOCTL_MODE_GETCRTC: u32 = ioc(3, b'd', 0xA1, std::mem::size_of::<DrmModeCrtc>() as u32);
+const DRM_IOCTL_MODE_SETCRTC: u32 = ioc(3, b'd', 0xA2, std::mem::size_of::<DrmModeCrtc>() as u32);
+const DRM_IOCTL_MODE_GETENCODER: u32 = ioc(3, b'd', 0xA6, 20);
+const DRM_IOCTL_MODE_GETCONNECTOR: u32 = ioc(3, b'd', 0xA7, 64);
+const DRM_IOCTL_MODE_CREATE_DUMB: u32 = ioc(3, b'd', 0xB2, 32);
+const DRM_IOCTL_MODE_MAP_DUMB: u32 = ioc(3, b'd', 0xB3, 16);
+const DRM_IOCTL_MODE_GETPLANE_RES: u32 = ioc(3, b'd', 0xB5, 16);
+const DRM_IOCTL_MODE_GETPLANE: u32 = ioc(3, b'd', 0xB6, std::mem::size_of::<DrmGetPlane>() as u32);
+const DRM_IOCTL_MODE_SETPLANE: u32 = ioc(3, b'd', 0xB7, 48);
+const DRM_IOCTL_MODE_ADDFB2: u32 = ioc(3, b'd', 0xB8, std::mem::size_of::<DrmFbCmd2>() as u32);
+const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u32 = ioc(3, b'd', 0xB9, 32);
+const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u32 = ioc(3, b'd', 0xBA, 24);
+const DRM_IOCTL_MODE_GETPROP: u32 = ioc(3, b'd', 0xAA, 168);
+const DRM_IOCTL_PRIME_FD_TO_HANDLE: u32 = ioc(3, b'd', 0x2e, 12);
+/// DRM_IOCTL_SET_CLIENT_CAP (drm.h 0x0d, IOW). struct drm_set_client_cap.
+const DRM_IOCTL_SET_CLIENT_CAP: u32 = ioc(1, b'd', 0x0d, 16);
+const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
+
+const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
+const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258;
+
+/// layouts proven by aterm's drm.rs on this exact device.
+#[repr(C)]
+#[derive(Default)]
+struct DrmGetConnector {
+    encoders_ptr: u64,
+    modes_ptr: u64,
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    count_modes: i32,
+    count_props: i32,
+    count_encoders: i32,
+    encoder_id: u32,
+    connector_id: u32,
+    connector_type: u32,
+    connector_type_id: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmGetEncoder {
+    encoder_id: u32,
+    encoder_type: u32,
+    crtc_id: u32,
+    possible_crtcs: u32,
+    possible_clones: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmCreateDumb {
+    height: u32,
+    width: u32,
+    bpp: u32,
+    flags: u32,
+    handle: u32,
+    pitch: u32,
+    size: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmMapDumb {
+    handle: u32,
+    pad: u32,
+    offset: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DrmModeinfo {
+    clock: u32,
+    hdisplay: u16,
+    hsync_start: u16,
+    hsync_end: u16,
+    htotal: u16,
+    hskew: u16,
+    vdisplay: u16,
+    vsync_start: u16,
+    vsync_end: u16,
+    vtotal: u16,
+    vscan: u16,
+    vrefresh: u32,
+    flags: u32,
+    ty: u32,
+    name: [u8; 32],
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmModeCrtc {
+    set_connectors_ptr: u64,
+    count_connectors: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    x: u32,
+    y: u32,
+    gamma_size: u32,
+    mode_valid: u32,
+    mode: DrmModeinfo,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmGetPlane {
+    plane_id: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    possible_crtcs: u32,
+    gamma_size: u32,
+    count_format_types: u32,
+    format_type_ptr: u64,
+}
+
+/// NOTE: kernel field order is src_x, src_y, src_h, src_w (h before w —
+/// upstream quirk, kept verbatim).
+#[repr(C)]
+#[derive(Default)]
+struct DrmSetPlane {
+    plane_id: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    flags: u32,
+    crtc_x: i32,
+    crtc_y: i32,
+    crtc_w: u32,
+    crtc_h: u32,
+    src_x: u32,
+    src_y: u32,
+    src_h: u32,
+    src_w: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmFbCmd2 {
+    fb_id: u32,
+    width: u32,
+    height: u32,
+    pixel_format: u32,
+    flags: u32,
+    handles: [u32; 4],
+    pitches: [u32; 4],
+    offsets: [u32; 4],
+    modifier: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmPrimeHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmObjGetProps {
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    count_props: u32,
+    obj_id: u32,
+    obj_type: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct DrmObjSetProp {
+    value: u64,
+    prop_id: u32,
+    obj_id: u32,
+    obj_type: u32,
+}
+
+/// drm_mode_get_property: name is a __u32[32] in the UAPI but the kernel
+/// strncpy's raw bytes into it — read as bytes, stop at NUL.
+#[repr(C)]
+struct DrmGetProp {
+    values_ptr: u64,
+    enum_blob_ptr: u64,
+    prop_id: u32,
+    flags: u32,
+    name: [u8; 128],
+    count_values: u32,
+    count_enum_blobs: u32,
+}
+
+impl Default for DrmGetProp {
+    fn default() -> Self {
+        DrmGetProp {
+            values_ptr: 0,
+            enum_blob_ptr: 0,
+            prop_id: 0,
+            flags: 0,
+            name: [0; 128],
+            count_values: 0,
+            count_enum_blobs: 0,
+        }
+    }
+}
+
+/// Owns one YUV plane on the active CRTC. Import-and-show per frame; the
+/// venus dmabufs never get copied (zero-copy scanout). This kernel gates
+/// SETPLANE/OBJ_SETPROPERTY on DRM_MASTER (drm_ioctl.c, no CAP_SYS_ADMIN
+/// bypass), so we take master for the lifetime of the display — aterm must
+/// not be holding it (kill aterm first; its handoff supervisor revives it
+/// after we exit and it re-SET_MASTERs then).
+pub struct DrmDisplay {
+    file: fs::File,
+    crtc_id: u32,
+    plane_id: u32,
+    zpos_prop: u32, // 0 = no zpos prop found
+    mode_w: u32,
+    mode_h: u32,
+    /// GEM handle + FB per capture buffer index (lazily imported).
+    gem: [u32; 4],
+    fb: [u32; 4],
+}
+
+impl DrmDisplay {
+    fn open() -> Result<DrmDisplay, String> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open("/dev/dri/card0")
+            .map_err(|e| format!("open card0: {e}"))?;
+        let fd = file.as_raw_fd();
+
+        // SETPLANE is DRM_MASTER-gated on this kernel — take it. Fails with
+        // EINVAL if aterm (or anyone) still holds it.
+        const DRM_IOCTL_SET_MASTER: u32 = ioc(0, b'd', 0x1e, 0);
+        if ioctl(fd, DRM_IOCTL_SET_MASTER, std::ptr::null_mut::<u8>()) < 0 {
+            return Err(format!(
+                "SET_MASTER errno={} (is aterm still up? kill it first — {})",
+                errno(),
+                "its handoff will revive it after we exit"
+            ));
+        }
+
+        // without UNIVERSAL_PLANES only overlays are listed — and on sde the
+        // YUV-capable VIG pipes are the CRTCs' primaries, so every visible
+        // plane is RGB-only. With the cap, primaries appear too; the idle
+        // CRTC's unbound VIG primary is our NV12+scaler plane.
+        #[repr(C)]
+        #[derive(Default)]
+        struct SetClientCap {
+            capability: u64,
+            value: u64,
+        }
+        let mut cap = SetClientCap {
+            capability: DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+            value: 1,
+        };
+        if ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &mut cap) < 0 {
+            eprintln!("drm: SET_CLIENT_CAP(universal planes) errno={}", errno());
+        }
+        // zpos & friends are atomic properties — without this cap they don't
+        // show up in OBJ_GETPROPERTIES at all (we saw 10 props, no zpos).
+        let mut cap = SetClientCap {
+            capability: DRM_CLIENT_CAP_ATOMIC,
+            value: 1,
+        };
+        if ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &mut cap) < 0 {
+            eprintln!("drm: SET_CLIENT_CAP(atomic) errno={}", errno());
+        }
+
+        // aterm quirk (proven on device): the second GETRESOURCES must carry
+        // zero fbs/encoders counts when their pointers are null.
+        #[repr(C)]
+        #[derive(Default)]
+        struct CardRes {
+            fb_id_ptr: u64,
+            crtc_id_ptr: u64,
+            connector_id_ptr: u64,
+            encoder_id_ptr: u64,
+            count_fbs: u32,
+            count_crtcs: u32,
+            count_connectors: u32,
+            count_encoders: u32,
+            min_width: u32,
+            max_width: u32,
+            min_height: u32,
+            max_height: u32,
+        }
+        let mut res = CardRes::default();
+        if ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut res) < 0 {
+            return Err(format!("GETRESOURCES #1 errno={}", errno()));
+        }
+        let mut crtcs = [0u32; 8];
+        let mut conns = [0u32; 8];
+        res.count_crtcs = res.count_crtcs.min(8);
+        res.crtc_id_ptr = crtcs.as_mut_ptr() as u64;
+        res.connector_id_ptr = conns.as_mut_ptr() as u64;
+        res.count_connectors = res.count_connectors.min(8);
+        // unused id lists must carry BOTH a null pointer and a zero count,
+        // or the copy-out EFAULTs (aterm hit the same on fbs/encoders)
+        res.count_fbs = 0;
+        res.count_encoders = 0;
+        if ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &mut res) < 0 {
+            return Err(format!("GETRESOURCES #2 errno={}", errno()));
+        }
+
+        // active CRTC = one with a framebuffer latched (aterm SETCRTC'd it)
+        let mut crtc_id = 0u32;
+        let mut crtc_idx = 0u32;
+        let mut mode_w = 0u32;
+        let mut mode_h = 0u32;
+        for i in 0..res.count_crtcs {
+            let mut gc = DrmModeCrtc {
+                crtc_id: crtcs[i as usize],
+                ..Default::default()
+            };
+            if ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &mut gc) < 0 {
+                continue;
+            }
+            if gc.mode_valid != 0 || gc.fb_id != 0 {
+                crtc_id = crtcs[i as usize];
+                crtc_idx = i;
+                mode_w = gc.mode.hdisplay as u32;
+                mode_h = gc.mode.vdisplay as u32;
+                eprintln!(
+                    "drm: active crtc {} (#{i}) mode {}x{} fb={} name={}",
+                    crtc_id,
+                    mode_w,
+                    mode_h,
+                    gc.fb_id,
+                    cstr(&gc.mode.name)
+                );
+                break;
+            }
+        }
+        if crtc_id == 0 {
+            // We hold master and aterm is dead — but aterm's death dropped
+            // the old master and msm's master-drop hook blanked the CRTC, so
+            // there is no "active CRTC + free master" state to inherit. Do
+            // our own modeset (aterm's proven recipe): DSI connector -> its
+            // mode -> black dumb fb -> SETCRTC.
+            eprintln!("drm: no active crtc (aterm dead) — cold modeset");
+            let n_conn = res.count_connectors as usize;
+            let mut conn_id = 0u32;
+            let mut enc_id = 0u32;
+            let mut mode = DrmModeinfo::default();
+            for i in 0..n_conn {
+                let mut gc = DrmGetConnector {
+                    connector_id: conns[i],
+                    ..Default::default()
+                };
+                let mut modes = [DrmModeinfo::default(); 8];
+                let mut encs = [0u64; 8];
+                gc.encoders_ptr = encs.as_mut_ptr() as u64;
+                gc.count_encoders = 8;
+                gc.modes_ptr = modes.as_mut_ptr() as u64;
+                gc.count_modes = 8;
+                if ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &mut gc) < 0 {
+                    continue;
+                }
+                if gc.count_modes < 1 {
+                    continue;
+                }
+                // encoder_id can read 0 after the previous master exited —
+                // fall back to the first compatible encoder (aterm quirk)
+                let e = if gc.encoder_id != 0 {
+                    gc.encoder_id
+                } else if gc.count_encoders > 0 {
+                    encs[0] as u32
+                } else {
+                    0
+                };
+                if e == 0 {
+                    continue;
+                }
+                if conn_id == 0 || gc.connector_type == 16 {
+                    conn_id = conns[i];
+                    enc_id = e;
+                    mode = modes[0];
+                    if gc.connector_type == 16 {
+                        break;
+                    }
+                }
+            }
+            if conn_id == 0 {
+                return Err("cold modeset: no usable connector".into());
+            }
+            let mut ge = DrmGetEncoder {
+                encoder_id: enc_id,
+                ..Default::default()
+            };
+            if ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &mut ge) < 0 || ge.crtc_id == 0 {
+                // pick the first crtc the encoder can drive
+                for c in 0..res.count_crtcs as usize {
+                    if ge.possible_crtcs & (1 << c) != 0 {
+                        ge.crtc_id = crtcs[c];
+                        break;
+                    }
+                }
+            }
+            if ge.crtc_id == 0 {
+                return Err("cold modeset: no crtc for encoder".into());
+            }
+            crtc_id = ge.crtc_id;
+            crtc_idx = (0..res.count_crtcs as usize)
+                .find(|&i| crtcs[i] == crtc_id)
+                .unwrap_or(0) as u32;
+            mode_w = mode.hdisplay as u32;
+            mode_h = mode.vdisplay as u32;
+            eprintln!(
+                "drm: conn {} enc {} -> crtc {} mode {}x{} {}",
+                conn_id,
+                enc_id,
+                crtc_id,
+                mode_w,
+                mode_h,
+                cstr(&mode.name)
+            );
+
+            // black backdrop: dumb fb, zeroed (API doesn't guarantee it)
+            let mut dumb = DrmCreateDumb {
+                width: mode_w,
+                height: mode_h,
+                bpp: 32,
+                ..Default::default()
+            };
+            if ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &mut dumb) < 0 {
+                return Err(format!("CREATE_DUMB errno={}", errno()));
+            }
+            let mut md = DrmMapDumb {
+                handle: dumb.handle,
+                ..Default::default()
+            };
+            if ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &mut md) < 0 {
+                return Err(format!("MAP_DUMB errno={}", errno()));
+            }
+            let map = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    dumb.size as usize,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    md.offset as libc::off_t,
+                )
+            };
+            if map == libc::MAP_FAILED {
+                return Err("mmap dumb failed".into());
+            }
+            unsafe {
+                libc::memset(map, 0, dumb.size as usize);
+                libc::munmap(map, dumb.size as usize);
+            }
+            let mut fb2 = DrmFbCmd2 {
+                width: mode_w,
+                height: mode_h,
+                pixel_format: DRM_FORMAT_XRGB8888,
+                ..Default::default()
+            };
+            fb2.handles[0] = dumb.handle;
+            fb2.pitches[0] = dumb.pitch;
+            if ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &mut fb2) < 0 {
+                return Err(format!("ADDFB2(black) errno={}", errno()));
+            }
+            let conn_list = [conn_id];
+            let mut sc = DrmModeCrtc {
+                set_connectors_ptr: conn_list.as_ptr() as u64,
+                count_connectors: 1,
+                crtc_id,
+                fb_id: fb2.fb_id,
+                mode_valid: 1,
+                mode,
+                ..Default::default()
+            };
+            let mut rc = ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &mut sc);
+            if rc < 0 {
+                // aterm quirk: retry with no connectors latched
+                sc.set_connectors_ptr = 0;
+                sc.count_connectors = 0;
+                rc = ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &mut sc);
+            }
+            if rc < 0 {
+                return Err(format!("SETCRTC errno={}", errno()));
+            }
+            eprintln!("drm: cold modeset ok (fb {})", fb2.fb_id);
+        }
+
+        // plane table; pick an unused (crtc_id==0) overlay whose format list
+        // carries NV12 and that can live on the active crtc
+        #[repr(C)]
+        #[derive(Default)]
+        struct PlaneRes {
+            plane_id_ptr: u64,
+            count_planes: u32,
+        }
+        let mut pr = PlaneRes::default();
+        if ioctl(fd, DRM_IOCTL_MODE_GETPLANE_RES, &mut pr) < 0 {
+            return Err(format!("GETPLANERESOURCES errno={}", errno()));
+        }
+        let mut planes = [0u32; 24];
+        pr.count_planes = pr.count_planes.min(24);
+        pr.plane_id_ptr = planes.as_mut_ptr() as u64;
+        if ioctl(fd, DRM_IOCTL_MODE_GETPLANE_RES, &mut pr) < 0 {
+            return Err(format!("GETPLANERESOURCES #2 errno={}", errno()));
+        }
+
+        let mut chosen = 0u32;
+        let mut fmts_buf = [0u32; 64];
+        for i in 0..pr.count_planes {
+            let mut gp = DrmGetPlane {
+                plane_id: planes[i as usize],
+                format_type_ptr: fmts_buf.as_mut_ptr() as u64,
+                count_format_types: 64,
+                ..Default::default()
+            };
+            if ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &mut gp) < 0 {
+                eprintln!("drm: plane {} GETPLANE errno={}", planes[i as usize], errno());
+                continue;
+            }
+            let n = (gp.count_format_types as usize).min(64);
+            let has_nv12 = fmts_buf[..n].contains(&FMT_NV12);
+            let fmt_names: Vec<String> = fmts_buf[..n].iter().map(|&f| fourcc_str(f)).collect();
+            eprintln!(
+                "drm: plane {} crtc={} possible={:#x} nfmts={} nv12={} fmts=[{}]",
+                gp.plane_id, gp.crtc_id, gp.possible_crtcs, gp.count_format_types, has_nv12,
+                fmt_names.join(",")
+            );
+            if chosen == 0
+                && gp.crtc_id == 0
+                && has_nv12
+                && gp.possible_crtcs & (1 << crtc_idx) != 0
+            {
+                chosen = gp.plane_id;
+            }
+        }
+        if chosen == 0 {
+            return Err("no free overlay plane with NV12 on the active crtc".into());
+        }
+        eprintln!("drm: chose overlay plane {chosen}");
+
+        // read the chosen plane's props (names + current values) for the log;
+        // remember zpos so we can raise the layer above the terminal
+        let mut props = [0u64; 24];
+        let mut vals = [0u64; 24];
+        let mut og = DrmObjGetProps {
+            props_ptr: props.as_mut_ptr() as u64,
+            prop_values_ptr: vals.as_mut_ptr() as u64,
+            count_props: 24,
+            obj_id: chosen,
+            obj_type: DRM_MODE_OBJECT_PLANE,
+        };
+        let mut zpos_prop = 0u32;
+        if ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &mut og) == 0 {
+            let n = (og.count_props as usize).min(24);
+            for p in 0..n {
+                let mut gprop = DrmGetProp {
+                    prop_id: props[p] as u32,
+                    values_ptr: [0u64; 2].as_mut_ptr() as u64,
+                    count_values: 2,
+                    ..Default::default()
+                };
+                if ioctl(fd, DRM_IOCTL_MODE_GETPROP, &mut gprop) < 0 {
+                    continue;
+                }
+                let end = gprop.name.iter().position(|&b| b == 0).unwrap_or(128);
+                let name = String::from_utf8_lossy(&gprop.name[..end]).into_owned();
+                eprintln!("drm:   plane prop {name} = {}", vals[p]);
+                if name == "zpos" {
+                    zpos_prop = props[p] as u32;
+                }
+            }
+        } else {
+            eprintln!("drm: plane props read errno={}", errno());
+        }
+
+        // sde in custom-client mode defaults EVERY plane's zpos to 0, so our
+        // layer and the modeset backdrop would share blend stage 0 and the
+        // src-split order check rejects the overlapping full-width rects
+        // ("invalid coordinates, stage:0 l:0-1080 r:0-1080"). Move this plane
+        // one stage up BEFORE the first SETPLANE (255 would blow the
+        // maxblendstages range — max is 7 on this catalog).
+        if zpos_prop != 0 {
+            let mut sp = DrmObjSetProp {
+                value: 1,
+                prop_id: zpos_prop,
+                obj_id: chosen,
+                obj_type: DRM_MODE_OBJECT_PLANE,
+            };
+            if ioctl(fd, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &mut sp) < 0 {
+                eprintln!("drm: zpos=1 errno={} (continuing)", errno());
+            } else {
+                eprintln!("drm: plane {chosen} zpos -> 1");
+            }
+        } else {
+            eprintln!("drm: no zpos prop — stage collision expected");
+        }
+
+        Ok(DrmDisplay {
+            file,
+            crtc_id,
+            plane_id: chosen,
+            zpos_prop,
+            mode_w,
+            mode_h,
+            gem: [0; 4],
+            fb: [0; 4],
+        })
+    }
+
+    /// Locate the UV plane start inside the venus buffer: the fw writes only
+    /// h luma rows, so the gap between y_end and UV is zeros (observed:
+    /// 320x240 -> stride 512, y rows end 0x1E000, UV at 0x40000). Scan
+    /// 4K-aligned blocks for the first nonzero one past the luma.
+    fn scan_uv_off(ptr: *const u8, len: usize, y_end: usize) -> Option<usize> {
+        let data = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let mut off = (y_end + 0xfff) & !0xfff;
+        while off + 64 <= len {
+            if data[off..off + 64].iter().any(|&b| b != 0) {
+                return Some(off);
+            }
+            off += 0x1000;
+        }
+        None
+    }
+
+    /// Import the frame's dmabuf as an NV12 fb (once per buffer) and push it
+    /// to the overlay plane, aspect-fit into the panel with DPU scaling.
+    fn show_frame(&mut self, idx: usize, buf: &IonBuf, w: u32, h: u32, stride: u32, size: usize) -> Result<(), String> {
+        let fd = self.file.as_raw_fd();
+        let i = idx.min(3);
+        if self.fb[i] == 0 {
+            let y_end = stride as usize * h as usize;
+            let uv_off = Self::scan_uv_off(buf.ptr, size, y_end)
+                .ok_or("scan_uv_off: no chroma block found past luma")?;
+            eprintln!("drm: buf{idx} uv_off={uv_off:#x} (y_end={y_end:#x})");
+
+            let mut ph = DrmPrimeHandle {
+                fd: buf.fd,
+                ..Default::default()
+            };
+            if ioctl(fd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &mut ph) < 0 {
+                return Err(format!("PRIME_FD_TO_HANDLE errno={} ({})", errno(), std::io::Error::from_raw_os_error(errno())));
+            }
+            self.gem[i] = ph.handle;
+            let mut fb = DrmFbCmd2 {
+                width: w,
+                height: h,
+                pixel_format: FMT_NV12,
+                ..Default::default()
+            };
+            fb.handles[0] = ph.handle;
+            fb.handles[1] = ph.handle;
+            fb.pitches[0] = stride;
+            fb.pitches[1] = stride;
+            fb.offsets[0] = 0;
+            fb.offsets[1] = uv_off as u32;
+            if ioctl(fd, DRM_IOCTL_MODE_ADDFB2, &mut fb) < 0 {
+                return Err(format!("ADDFB2 errno={} ({})", errno(), std::io::Error::from_raw_os_error(errno())));
+            }
+            self.fb[i] = fb.fb_id;
+            eprintln!("drm: buf{idx} -> fb {} (gem handle {})", fb.fb_id, ph.handle);
+        }
+
+        // aspect-fit into the panel
+        let scale = (self.mode_w as f64 / w as f64).min(self.mode_h as f64 / h as f64);
+        let dw = ((w as f64) * scale) as u32;
+        let dh = ((h as f64) * scale) as u32;
+        let x = ((self.mode_w - dw) / 2) as i32;
+        let y = ((self.mode_h - dh) / 2) as i32;
+
+        let mut sp = DrmSetPlane {
+            plane_id: self.plane_id,
+            crtc_id: self.crtc_id,
+            fb_id: self.fb[i],
+            flags: 0,
+            crtc_x: x,
+            crtc_y: y,
+            crtc_w: dw,
+            crtc_h: dh,
+            src_x: 0,
+            src_y: 0,
+            src_h: h << 16,
+            src_w: w << 16,
+        };
+        if ioctl(fd, DRM_IOCTL_MODE_SETPLANE, &mut sp) < 0 {
+            return Err(format!("SETPLANE errno={} ({})", errno(), std::io::Error::from_raw_os_error(errno())));
+        }
+        // (zpos is raised to 1 once at open(), before the first SETPLANE)
+        Ok(())
+    }
+
+    /// Detach the plane (fb_id=0 disables it in the legacy path).
+    fn disable(&mut self) {
+        let mut sp = DrmSetPlane {
+            plane_id: self.plane_id,
+            crtc_id: self.crtc_id,
+            fb_id: 0,
+            ..Default::default()
+        };
+        let rc = ioctl(self.file.as_raw_fd(), DRM_IOCTL_MODE_SETPLANE, &mut sp);
+        eprintln!("drm: plane off rc={rc}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,8 +1888,26 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 .get(4)
                 .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(DEFAULT_ION_HEAP_MASK);
-            decode(in_path, out_prefix, want, heap)
+            decode(in_path, out_prefix, want, heap, None)
         }
-        _ => Err("usage: vidc caps | vidc sizes [node] | vidc ion | vidc decode <in.h264> <out> [n] [heapmask]".into()),
+        Some("show") => {
+            let in_path = args
+                .get(1)
+                .ok_or("usage: vidc show <in.h264> [hold_secs] [heapmask]")?;
+            let hold: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
+            let heap = args
+                .get(3)
+                .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(DEFAULT_ION_HEAP_MASK);
+            let mut disp = Some(DrmDisplay::open()?);
+            decode(in_path, "", usize::MAX, heap, disp.as_mut())?;
+            if let Some(d) = disp.as_mut() {
+                eprintln!("holding plane for {hold}s...");
+                std::thread::sleep(std::time::Duration::from_secs(hold));
+                d.disable();
+            }
+            Ok(())
+        }
+        _ => Err("usage: vidc caps | vidc sizes [node] | vidc ion | vidc decode <in.h264> <out> [n] [heapmask] | vidc show <in.h264> [hold] [heapmask]".into()),
     }
 }
