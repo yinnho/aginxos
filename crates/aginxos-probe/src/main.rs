@@ -12,7 +12,30 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
+mod vidc;
+
 fn main() {
+    // bring-up subcommands (M41+); bare invocation keeps the classic probe dump
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "vidc" => {
+                let code = match vidc::run(&args[2..]) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("vidc: {e}");
+                        1
+                    }
+                };
+                std::process::exit(code);
+            }
+            other => {
+                eprintln!("unknown subcommand: {other} (try: vidc caps | vidc decode <in.h264> <out> [n])");
+                std::process::exit(2);
+            }
+        }
+    }
+
     println!("AginxOS probe {}", env!("CARGO_PKG_VERSION"));
     println!("uid={}", unsafe { libc::getuid() });
 
