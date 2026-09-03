@@ -12,6 +12,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
+mod snd;
 mod vidc;
 
 fn main() {
@@ -30,7 +31,7 @@ fn main() {
                 std::process::exit(code);
             }
             other => {
-                eprintln!("unknown subcommand: {other} (try: vidc caps | vidc decode <in.h264> <out> [n] | vidc show <in.h264>)");
+                eprintln!("unknown subcommand: {other} (try: vidc caps | vidc decode <in.h264> <out> [n] | vidc show <in.h264> | vidc play <in.h264> <in.s16>)");
                 std::process::exit(2);
             }
         }

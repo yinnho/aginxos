@@ -697,8 +697,10 @@ pub fn decode(
     want_frames: usize,
     heap_mask: u32,
     disp: Option<&mut DrmDisplay>,
+    av: Option<&mut crate::snd::AvAudio>,
 ) -> Result<(), String> {
     let mut disp = disp;
+    let mut av = av;
     let stream = fs::read(stream_path).map_err(|e| format!("read {stream_path}: {e}"))?;
     let aus = split_access_units(&stream);
     // AU0 is codec config iff it holds no slice NAL (just leading SPS/PPS/SEI)
@@ -1103,6 +1105,37 @@ pub fn decode(
         // zero-copy scanout: import this venus dmabuf straight into the DPU
         // overlay plane (hardware-scaled), before the fw gets the buffer back
         if let Some(d) = disp.as_deref_mut() {
+            // A/V sync pacing: gate each scanout on the audio clock (the
+            // played-frames counter is the master). Frame n's PTS is n/30
+            // shifted by the one tick AU0 burns when it is config-only (the
+            // timestamp counter starts on the leading SPS/PPS chunk). The
+            // audio timeline starts only AFTER the first frame is on screen
+            // — sample 0 then coincides with picture 0 by construction
+            // (first device run with start-before-show measured a constant
+            // +92 ms audio lead: both clocks tick at 1x, so a start skew
+            // never self-corrects).
+            let clocked = av.as_deref().is_some_and(|c| c.started());
+            if clocked {
+                if let Some(clk) = av.as_deref_mut() {
+                    let n = frames_done - 1;
+                    let pts = (n as i64 + au0_config_only as i64) * 33_333;
+                    clk.wait_until(pts);
+                    if n % 300 == 0 {
+                        let now = clk.played_us();
+                        eprintln!(
+                            "sync: frame {n} pts={:.3}s audio={:.3}s delta={:+.1}ms",
+                            pts as f64 / 1e6,
+                            now as f64 / 1e6,
+                            (now - pts) as f64 / 1e3
+                        );
+                    }
+                }
+            } else if av.is_none() {
+                // ~30 fps pacing so the burst isn't a single flash (plain
+                // show without an audio clock; with the clock pending this
+                // is frame 0 and it goes out now to anchor the timeline)
+                std::thread::sleep(std::time::Duration::from_millis(33));
+            }
             let (nw, nh, nbpl) = (
                 cap_fmt.width,
                 cap_fmt.height,
@@ -1118,8 +1151,13 @@ pub fn decode(
             ) {
                 eprintln!("scanout: {e} (continuing decode)");
             }
-            // ~30 fps pacing so the burst isn't a single flash
-            std::thread::sleep(std::time::Duration::from_millis(33));
+            if let Some(clk) = av.as_deref_mut() {
+                if !clk.started() {
+                    if let Err(e) = clk.start() {
+                        eprintln!("snd: {e} — video paces on fixed 33ms");
+                    }
+                }
+            }
         }
 
         // requeue the capture buffer
@@ -1888,7 +1926,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 .get(4)
                 .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(DEFAULT_ION_HEAP_MASK);
-            decode(in_path, out_prefix, want, heap, None)
+            decode(in_path, out_prefix, want, heap, None, None)
         }
         Some("show") => {
             let in_path = args
@@ -1900,7 +1938,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(DEFAULT_ION_HEAP_MASK);
             let mut disp = Some(DrmDisplay::open()?);
-            decode(in_path, "", usize::MAX, heap, disp.as_mut())?;
+            decode(in_path, "", usize::MAX, heap, disp.as_mut(), None)?;
             if let Some(d) = disp.as_mut() {
                 eprintln!("holding plane for {hold}s...");
                 std::thread::sleep(std::time::Duration::from_secs(hold));
@@ -1908,6 +1946,33 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("usage: vidc caps | vidc sizes [node] | vidc ion | vidc decode <in.h264> <out> [n] [heapmask] | vidc show <in.h264> [hold] [heapmask]".into()),
+        Some("play") => {
+            // A/V sync: venus decode → DPU scanout, paced by the audio
+            // device's played-frames clock (MM1 → QUIN_TDM_RX_0, the mixer
+            // routing audio-bringup bakes at boot). Audio timeline starts
+            // when the decoder's first frame is in hand.
+            let in_path = args
+                .get(1)
+                .ok_or("usage: vidc play <in.h264> <in.s16> [vol] [heapmask]")?;
+            let pcm_path = args
+                .get(2)
+                .ok_or("usage: vidc play <in.h264> <in.s16> [vol] [heapmask]")?;
+            let vol: i32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(70);
+            let heap = args
+                .get(4)
+                .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(DEFAULT_ION_HEAP_MASK);
+            let mut disp = Some(DrmDisplay::open()?);
+            let mut av = crate::snd::AvAudio::new("/dev/snd/pcmC0D0p", 48_000, 2, pcm_path, vol)?;
+            decode(in_path, "", usize::MAX, heap, disp.as_mut(), Some(&mut av))?;
+            // let the audio tail drain (feeder DRAINs at EOF), then tear
+            // the plane down — the receipt window is the playing clip itself
+            av.finish();
+            if let Some(d) = disp.as_mut() {
+                d.disable();
+            }
+            Ok(())
+        }
+        _ => Err("usage: vidc caps | vidc sizes [node] | vidc ion | vidc decode <in.h264> <out> [n] [heapmask] | vidc show <in.h264> [hold] [heapmask] | vidc play <in.h264> <in.s16> [vol] [heapmask]".into()),
     }
 }
