@@ -8,6 +8,10 @@
 # frame before SETCRTC, so the panel only dips for the modeset itself.
 # The respawn loop keeps the UI alive if aterm ever crashes.
 export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+# M17 voice hook: watch /run/aterm.inject (ASR text lands there; aterm
+# types it into the pty). Was hand-exported since M18 — baked here in
+# #13 so it survives rootfs swaps.
+export ATERM_INJECT=1
 
 n=0
 while ! grep -q '^done ' /run/boot.state 2>/dev/null && [ $n -lt 150 ]; do
