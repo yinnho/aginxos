@@ -1,7 +1,8 @@
 #!/bin/sh
 # ag:summary=avatar (clone) lifecycle: install/list/remove/update
-# ag:args=install <name> [--file <tar>] [--dry-run] | list [--json] | remove <name> | update <name> | remote add <name> <url> | remote remove <name>
+# ag:args=install <name> [--file <tar>] [--dry-run] | list [--json] | remove <name> | update <name> | send <agent> --message <text> [--sender <id>] | kill <agent> | restart <agent> | remote add <name> <url> | remote remove <name>
 # ag:examples=list --json
+# ag:examples=send me --message "ping"
 # ag:group=agent
 # Pass-through to the provisioned carrier binary (/var/bin/aginx-carrier,
 # first-boot must-exist). M30: install --file 本地 tar 源 + --dry-run 权限预览。

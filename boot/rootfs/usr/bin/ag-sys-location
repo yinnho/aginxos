@@ -1,0 +1,8 @@
+#!/bin/sh
+# ag:summary=IP geolocation lookup (ip-api.com)
+# ag:args=[--json]
+# ag:examples=--json
+# ag:group=sys
+# Pass-through to the provisioned carrier binary (M33: sys face — runtime
+# misc location_get moved out; same trust domain, no ag:exec).
+exec /var/bin/aginx-carrier sys location "$@"

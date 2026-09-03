@@ -1,7 +1,8 @@
 #!/bin/sh
 # ag:summary=scheduled tasks owned by avatars
-# ag:args=list [--agent <name>]
+# ag:args=list [--agent <name>] | pause <id> | resume <id> | remove <id> | create --agent <name> [--json <job-json>]
 # ag:examples=list
+# ag:examples=create --agent me --json '{"name":"tick","schedule":{"kind":"every","every_secs":600},"action":{"kind":"system_event","text":"tick"}}'
 # ag:group=cron
 # Pass-through to the provisioned carrier binary (/var/bin/aginx-carrier,
 # first-boot must-exist) — no ag:exec for the same reason as ag-agent.

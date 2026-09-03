@@ -1,0 +1,8 @@
+#!/bin/sh
+# ag:summary=current date/time, timezone, unix epoch
+# ag:args=[--json]
+# ag:examples=--json
+# ag:group=sys
+# Pass-through to the provisioned carrier binary (M33: sys face — runtime
+# misc system_time moved out; same trust domain, no ag:exec).
+exec /var/bin/aginx-carrier sys time "$@"
