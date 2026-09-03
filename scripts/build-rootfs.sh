@@ -40,7 +40,11 @@ mkdir -p "${TREE}"
 # busybox tar exits 1 on a missing member, which the hardened agupd
 # rightly treats as fatal (observed 2026-09-03). /var/lib/ag/done is the
 # agdone marker home (M27); provision seeds it at runtime too.
-mkdir -p "${TREE}"/{dev,proc,sys,etc,home,media,mnt,opt,root,run,srv,tmp,var/log,var/power}
+# /var/tmp — NOT tmpfs (only /tmp is), yet nothing created it: bake #10's
+# fresh image shipped without it, provision's `>$LOG` redirect failed and
+# resync reported pkg-fail-with-no-log (observed 2026-09-03). agupd also
+# stage-builds its state tar there (M22 note).
+mkdir -p "${TREE}"/{dev,proc,sys,etc,home,media,mnt,opt,root,run,srv,tmp,var/log,var/power,var/tmp}
 mkdir -p "${TREE}"/var/lib/agpkg/{skills,units,stamps}
 mkdir -p "${TREE}"/var/lib/ag/done
 
