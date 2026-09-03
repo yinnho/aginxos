@@ -1,0 +1,11 @@
+#!/bin/sh
+# ag:summary=memory tools: kv get/set/list, tree search, knowledge base, flows (agmem package)
+# ag:args=get <key> | set <key> [value] | list [prefix] | del <key> | search <query> | topic <id> --query <q> | k <ls|read|add|rm|lint|heal> | flow <new|cat|set> | evaluate | tool <name>
+# ag:examples=get theme
+# ag:examples=set theme '"dark"'
+# ag:examples=list entity.
+# ag:examples=--workspace ~/ws k ls
+# ag:group=mem
+# Pass-through to the provisioned agmem CLI (M35 — memory tools moved out
+# as a package). Machine face `agmem tool kv_get` serves the runtime bridge.
+exec /var/bin/agmem "$@"
