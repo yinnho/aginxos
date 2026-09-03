@@ -39,7 +39,11 @@
 # (M10, /health + /fetch ok). All sha256 match the on-device installs.
 
 aginx          https://pkgs.aginx.net/aginx/v0.3.2/aginx-aarch64-unknown-linux-musl 1f8134d0d7bbead9ffcff9c7c1cb1499f3fcc10b4c7f3db7f44e41d658991690
-aginx-carrier  https://pkgs.aginx.net/aginx-carrier/v0.2.1/aginx-carrier-v0.2.1-aarch64-unknown-linux-musl c0d490d3f5f579f5e40c9e5972d89459997ed6357f9ee1fccea833ea40d97ba5
+# 2026-09-03 推送: carrier v0.3.0 (build d64f2fb, M30–M36) replaces the
+# v0.2.1 pin; first four tool packages join as core — the runtime bridges
+# (agb/agf/agmem/carrier CLI) delegate to them, so a bare rootfs without
+# them is not a working agent phone.
+aginx-carrier  https://pkgs.aginx.net/aginx-carrier/v0.3.0/aginx-carrier-v0.3.0-aarch64-unknown-linux-musl ada7d7edd073c175b1e9ef0980f5e62d505047e3cf1746ea57cd2db9cc38c25c
 aginxbrowser   https://pkgs.aginx.net/aginxbrowser/v0.2.5/aginxbrowser-v0.2.5-aarch64-unknown-linux-musl 5561e6287d6b146a94170bb71fc2c5b0ff0e9e6cfd0aa0a8ea84a21d630a99e6
 # python3 (M28) — first TREE bundle: musl CPython 3.12.14 (python-build-
 # standalone 20260901 install_only_stripped) + Alpine musl 1.2.5 ld.so;
@@ -48,6 +52,13 @@ aginxbrowser   https://pkgs.aginx.net/aginxbrowser/v0.2.5/aginxbrowser-v0.2.5-aa
 # to /lib/ld-musl-aarch64.so.1 (kernel interp path) and marks it done.
 python3        https://pkgs.aginx.net/python3/v3.12.14/python3-v3.12.14-4pc.tar 23923ffe46c3562d3801b742fea02ccc7f0aaddd91d7a40a66e4a6ee7a6beb73
 codex          https://pkgs.aginx.net/codex/v0.151.0/codex-v0.151.0-aarch64-unknown-linux-musl 56f026015ccc3ebc12895282200d89c216892bf6fa15fa7f228e6e0c6ad6ce76
+# M30–M35 tool packages (2026-09-03 推送): the runtime's browser/web,
+# filesystem, memory and clone bridges spawn these CLIs — core tier, a
+# rootfs without them has a carrier that cannot browse/read/remember.
+dup            https://pkgs.aginx.net/dup/v0.2.0/dup-v0.2.0-4pc.tar 652f9d583611826cdb3c5c02ee62a07b3e710df786c914f3a0e2629173c32a82
+agb            https://pkgs.aginx.net/agb/v0.2.0/agb-v0.2.0-4pc.tar c960cab30828caec70452526001c0e808c7df7fdaa2002b9c631b4ef90ad5b02
+agf            https://pkgs.aginx.net/agf/v0.2.0/agf-v0.2.0-4pc.tar eed372acd77037b1755ad3ad0053c949e86fc7f0bb4be57b06314e604b4862a9
+agmem          https://pkgs.aginx.net/agmem/v0.2.0/agmem-v0.2.0-4pc.tar 4b9c469038cbf4e97e913d10fa55b1fe67e14c2220a2f4134d522aeec0bf5357
 # grok is optional since M23 (选装 tier): an agent CLI like codex, but
 # self-built and not needed for the phone's own loop — pick it via "+".
 grok           https://pkgs.aginx.net/grok/v1.0.12/grok-v1.0.12-aarch64-unknown-linux-musl dac1ccb2084ee8ccbfd3e9656210e5dfb689c080b05d0fc1c5349c010fd6796d opt
