@@ -30,6 +30,7 @@ mod input;
 mod kb;
 mod launch;
 mod photos;
+mod pinyin;
 mod term;
 
 use drm::Drm;
@@ -47,6 +48,10 @@ const DIM: u32 = 0x001E3A2E; // key outlines / separators
 const ROW_GAP: usize = 8; // extra px between terminal text rows
 const KEYCAP: u32 = 0x000A1410; // key fill
 const UNAVAIL: u32 = 0x00115A3F; // dimmed green for missing apps
+
+// M40 candidate strip: floats over the terminal's bottom rows while 拼
+// is on — 8 slots (composing buffer, 6 candidates, page arrow).
+const IME_STRIP_H: usize = 120;
 
 // M15 power: short press (< POWER_HOLD) toggles blank; hold at or beyond it
 // shuts down; IDLE_BLANK without input blanks the screen.
@@ -633,23 +638,59 @@ impl<'a> Render<'a> {
         for (i, kd) in kb::EXTRA_KEYS.iter().enumerate() {
             let x0 = m + i * ekw + gi;
             let y0 = kg.extra_y + gi;
-            let active = self.mod_active(kd, kb);
+            let active = self.mod_active(kd, kb) || kb.is_pressed(kb::AREA_EXTRA, 0, i as u8);
             let ks = if i >= 3 { 5 } else { 3 };
             self.keycap(pix, x0, y0, ekw - kg.gap, kg.extra_h - kg.gap, kd.label, ks, active);
         }
-        for (r, row) in kb.page_rows().iter().enumerate() {
-            for (col, ch) in row.chars().enumerate() {
-                let x0 = m + col * kg.cell_w + gi;
+        // M40b iOS letter block. Grid rows 0-1: uniform cells (10 then 9
+        // keys); lowercase labels, shift shows caps.
+        let grids = kb.grids();
+        for r in 0..2 {
+            let s = grids[r];
+            let n = s.len();
+            let cw = (w - 2 * m) / n;
+            for (col, ch) in s.chars().enumerate() {
+                let lbl = if kb.shift_on() && kb.page() == kb::Page::Letters {
+                    ch.to_ascii_uppercase().to_string()
+                } else {
+                    ch.to_string()
+                };
+                let x0 = m + col * cw + gi;
                 let y0 = kg.panel_y + r * kg.cell_h + gi;
-                self.keycap(pix, x0, y0, kg.cell_w - kg.gap, kg.cell_h - kg.gap, &ch.to_string(), kg.label_scale, false);
+                let lit = kb.is_pressed(kb::AREA_PANEL, r as u8, col as u8);
+                self.keycap(pix, x0, y0, cw - kg.gap, kg.cell_h - kg.gap, &lbl, kg.label_scale, lit);
             }
         }
-        let kw = (w - 2 * m) / 5;
-        for (i, kd) in kb::SPECIALS.iter().enumerate() {
-            let x0 = m + i * kw + gi;
-            let y0 = kg.panel_y + 4 * kg.cell_h + gi;
-            let active = self.mod_active(kd, kb);
-            self.keycap(pix, x0, y0, kw - kg.gap, kg.cell_h - kg.gap, kd.label, 4, active);
+        // Rows 2-3: weighted keys normalized to the span (shift+7+delete;
+        // 123 拼 space 。 换行).
+        for (r, row) in [kb.row2(), kb.row3()].iter().enumerate() {
+            let units: usize = row.iter().map(|k| k.w).sum();
+            let mut acc = 0usize;
+            for (idx, kd) in row.iter().enumerate() {
+                let x0 = m + kg.span * acc / units + gi;
+                let kw = kg.span * kd.w / units - kg.gap;
+                acc += kd.w;
+                let y0 = kg.panel_y + (r + 2) * kg.cell_h + gi;
+                let lit = kb.is_pressed(kb::AREA_PANEL, (r + 2) as u8, idx as u8);
+                let (lbl, ls): (&str, usize) = match &kd.act {
+                    kb::Act::Letter(c) => {
+                        // owned labels for the shift case — draw and move on
+                        let up = if kb.shift_on() && kb.page() == kb::Page::Letters {
+                            c.to_ascii_uppercase().to_string()
+                        } else {
+                            c.to_string()
+                        };
+                        self.keycap(pix, x0, y0, kw, kg.cell_h - kg.gap, &up, kg.label_scale, lit);
+                        continue;
+                    }
+                    // 拼/空格/换行 share one label size (user round-2 ②)
+                    kb::Act::Period => (if kb.pinyin_on() { "。" } else { "." }, 4),
+                    kb::Act::Space => (if kb.pinyin_on() { "空格" } else { "" }, 4),
+                    _ => (kd.label, 4),
+                };
+                let active = self.mod_active(kd, kb) || lit;
+                self.keycap(pix, x0, y0, kw, kg.cell_h - kg.gap, lbl, ls, active);
+            }
         }
     }
 
@@ -658,8 +699,52 @@ impl<'a> Render<'a> {
         match kd.act {
             Act::Ctrl => kb.ctrl_on(),
             Act::Shift => kb.shift_on(),
-            Act::Sym => kb.sym_on(),
-            _ => false,
+            Act::Pinyin => kb.pinyin_on(),
+            Act::Page(_) | Act::Period | Act::Space | Act::Letter(_) | Act::Text(_) | Act::Ev(_) => false,
+        }
+    }
+
+    /// M40 candidate strip, drawn every render pass while 拼 is on (it
+    /// floats over terminal rows that repaint on blink — drawing it only
+    /// on keyboard-dirty frames would let a cursor blink erase it).
+    /// 8 slots of w/8: composing buffer | 6 candidates | page arrow.
+    fn ime_strip(&self, pix: &mut [u32], ime: &pinyin::Ime, kg: &KeyGeom) {
+        let (w, h) = (self.w, self.h);
+        let y0 = kg.extra_y.saturating_sub(IME_STRIP_H);
+        fill_rect(pix, self.pitch, w, h, 0, y0 as i32, w as i32, (IME_STRIP_H - 2) as i32, BG);
+        fill_rect(pix, self.pitch, w, h, 0, y0 as i32, w as i32, 2, DIM);
+        let sw = w / 8;
+        for slot in 0..8 {
+            let x0 = slot * sw;
+            if slot > 0 {
+                fill_rect(pix, self.pitch, w, h, x0 as i32, y0 as i32 + 10, 2, (IME_STRIP_H - 20) as i32, DIM);
+            }
+            match slot {
+                // composing pinyin (dim 拼 hint while idle) — scale 3 fits
+                // the longest syllable "zhuang" in the slot
+                0 => {
+                    let s: &str = if ime.buf.is_empty() { "拼" } else { &ime.buf };
+                    let c = if ime.buf.is_empty() { DIM } else { WHITE };
+                    let tw = text_w(s, 3) as i32;
+                    draw_text(pix, self.pitch, w, h, self.font, x0 as i32 + (sw as i32 - tw) / 2, y0 as i32 + (IME_STRIP_H as i32 - 8 * 3) / 2, s, 3, c);
+                }
+                // page arrow — dim when everything fits on one page
+                7 => {
+                    let len = ime.candidates().len();
+                    let pages = if len == 0 { 0 } else { (len + pinyin::PAGE - 1) / pinyin::PAGE };
+                    let c = if pages > 1 { GREEN } else { DIM };
+                    let tw = text_w("›", 5) as i32;
+                    draw_text(pix, self.pitch, w, h, self.font, x0 as i32 + (sw as i32 - tw) / 2, y0 as i32 + (IME_STRIP_H as i32 - 8 * 5) / 2, "›", 5, c);
+                }
+                // candidate hanzi: wide-glyph path, ~80 px in the 120 px strip
+                i => {
+                    if let Some(ch) = ime.page_candidate(i - 1) {
+                        let s = ch.to_string();
+                        let tw = text_w(&s, 10) as i32;
+                        draw_text(pix, self.pitch, w, h, self.font, x0 as i32 + (sw as i32 - tw) / 2, y0 as i32 + (IME_STRIP_H as i32 - 8 * 10) / 2, &s, 10, GREEN);
+                    }
+                }
+            }
         }
     }
 
@@ -797,7 +882,30 @@ fn host_ppm(out: &str) {
         }
         println!("wrote {photo_path}");
     }
-    println!("wrote {out} and {term_path}");
+
+    // fourth frame (M40): pinyin IME — ATERM_IME_DEMO=<syllable> latches
+    // 拼 on, types the syllable into the buffer and renders the strip over
+    // the demo session, so the candidate row is host-verifiable.
+    if let Ok(syl) = std::env::var("ATERM_IME_DEMO") {
+        let mut k = kb0();
+        k.set_pinyin(true);
+        let mut ime = pinyin::Ime::new();
+        for c in syl.chars().filter(|c| c.is_ascii_lowercase()) {
+            ime.feed(&InputEvent::Text(c.to_string()));
+        }
+        let mut pix4 = vec![0u32; pitch * h];
+        fill_rect(&mut pix4, pitch, w, h, 0, 0, w as i32, h as i32, BG);
+        r.toolbar(&mut pix4, kb::KB_M, lg.toolbar_h);
+        r.terminal(&mut pix4, &t, area_top0, area_h0, sc0, true, kb::KB_M);
+        r.keyboard(&mut pix4, &kg, &k);
+        r.ime_strip(&mut pix4, &ime, &kg);
+        let ime_path = format!("{}-ime", out);
+        if let Err(e) = ppm_dump(&ime_path, &pix4, w, h, pitch) {
+            eprintln!("ppm: {e}");
+        }
+        println!("wrote {ime_path}");
+    }
+    println!("wrote {out} and {out}-term");
 }
 
 // ---------------- main ----------------
@@ -821,6 +929,7 @@ fn main() {
     let pitch = d.pitch_px();
 
     let mut kb = Kb::new();
+    let mut ime = pinyin::Ime::new(); // M40: 拼 buffer + candidate page
     let kg = Kb::geom(w, h);
     let mut entries = launch::entries();
     // Picker state ("+" tile): optional packages from `agpkg available`
@@ -909,6 +1018,9 @@ fn main() {
         }
         if kb_visible {
             r.keyboard(buf, &kg, &kb);
+            if kb.pinyin_on() {
+                r.ime_strip(buf, &ime, &kg);
+            }
         }
         d.back_buf().copy_from_slice(&canvas);
     }
@@ -1030,7 +1142,31 @@ fn main() {
                                     redraw = true;
                                 }
                             } else if y < kg.extra_y {
-                                if let Mode::Launcher = &mut mode {
+                                // M40 candidate strip floats over this band
+                                // while 拼 is on and a session runs: slot 0
+                                // is the buffer (display only), 1-6 commit a
+                                // hanzi, 7 pages the candidate list.
+                                let strip_top = kg.extra_y.saturating_sub(IME_STRIP_H);
+                                if kb_visible
+                                    && kb.pinyin_on()
+                                    && y >= strip_top
+                                    && matches!(mode, Mode::Running(_))
+                                {
+                                    let slot = (x / (w / 8)).min(7);
+                                    if slot == 7 {
+                                        ime.next_page();
+                                    } else if slot >= 1 {
+                                        if let Some(ch) = ime.take_candidate(slot - 1) {
+                                            inject(
+                                                &mut mode,
+                                                &mut term,
+                                                &mut parser,
+                                                &InputEvent::Text(ch.to_string()),
+                                            );
+                                        }
+                                    }
+                                    redraw = true;
+                                } else if let Mode::Launcher = &mut mode {
                                     if let Some(i2) = lg.button_at(x, y, entries.len()) {
                                         if entries[i2].picker {
                                             pkgs = read_available();
@@ -1143,19 +1279,50 @@ fn main() {
                                 }
                             }
                             if kb_visible && y >= kg.extra_y {
+                                let py_was = kb.pinyin_on(); // before 拼 may flip
                                 let ev = if y >= kg.panel_y {
                                     kb.key_at(&kg, x, y)
                                 } else {
                                     kb.extra_key_at(&kg, x, y)
                                 };
                                 if let Some(ev) = ev {
-                                    inject(&mut mode, &mut term, &mut parser, &ev);
-                                    if input::repeatable(&ev) {
-                                        held = Some((ev, Instant::now() + Duration::from_millis(400)));
+                                    // M40: while 拼 is on, the IME sees the
+                                    // event first — letters build the buffer,
+                                    // space/enter commit. Pass flows through
+                                    // to inject() unchanged.
+                                    match if py_was && matches!(mode, Mode::Running(_)) {
+                                        ime.feed(&ev)
+                                    } else {
+                                        pinyin::Outcome::Pass
+                                    } {
+                                        pinyin::Outcome::Commit(s) => {
+                                            inject(&mut mode, &mut term, &mut parser, &InputEvent::Text(s));
+                                        }
+                                        pinyin::Outcome::Consumed => {}
+                                        pinyin::Outcome::Pass => {
+                                            inject(&mut mode, &mut term, &mut parser, &ev);
+                                            if input::repeatable(&ev) {
+                                                held = Some((ev, Instant::now() + Duration::from_millis(400)));
+                                            }
+                                        }
                                     }
-                                    kb_dirty = true; // modifier highlight may flip
-                                    redraw = true;
+                                    // 拼 flipped this tap: drop the buffer and
+                                    // repaint the terminal rows the strip was
+                                    // floating over (row-damage alone would
+                                    // leave stale strip pixels)
+                                    if py_was != kb.pinyin_on() {
+                                        ime.clear();
+                                        for row in 0..term.rows {
+                                            term.mark_row(row);
+                                        }
+                                    }
+                                    // (modifier highlight / repaint handled
+                                    // by the touch-feedback lines below)
                                 }
+                                // touch feedback: this keycap lights until lift
+                                kb.press_locate(&kg, x, y);
+                                kb_dirty = true;
+                                redraw = true;
                             }
                         }
                         // Finger lifted: everything fired at Down already.
@@ -1163,12 +1330,25 @@ fn main() {
                         // dismisses the keyboard; rows resize + SIGWINCH.
                         Touch::Tap(_x, y) => {
                             held = None;
+                            // lift without a drag — the normal end of a key
+                            // tap: drop the touch-feedback highlight
+                            if kb.clear_pressed_if_any() {
+                                kb_dirty = true;
+                                redraw = true;
+                            }
                             if std::env::var("ATERM_DEBUG").is_ok() {
                                 eprintln!("aterm: touch tap y={y} kbvis={kb_visible}");
                             }
                             let kb_bot = if kb_visible { kg.extra_y } else { h };
+                            // a lift over the candidate strip is an IME tap
+                            // (already handled at Down) — it must not also
+                            // toggle the keyboard away
+                            let in_strip = kb_visible
+                                && kb.pinyin_on()
+                                && matches!(mode, Mode::Running(_))
+                                && y >= kg.extra_y.saturating_sub(IME_STRIP_H);
                             if let Mode::Running(c) = &mode {
-                                if y >= lg.toolbar_h && y < kb_bot {
+                                if y >= lg.toolbar_h && y < kb_bot && !in_strip {
                                     kb_visible = !kb_visible;
                                     let nr = rows_for(kb_visible, scale);
                                     term.resize_rows(nr);
@@ -1194,6 +1374,12 @@ fn main() {
                         // nothing and scrolls nothing).
                         Touch::Up => {
                             held = None;
+                            // lift after a drag that started on a key:
+                            // drop the touch-feedback highlight
+                            if kb.clear_pressed_if_any() {
+                                kb_dirty = true;
+                                redraw = true;
+                            }
                         }
                         Touch::Drag(dy) => {
                             held = None; // finger slid off the key
@@ -1323,6 +1509,11 @@ fn main() {
                         if kb_visible {
                             r.keyboard(buf, &kg, &kb);
                         }
+                    }
+                    // every pass, not just kb_dirty: the strip floats over
+                    // terminal rows that repaint on cursor blink
+                    if kb_visible && kb.pinyin_on() {
+                        r.ime_strip(buf, &ime, &kg);
                     }
                 }
             }

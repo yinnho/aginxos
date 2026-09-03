@@ -1,101 +1,170 @@
-// On-screen ASCII keyboard: the panel's lower half. Input is evdev
-// (type-B touch protocol); keys fire on finger-DOWN (a tap only read as
-// complete at finger-up was a big chunk of the perceived typing lag).
-// Drag-scroll of scrollback is armed only by touches starting ABOVE the
-// keyboard, so dragging across keys no longer scrolls.
+// On-screen keyboard, the panel's lower half. Input is evdev (type-B touch
+// protocol); keys fire on finger-DOWN (a tap only read as complete at
+// finger-up was a big chunk of the perceived typing lag). Drag-scroll of
+// scrollback is armed only by touches starting ABOVE the keyboard, so
+// dragging across keys no longer scrolls.
 //
 // M17: the keyboard is a key table (inputd shape) — every keycap is a
 // KeyDef (label + Act), and hit tests return typed input::InputEvents,
 // never raw pty bytes. Text keys (letters, symbols, space) come back as
 // TextInputEvent, control keys as KeyEvent; encoding to bytes happens
-// once, in the terminal layer (input::encode). Voice (M18) injects
-// TextInputEvent through the same path in main.rs.
+// once, in the terminal layer (input::encode). Voice (M18) and the IME
+// (M40) inject TextInputEvent through the same path in main.rs.
 //
-// Extra-keys row (borrowed from Termux's ExtraKeysView): a slim row above
-// the letter rows with ESC TAB CTL and arrows; DEL + arrows repeat while
-// held (Termux PRIMARY_REPETITIVE_KEYS). Specials row: SHF (one-shot
-// shift) SYM (one-shot symbol page) SPC DEL ENT. CTL is a one-shot
-// modifier: letter -> KeyEvent::Ctrl (CTL c = 0x03 when encoded).
-//
-// Layout math (1080x2340): a plain 10-column grid — every row divides the
-// usable width evenly (28 px side margins, 24 px bottom margin) with ONE
-// uniform keycap gap (≈0.8% of span), so the four letter rows are identical
-// and edge-to-edge with the extra-keys and specials rows (2026-09-02: the
-// QWERTY stagger and fixed-width cells are gone — all rows have 10 keys,
-// so all rows are the same row).
+// M40b: the letter block follows the iPhone keyboard layout (user call,
+// 2026-09-03) — three letter rows (10 / 9 centered / shift+7+delete) plus
+// a bottom row of [123] [拼] [ space ] [。] [换行], with the 123 and #+=
+// symbol pages switching through the bottom-left key like iOS. Pages
+// LATCH (typing a digit stays on the page); only shift stays one-shot.
+// Letters display lowercase, shift uppercases. What iOS does not have
+// and a terminal needs stays in the slim extra-keys row above (Termux
+// style): ESC TAB CTL and the arrows.
 
 use crate::input::{Dir, InputEvent, KeyEvent};
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
 
-const ROWS: [&str; 4] = [
-    "1234567890",
-    "QWERTYUIOP",
-    "ASDFGHJKL?",
-    "ZXCVBNM.,-",
-];
-// SYM page: 30 shell punctuation chars + the letter row stays for mixing.
-const SYM_ROWS: [&str; 4] = [
-    "!@#$%^&*()",
-    "\"';:=+[]\\|",
-    "<>_`~{}/-?",
-    "ZXCVBNM.,-",
-];
-const SPEC_Y_ROW: usize = 4; // fifth row: SHF SYM SPC DEL ENT
+/// Whole-panel page, switched by the 123 / #+= / ABC keys (iOS behavior:
+/// latching — a page persists across key presses).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Page {
+    Letters,
+    Num,
+    Sym,
+}
 
-/// What a keycap does. The letter pages stay char grids (ROWS/SYM_ROWS)
-/// because their behavior is combinatorial (page x shift x ctrl), so they
-/// bypass the table; the fixed rows spell their actions out here. The
-/// vocabulary grows with the table — add a KeyDef, not a match arm.
+/// What a keycap does. Grid rows (rows 0-1) are char grids because their
+/// behavior is combinatorial (page x shift x ctrl); rows 2-3 spell their
+/// keys out here. The vocabulary grows with the table — add a KeyDef,
+/// not a match arm.
+#[derive(Clone)]
 pub enum Act {
-    /// Fixed key: emits this event every tap.
+    /// Fixed key: emits this event every tap (DEL, 换行, ESC, arrows).
     Ev(InputEvent),
+    /// Letter key (row 2): composes with shift/ctrl at hit time.
+    Letter(char),
+    /// Literal char key: digits and punctuation — shift does not compose.
+    Text(char),
     /// Space — a Text event, composed at hit time (" ".into() is not const).
     Space,
-    /// One-shot modifiers — toggle state, compose nothing themselves.
+    /// 。 while 拼 is on, . while off (iOS Chinese convention).
+    Period,
+    /// One-shot shift (next letter uppercased).
     Shift,
-    Sym,
+    /// One-shot ctrl (letter -> KeyEvent::Ctrl).
     Ctrl,
+    /// 拼 (M40): latching toggle for the pinyin IME. It stays on until
+    /// pressed again — an IME is a mode you type in, not a one-shot.
+    Pinyin,
+    /// Switch the panel to this page.
+    Page(Page),
 }
 
 pub struct KeyDef {
     pub label: &'static str,
     pub act: Act,
+    /// Relative width within the row (letters weigh 2; shift/del/123/换行
+    /// weigh 3; space weighs 8). Each row normalizes to the full span.
+    pub w: usize,
 }
 
-// Extra-keys row (above the letter rows), Termux default order:
-// ESC TAB CTL LEFT DOWN UP RIGHT. Arrows are font glyphs 0x10-0x13.
+// Extra-keys row (above the letter block), Termux style: ESC TAB CTL and
+// the four arrows (拼 lives in the bottom row, the iOS globe slot). Arrows
+// are font glyphs 0x10-0x13.
 pub const EXTRA_KEYS: [KeyDef; 7] = [
-    KeyDef { label: "ESC", act: Act::Ev(InputEvent::Key(KeyEvent::Esc)) },
-    KeyDef { label: "TAB", act: Act::Ev(InputEvent::Key(KeyEvent::Tab)) },
-    KeyDef { label: "CTL", act: Act::Ctrl },
-    KeyDef { label: "\u{10}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Left))) },
-    KeyDef { label: "\u{11}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Down))) },
-    KeyDef { label: "\u{12}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Up))) },
-    KeyDef { label: "\u{13}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Right))) },
+    KeyDef { label: "ESC", act: Act::Ev(InputEvent::Key(KeyEvent::Esc)), w: 1 },
+    KeyDef { label: "TAB", act: Act::Ev(InputEvent::Key(KeyEvent::Tab)), w: 1 },
+    KeyDef { label: "CTL", act: Act::Ctrl, w: 1 },
+    KeyDef { label: "\u{10}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Left))), w: 1 },
+    KeyDef { label: "\u{11}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Down))), w: 1 },
+    KeyDef { label: "\u{12}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Up))), w: 1 },
+    KeyDef { label: "\u{13}", act: Act::Ev(InputEvent::Key(KeyEvent::Arrow(Dir::Right))), w: 1 },
 ];
 
-pub const SPECIALS: [KeyDef; 5] = [
-    KeyDef { label: "SHF", act: Act::Shift },
-    KeyDef { label: "SYM", act: Act::Sym },
-    KeyDef { label: "SPC", act: Act::Space },
-    KeyDef { label: "DEL", act: Act::Ev(InputEvent::Key(KeyEvent::Backspace)) },
-    KeyDef { label: "ENT", act: Act::Ev(InputEvent::Key(KeyEvent::Enter)) },
+// Grid rows (uniform cells): 10 keys, then 9 centered — iOS letter block,
+// lowercase labels (shift shows caps). Same shape on every page.
+const GRID: [&str; 2] = ["qwertyuiop", "asdfghjkl"];
+const GRID_NUM: [&str; 2] = ["1234567890", "-/:;()$&@\""];
+const GRID_SYM: [&str; 2] = ["[]{}#%^*+=", "_\\|~<>`'\""];
+
+// Row 2: shift-slot + keys + delete (iOS). Letters page: ⇧ z x c v b n m ⌫.
+const R2: [KeyDef; 9] = [
+    KeyDef { label: "SHF", act: Act::Shift, w: 3 },
+    KeyDef { label: "z", act: Act::Letter('z'), w: 2 },
+    KeyDef { label: "x", act: Act::Letter('x'), w: 2 },
+    KeyDef { label: "c", act: Act::Letter('c'), w: 2 },
+    KeyDef { label: "v", act: Act::Letter('v'), w: 2 },
+    KeyDef { label: "b", act: Act::Letter('b'), w: 2 },
+    KeyDef { label: "n", act: Act::Letter('n'), w: 2 },
+    KeyDef { label: "m", act: Act::Letter('m'), w: 2 },
+    KeyDef { label: "DEL", act: Act::Ev(InputEvent::Key(KeyEvent::Backspace)), w: 3 },
 ];
+// 123 page row 2: #+= . , ? ! ' ⌫ (the shift slot becomes the #+= switch).
+const R2_NUM: [KeyDef; 7] = [
+    KeyDef { label: "#+=", act: Act::Page(Page::Sym), w: 3 },
+    KeyDef { label: ".", act: Act::Text('.'), w: 2 },
+    KeyDef { label: ",", act: Act::Text(','), w: 2 },
+    KeyDef { label: "?", act: Act::Text('?'), w: 2 },
+    KeyDef { label: "!", act: Act::Text('!'), w: 2 },
+    KeyDef { label: "'", act: Act::Text('\''), w: 2 },
+    KeyDef { label: "DEL", act: Act::Ev(InputEvent::Key(KeyEvent::Backspace)), w: 3 },
+];
+// #+= page row 2: 123 . , : ; ! ? ⌫ (terminal-tuned where iOS shows
+// currency the font subset cannot render).
+const R2_SYM: [KeyDef; 8] = [
+    KeyDef { label: "123", act: Act::Page(Page::Num), w: 3 },
+    KeyDef { label: ".", act: Act::Text('.'), w: 2 },
+    KeyDef { label: ",", act: Act::Text(','), w: 2 },
+    KeyDef { label: ":", act: Act::Text(':'), w: 2 },
+    KeyDef { label: ";", act: Act::Text(';'), w: 2 },
+    KeyDef { label: "!", act: Act::Text('!'), w: 2 },
+    KeyDef { label: "?", act: Act::Text('?'), w: 2 },
+    KeyDef { label: "DEL", act: Act::Ev(InputEvent::Key(KeyEvent::Backspace)), w: 3 },
+];
+
+// Bottom row (same on every page except the left key): [123/ABC] 拼 ——
+// space —— 。/。 换行. 拼 sits in the iOS globe slot; the period shows 。
+// while the IME is on.
+const R3: [KeyDef; 5] = [
+    KeyDef { label: "123", act: Act::Page(Page::Num), w: 3 },
+    KeyDef { label: "拼", act: Act::Pinyin, w: 2 },
+    KeyDef { label: "", act: Act::Space, w: 8 },
+    KeyDef { label: ".", act: Act::Period, w: 2 },
+    KeyDef { label: "换行", act: Act::Ev(InputEvent::Key(KeyEvent::Enter)), w: 3 },
+];
+const R3_NUM: [KeyDef; 5] = [
+    KeyDef { label: "ABC", act: Act::Page(Page::Letters), w: 3 },
+    KeyDef { label: "拼", act: Act::Pinyin, w: 2 },
+    KeyDef { label: "", act: Act::Space, w: 8 },
+    KeyDef { label: ".", act: Act::Period, w: 2 },
+    KeyDef { label: "换行", act: Act::Ev(InputEvent::Key(KeyEvent::Enter)), w: 3 },
+];
+const R3_SYM: [KeyDef; 5] = R3_NUM;
 
 pub const KB_M: usize = 28; // side margin (px)
 pub const KB_B: usize = 24; // bottom margin (px)
+// Rows in the letter block (grid, grid, weighted, bottom) — the M40b iOS
+// layout; the pre-iOS layout had a fifth specials row.
+const KB_ROWS: usize = 4;
 // Row height cap: keeps the terminal area identical to the pre-grid layout
-// on redfin — the h/2 height budget would allow 229, far taller than a
-// 10-column grid needs now that the width no longer shrinks the cells.
+// on redfin — the h/2 height budget would allow far taller caps.
 const KB_ROW_H: usize = 118;
 
 pub struct Kb {
     shift: bool,
-    sym: bool,
     ctrl: bool,
+    pinyin: bool,
+    page: Page,
+    /// Key under the finger right now: (area, row, index) — the renderer
+    /// lights that one keycap for touch feedback (iOS keys darken while
+    /// pressed; ours go bright). Lives from finger-DOWN to any lift.
+    pressed: Option<(u8, u8, u8)>,
 }
+
+/// pressed-slot areas (see Kb::pressed).
+pub const AREA_EXTRA: u8 = 0;
+pub const AREA_PANEL: u8 = 1;
 
 pub struct KeyGeom {
     pub panel_y: usize, // letter panel top edge (px)
@@ -104,28 +173,24 @@ pub struct KeyGeom {
     pub x_off: usize, // side margin
     pub gap: usize, // uniform keycap gap, H+V (≈0.8% of span)
     pub label_scale: usize, // letter labels: ~half the cap, not edge-to-edge
-    pub span: usize, // usable width inside the margins
+    pub span: usize,
     pub cell_w: usize,
     pub cell_h: usize,
 }
 
 impl Kb {
     pub fn new() -> Kb {
-        Kb { shift: false, sym: false, ctrl: false }
+        Kb { shift: false, ctrl: false, pinyin: false, page: Page::Letters, pressed: None }
     }
 
     pub fn geom(w: usize, h: usize) -> KeyGeom {
-        // 10-column grid: every row divides the span into equal cells — no
-        // stagger, no fixed cell size — so all four letter rows are
-        // identical (10 keys each) and flush with the extra-keys and
-        // specials rows. One gap constant spaces every keycap, H and V.
         let span = w - 2 * KB_M;
         let cell_w = span / 10;
         let cell_h = (h / 2 / 5).min(KB_ROW_H);
         let gap = span / 128; // ≈0.8% of span: 8 px on the 1080 panel
         // letter labels: ~half the keycap so rows read as separate keys
         let label_scale = ((cell_w - 24) / 6).min((cell_h - 24) / 8).max(2);
-        let panel_y = h - KB_B - cell_h * 5;
+        let panel_y = h - KB_B - cell_h * KB_ROWS;
         let extra_h = cell_h * 3 / 4;
         KeyGeom {
             panel_y,
@@ -140,15 +205,13 @@ impl Kb {
         }
     }
 
-
-
     /// Extra-keys row hit test. y in [extra_y, panel_y).
     pub fn extra_key_at(&mut self, g: &KeyGeom, x: usize, y: usize) -> Option<InputEvent> {
         if y < g.extra_y || y >= g.panel_y || x < g.x_off {
             return None;
         }
-        let kw = g.span / 7;
-        let k = ((x - g.x_off) / kw).min(6);
+        let kw = g.span / EXTRA_KEYS.len();
+        let k = ((x - g.x_off) / kw).min(EXTRA_KEYS.len() - 1);
         match &EXTRA_KEYS[k].act {
             Act::Ctrl => {
                 self.ctrl = !self.ctrl;
@@ -159,79 +222,99 @@ impl Kb {
         }
     }
 
-    pub fn page_rows(&self) -> &'static [&'static str; 4] {
-        if self.sym { &SYM_ROWS } else { &ROWS }
+    pub fn page(&self) -> Page {
+        self.page
+    }
+
+    /// Grid rows 0-1 for the current page (uniform cells, 10 then 9 keys).
+    pub fn grids(&self) -> [&'static str; 2] {
+        match self.page {
+            Page::Letters => GRID,
+            Page::Num => GRID_NUM,
+            Page::Sym => GRID_SYM,
+        }
+    }
+
+    /// Weighted row 2 (shift-slot + keys + delete) for the current page.
+    pub fn row2(&self) -> &'static [KeyDef] {
+        match self.page {
+            Page::Letters => &R2,
+            Page::Num => &R2_NUM,
+            Page::Sym => &R2_SYM,
+        }
+    }
+
+    /// Bottom row for the current page.
+    pub fn row3(&self) -> &'static [KeyDef] {
+        match self.page {
+            Page::Letters => &R3,
+            Page::Num => &R3_NUM,
+            Page::Sym => &R3_SYM,
+        }
     }
 
     /// Key at panel coords -> input event. Text keys (page/shift/ctrl
-    /// compositing) come back as TextInputEvent; specials as KeyEvent.
-    /// Consumes one-shot shift/sym. Modifier toggles return empty Text
-    /// (consumed, no output).
+    /// compositing) come back as TextInputEvent; DEL/换行 as KeyEvent.
+    /// Modifier toggles and page switches return empty Text (consumed).
     pub fn key_at(&mut self, g: &KeyGeom, x: usize, y: usize) -> Option<InputEvent> {
         if y < g.panel_y || x < g.x_off {
             return None;
         }
-        let x = x - g.x_off;
+        let xr = x - g.x_off;
         let row = (y - g.panel_y) / g.cell_h;
-        if row < 4 {
-            let col = x / g.cell_w;
-            let s = if self.sym { SYM_ROWS[row] } else { ROWS[row] };
-            if col >= s.len() {
-                return None;
+        match row {
+            0 | 1 => {
+                let s = self.grids()[row];
+                let n = s.len();
+                let col = (xr / (g.span / n)).min(n - 1);
+                let ch = s.as_bytes()[col] as char;
+                self.compose_letter(ch)
             }
-            let mut ch = s.as_bytes()[col] as char;
-            if !self.sym {
-                if self.shift {
-                    if ch.is_ascii_uppercase() {
-                        // layout stores caps; unshifted means lowercase
-                    } else {
-                        ch = ch.to_ascii_uppercase();
-                    }
-                } else if ch.is_ascii_uppercase() {
-                    ch = ch.to_ascii_lowercase();
-                }
-                if ch == '?' && !self.shift {
-                    ch = '/';
-                }
-                if self.shift {
-                    const DIGIT_SHIFT: &[(char, char)] = &[
-                        ('1', '!'), ('2', '@'), ('3', '#'), ('4', '$'), ('5', '%'),
-                        ('6', '^'), ('7', '&'), ('8', '*'), ('9', '('), ('0', ')'),
-                        ('-', '_'), (',', '<'), ('.', '>'), ('/', '?'),
-                    ];
-                    for &(d, s2) in DIGIT_SHIFT {
-                        if ch == d {
-                            ch = s2;
-                        }
-                    }
-                }
+            2 => self.row_act(self.row2(), g, xr),
+            3 => self.row_act(self.row3(), g, xr),
+            _ => None,
+        }
+    }
+
+    /// A letter under one-shot shift/ctrl (grid rows and row-2 letters).
+    fn compose_letter(&mut self, ch: char) -> Option<InputEvent> {
+        let ctrl = self.ctrl;
+        self.ctrl = false;
+        if ctrl && ch.is_ascii_alphabetic() {
+            return Some(InputEvent::Key(KeyEvent::Ctrl(ch)));
+        }
+        let mut c = ch;
+        if self.shift && self.page == Page::Letters {
+            c = c.to_ascii_uppercase();
+        }
+        self.shift = false;
+        Some(InputEvent::Text(c.to_string()))
+    }
+
+    fn row_act(&mut self, row: &'static [KeyDef], g: &KeyGeom, xr: usize) -> Option<InputEvent> {
+        let kd = weighted_at(row, g, xr);
+        match kd.act.clone() {
+            Act::Letter(ch) => self.compose_letter(ch),
+            Act::Text(ch) => Some(InputEvent::Text(ch.to_string())),
+            Act::Period => Some(InputEvent::Text(if self.pinyin { "。" } else { "." }.into())),
+            Act::Space => Some(InputEvent::Text(" ".into())),
+            Act::Shift => {
+                self.shift = !self.shift;
+                Some(InputEvent::Text(String::new()))
             }
-            self.shift = false;
-            self.sym = false;
-            let ctrl = self.ctrl;
-            self.ctrl = false;
-            if ctrl && ch.is_ascii_alphabetic() {
-                return Some(InputEvent::Key(KeyEvent::Ctrl(ch)));
+            Act::Ctrl => {
+                self.ctrl = !self.ctrl;
+                Some(InputEvent::Text(String::new()))
             }
-            Some(InputEvent::Text(ch.to_string()))
-        } else if row == SPEC_Y_ROW {
-            let kw = g.span / 5;
-            let k = (x / kw).min(4);
-            match &SPECIALS[k].act {
-                Act::Shift => {
-                    self.shift = !self.shift;
-                    Some(InputEvent::Text(String::new()))
-                }
-                Act::Sym => {
-                    self.sym = !self.sym;
-                    Some(InputEvent::Text(String::new()))
-                }
-                Act::Ev(ev) => Some(ev.clone()),
-                Act::Space => Some(InputEvent::Text(" ".into())),
-                _ => None,
+            Act::Pinyin => {
+                self.pinyin = !self.pinyin;
+                Some(InputEvent::Text(String::new()))
             }
-        } else {
-            None
+            Act::Page(p) => {
+                self.page = p;
+                Some(InputEvent::Text(String::new()))
+            }
+            Act::Ev(ev) => Some(ev),
         }
     }
 
@@ -239,13 +322,86 @@ impl Kb {
         self.shift
     }
 
-    pub fn sym_on(&self) -> bool {
-        self.sym
+    /// Remember which key the finger just landed on (touch feedback).
+    /// Call from the Down path; any lift clears it.
+    pub fn press_locate(&mut self, g: &KeyGeom, x: usize, y: usize) {
+        self.pressed = self.locate(g, x, y);
+    }
+
+    /// Drop the highlight on finger lift; true if a repaint is needed.
+    pub fn clear_pressed_if_any(&mut self) -> bool {
+        self.pressed.take().is_some()
+    }
+
+    pub fn is_pressed(&self, area: u8, row: u8, idx: u8) -> bool {
+        self.pressed == Some((area, row, idx))
+    }
+
+    /// (area, row, index) of the key at panel coords — the same walks
+    /// key_at uses, index instead of event.
+    fn locate(&self, g: &KeyGeom, x: usize, y: usize) -> Option<(u8, u8, u8)> {
+        if x < g.x_off {
+            return None;
+        }
+        if y >= g.extra_y && y < g.panel_y {
+            let kw = g.span / EXTRA_KEYS.len();
+            let k = ((x - g.x_off) / kw).min(EXTRA_KEYS.len() - 1);
+            return Some((AREA_EXTRA, 0, k as u8));
+        }
+        if y < g.panel_y {
+            return None;
+        }
+        let row = (y - g.panel_y) / g.cell_h;
+        let xr = x - g.x_off;
+        match row {
+            0 | 1 => {
+                let s = self.grids()[row];
+                let n = s.len();
+                let col = (xr / (g.span / n)).min(n - 1);
+                Some((AREA_PANEL, row as u8, col as u8))
+            }
+            2 | 3 => {
+                let defs = if row == 2 { self.row2() } else { self.row3() };
+                let units: usize = defs.iter().map(|k| k.w).sum();
+                let mut acc = 0usize;
+                for (i, k) in defs.iter().enumerate() {
+                    acc += k.w;
+                    if xr < g.span * acc / units {
+                        return Some((AREA_PANEL, row as u8, i as u8));
+                    }
+                }
+                Some((AREA_PANEL, row as u8, defs.len() as u8 - 1))
+            }
+            _ => None,
+        }
     }
 
     pub fn ctrl_on(&self) -> bool {
         self.ctrl
     }
+
+    pub fn pinyin_on(&self) -> bool {
+        self.pinyin
+    }
+
+    /// Host --ppm demo path (ATERM_IME_DEMO): latch 拼 without a touch.
+    pub fn set_pinyin(&mut self, on: bool) {
+        self.pinyin = on;
+    }
+}
+
+/// The KeyDef covering x-offset `xr` inside a weighted row (each row
+/// normalizes its weights to the full span).
+pub fn weighted_at(row: &'static [KeyDef], g: &KeyGeom, xr: usize) -> &'static KeyDef {
+    let units: usize = row.iter().map(|k| k.w).sum();
+    let mut acc = 0usize;
+    for k in row {
+        acc += k.w;
+        if xr < g.span * acc / units {
+            return k;
+        }
+    }
+    row.last().unwrap()
 }
 
 // ---------------- evdev reader ----------------
@@ -461,5 +617,112 @@ impl KeyReader {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn g() -> KeyGeom {
+        Kb::geom(1080, 2340)
+    }
+
+    fn text_of(ev: Option<InputEvent>) -> String {
+        match ev {
+            Some(InputEvent::Text(s)) => s,
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn letter_block_is_ios() {
+        let g = g();
+        let mut kb = Kb::new();
+        // row 0: 10 uniform keys, q at the left edge
+        assert_eq!(text_of(kb.key_at(&g, g.x_off + 10, g.panel_y + 10)), "q");
+        assert_eq!(text_of(kb.key_at(&g, g.x_off + g.span - 10, g.panel_y + 10)), "p");
+        // row 1: 9 keys centered — 'a' is inset from the left edge
+        let cw1 = g.span / 9;
+        assert_eq!(text_of(kb.key_at(&g, g.x_off + cw1 / 2, g.panel_y + g.cell_h + 10)), "a");
+        // row 2: shift (3/20) then z x c v b n m then DEL
+        let z_x = g.x_off + g.span * 3 / 20 + g.span / 10 / 2;
+        assert_eq!(text_of(kb.key_at(&g, z_x, g.panel_y + 2 * g.cell_h + 10)), "z");
+        // DEL at the far right emits the Backspace key event
+        assert!(matches!(
+            kb.key_at(&g, g.x_off + g.span - 10, g.panel_y + 2 * g.cell_h + 10),
+            Some(InputEvent::Key(KeyEvent::Backspace))
+        ));
+        // bottom row center is space
+        assert_eq!(text_of(kb.key_at(&g, 540, g.panel_y + 3 * g.cell_h + 10)), " ");
+        // 4 rows in the block (the pre-iOS layout had 5)
+        assert_eq!(g.panel_y + 4 * g.cell_h + KB_B, 2340);
+    }
+
+    #[test]
+    fn shift_uppercases_one_shot() {
+        let g = g();
+        let mut kb = Kb::new();
+        // SHF toggles (consumed, empty Text), next letter is caps, then back
+        assert!(matches!(
+            kb.key_at(&g, g.x_off + g.span / 20, g.panel_y + 2 * g.cell_h + 10),
+            Some(InputEvent::Text(ref s)) if s.is_empty()
+        ));
+        assert!(kb.shift_on());
+        assert_eq!(text_of(kb.key_at(&g, g.x_off + 10, g.panel_y + 10)), "Q");
+        assert!(!kb.shift_on());
+        assert_eq!(text_of(kb.key_at(&g, g.x_off + 10, g.panel_y + 10)), "q");
+    }
+
+    #[test]
+    fn pages_latch_and_switch() {
+        let g = g();
+        let mut kb = Kb::new();
+        let bottom_left = (g.x_off + g.span / 12, g.panel_y + 3 * g.cell_h + 10);
+        // 123 -> digits, and typing a digit STAYS on the page (iOS latch)
+        assert!(matches!(
+            kb.key_at(&g, bottom_left.0, bottom_left.1),
+            Some(InputEvent::Text(ref s)) if s.is_empty()
+        ));
+        assert_eq!(kb.page(), Page::Num);
+        assert_eq!(text_of(kb.key_at(&g, g.x_off + 10, g.panel_y + 10)), "1");
+        assert_eq!(text_of(kb.key_at(&g, g.x_off + 10, g.panel_y + 10)), "1");
+        // #+= from the 123 page's shift slot, then ABC back to letters
+        let eq_key = (g.x_off + g.span * 3 / 32, g.panel_y + 2 * g.cell_h + 10);
+        kb.key_at(&g, eq_key.0, eq_key.1);
+        assert_eq!(kb.page(), Page::Sym);
+        assert_eq!(text_of(kb.key_at(&g, g.x_off + 10, g.panel_y + 10)), "[");
+        kb.key_at(&g, bottom_left.0, bottom_left.1); // ABC
+        assert_eq!(kb.page(), Page::Letters);
+        assert_eq!(text_of(kb.key_at(&g, g.x_off + 10, g.panel_y + 10)), "q");
+    }
+
+    #[test]
+    fn period_follows_ime_state() {
+        let g = g();
+        let mut kb = Kb::new();
+        let period_x = g.x_off + g.span * 13 / 18; // after space (3+2+8 of 18)
+        let y = g.panel_y + 3 * g.cell_h + 10;
+        assert_eq!(text_of(kb.key_at(&g, period_x, y)), ".");
+        kb.set_pinyin(true);
+        assert_eq!(text_of(kb.key_at(&g, period_x, y)), "。");
+    }
+
+    #[test]
+    fn ctrl_chords_and_arrows() {
+        let g = g();
+        let mut kb = Kb::new();
+        // CTL from the extra row, then 'c' (row 2, center of the c key) -> Ctrl('c')
+        let c_x = g.x_off + g.span * 8 / 20;
+        kb.extra_key_at(&g, g.x_off + g.span * 2 / 7 + 5, g.extra_y + 5); // CTL
+        assert!(matches!(
+            kb.key_at(&g, c_x, g.panel_y + 2 * g.cell_h + 10),
+            Some(InputEvent::Key(KeyEvent::Ctrl(c))) if c == 'c'
+        ));
+        // arrows in the extra row are plain key events
+        assert!(matches!(
+            kb.extra_key_at(&g, g.x_off + g.span - 5, g.extra_y + 5),
+            Some(InputEvent::Key(KeyEvent::Arrow(Dir::Right)))
+        ));
     }
 }
