@@ -15,6 +15,9 @@ pub struct Cell {
     pub ch: char,
     pub style: Style,
 }
+/// Trailing half of a wide (2-cell) glyph — the leading cell holds the real
+/// char; the renderer skips this sentinel and draws across both cells.
+pub const WIDE_TAIL: char = '\0';
 impl Default for Cell {
     fn default() -> Self {
         Cell {
@@ -229,9 +232,40 @@ impl Term {
             self.newline();
         }
         let st = self.style;
+        // Wide chars (CJK etc.) occupy two cells: the leading cell holds the
+        // char, the trailing a WIDE_TAIL sentinel the renderer skips. There
+        // is no room at the last column — wrap before placing.
+        let wide = crate::cjk::char_width(ch) == 2;
+        if wide && self.cursor_x + 2 > self.cols {
+            self.grid[self.cursor_y * self.cols + self.cursor_x] = Cell { ch: ' ', style: st };
+            self.cursor_x = 0;
+            self.newline();
+        }
+        // Overwriting half of an existing wide pair orphans the other half —
+        // blank it first so no torn glyph survives.
+        if self.cursor_x > 0 {
+            let prev = self.grid[self.cursor_y * self.cols + self.cursor_x - 1].ch;
+            if crate::cjk::char_width(prev) == 2 {
+                self.grid[self.cursor_y * self.cols + self.cursor_x - 1] = Cell { ch: ' ', style: st };
+            }
+        }
+        if crate::cjk::char_width(self.grid[self.cursor_y * self.cols + self.cursor_x].ch) == 2
+            && self.cursor_x + 1 < self.cols
+        {
+            self.grid[self.cursor_y * self.cols + self.cursor_x + 1] = Cell { ch: ' ', style: st };
+        }
         self.grid[self.cursor_y * self.cols + self.cursor_x] = Cell { ch, style: st };
         self.row_dirty[self.cursor_y] = true;
-        if self.cursor_x + 1 >= self.cols {
+        if wide {
+            if self.cursor_x + 1 < self.cols {
+                self.grid[self.cursor_y * self.cols + self.cursor_x + 1] = Cell { ch: WIDE_TAIL, style: st };
+            }
+            if self.cursor_x + 2 >= self.cols {
+                self.wrap_pending = true;
+            } else {
+                self.cursor_x += 2;
+            }
+        } else if self.cursor_x + 1 >= self.cols {
             self.wrap_pending = true;
         } else {
             self.cursor_x += 1;

@@ -23,6 +23,7 @@
 // Host verification: `aterm --ppm out.ppm` renders the launcher into a P6
 // PPM without touching DRM (same pattern as bootcard --ppm).
 
+mod cjk;
 mod drm;
 mod font;
 mod input;
@@ -146,10 +147,46 @@ fn glyph(font: &[[u8; 8]; 128], ch: char) -> [u8; 8] {
     }
 }
 
+// M38a: iterate CHARS, not bytes — a UTF-8 hanzi used to truncate to four
+// garbage ASCII cells. Wide chars (CJK etc.) render through the ab_glyph
+// path spanning two cells; ASCII keeps the 5x8 bitmap.
 fn draw_text(pix: &mut [u32], pitch: usize, w: usize, h: usize, font: &[[u8; 8]; 128], x: i32, y: i32, s: &str, scale: usize, c: u32) -> i32 {
     let mut cx = x;
-    for &b in s.as_bytes() {
-        let g = font[(b & 127) as usize];
+    for ch in s.chars() {
+        if cjk::char_width(ch) == 2 {
+            let box_w = 12 * scale;
+            let box_h = 8 * scale;
+            if !cjk::draw(pix, pitch, w, h, cx, y, box_w, box_h, box_h as f32, ch, c) {
+                let g = font['?' as usize];
+                for r in 0..8 {
+                    for col in 0..5 {
+                        if g[r] & (0x10 >> col) != 0 {
+                            fill_rect(
+                                pix,
+                                pitch,
+                                w,
+                                h,
+                                cx + (col * scale) as i32,
+                                y + (r * scale) as i32,
+                                scale as i32,
+                                scale as i32,
+                                c,
+                            );
+                        }
+                    }
+                }
+            }
+            cx += (12 * scale) as i32;
+            continue;
+        }
+        if (ch as u32) >= 0x80
+            && cjk::draw(pix, pitch, w, h, cx, y, 6 * scale, 8 * scale, (8 * scale) as f32 * 0.8, ch, c)
+        {
+            // narrow non-ASCII (—, ·, …) from the CJK subset; bitmap is ASCII-only
+            cx += (6 * scale) as i32;
+            continue;
+        }
+        let g = glyph(font, ch);
         for r in 0..8 {
             for col in 0..5 {
                 if g[r] & (0x10 >> col) != 0 {
@@ -173,7 +210,10 @@ fn draw_text(pix: &mut [u32], pitch: usize, w: usize, h: usize, font: &[[u8; 8];
 }
 
 fn text_w(s: &str, scale: usize) -> usize {
-    s.len() * 6 * scale
+    s.chars()
+        .map(|ch| if cjk::char_width(ch) == 2 { 12 } else { 6 })
+        .sum::<usize>()
+        * scale
 }
 
 fn draw_centered(pix: &mut [u32], pitch: usize, w: usize, h: usize, font: &[[u8; 8]; 128], y: i32, s: &str, scale: usize, c: u32) {
@@ -437,30 +477,47 @@ impl<'a> Render<'a> {
             let line = t.render_line(row);
             let mut x = x_off;
             for cell in &line {
+                if cell.ch == term::WIDE_TAIL {
+                    x += cell_w;
+                    continue;
+                }
                 if cell.ch != ' ' {
-                    let c = match cell.style {
+                    let mut c = match cell.style {
                         Style::Normal => GREEN,
                         Style::Bright => WHITE,
-                        Style::Inverse => {
-                            fill_rect(pix, self.pitch, w, h, x as i32, y as i32, cell_w as i32, cell_h as i32, GREEN);
-                            BG
-                        }
+                        Style::Inverse => GREEN,
                     };
-                    let g = glyph(self.font, cell.ch);
-                    for r in 0..8 {
-                        for col in 0..5 {
-                            if g[r] & (0x10 >> col) != 0 {
-                                fill_rect(
-                                    pix,
-                                    self.pitch,
-                                    w,
-                                    h,
-                                    (x + col * scale) as i32,
-                                    (y + r * scale) as i32,
-                                    scale as i32,
-                                    scale as i32,
-                                    c,
-                                );
+                    if matches!(cell.style, Style::Inverse) {
+                        let wcells = if cjk::char_width(cell.ch) == 2 { 2 * cell_w } else { cell_w };
+                        fill_rect(pix, self.pitch, w, h, x as i32, y as i32, wcells as i32, cell_h as i32, GREEN);
+                        c = BG;
+                    }
+                    if cjk::char_width(cell.ch) == 2
+                        && cjk::draw(pix, self.pitch, w, h, x as i32, y as i32, 2 * cell_w, cell_h, cell_h as f32, cell.ch, c)
+                    {
+                        // rendered from the CJK subset
+                    } else if (cell.ch as u32) >= 0x80
+                        && cjk::draw(pix, self.pitch, w, h, x as i32, y as i32, cell_w, cell_h, cell_h as f32 * 0.8, cell.ch, c)
+                    {
+                        // narrow non-ASCII (—, ·, …, °): width-1 but only the
+                        // CJK subset has the glyph — bitmap font is ASCII-only
+                    } else {
+                        let g = glyph(self.font, cell.ch);
+                        for r in 0..8 {
+                            for col in 0..5 {
+                                if g[r] & (0x10 >> col) != 0 {
+                                    fill_rect(
+                                        pix,
+                                        self.pitch,
+                                        w,
+                                        h,
+                                        (x + col * scale) as i32,
+                                        (y + r * scale) as i32,
+                                        scale as i32,
+                                        scale as i32,
+                                        c,
+                                    );
+                                }
                             }
                         }
                     }
@@ -605,13 +662,18 @@ fn host_ppm(out: &str) {
     r.launcher(&mut pix, &entries, &lg);
     r.keyboard(&mut pix, &kg, &kb0());
 
-    // second frame: terminal view with a fake session
+    // second frame: terminal view with a fake session (M38a: includes a
+    // UTF-8 Chinese line so the wide-cell put + ab_glyph render path is
+    // exercised on the host — ATERM_CJK_FONT points at the subset)
     let area_top0 = lg.toolbar_h + 20;
     let area_h0 = kg.extra_y - area_top0;
     let sc0 = 6usize;
     let mut t = Term::new((w - 2 * kb::KB_M) / (6 * sc0), area_h0 / (8 * sc0));
     let mut parser = vte::Parser::new();
-    let demo: &[u8] = b"root@aginxos:~# uname -a\r\nLinux aginxos 5.4.61-android13 aarch64\r\nroot@aginxos:~# \x1b[1mecho $HOME | tr a-z A-Z\x1b[0m\r\n/VAR/HOME\r\nroot@aginxos:~# ";
+    let demo_owned = std::env::var("ATERM_PPM_DEMO").unwrap_or_else(|_| {
+        "root@aginxos:~# uname -a\r\nLinux aginxos 5.4.61-android13 aarch64\r\nroot@aginxos:~# \x1b[1mecho '你好，世界'\x1b[0m\r\n你好，世界 — 化身·互联·记忆在线\r\nroot@aginxos:~# ".to_string()
+    });
+    let demo: &[u8] = demo_owned.as_bytes();
     for &b in demo {
         parser.advance(&mut t, b);
     }

@@ -7,6 +7,10 @@ license = "MIT"
 [dependencies]
 libc = { workspace = true }
 vte = "0.13"
+# M38a: CJK glyph rasterization (Noto Sans Mono CJK subset in the rootfs,
+# /usr/share/fonts/agterm-cjk.otf). Pure Rust, zero C deps — musl-static
+# friendly. ASCII stays on the 5x8 bitmap; this is the wide-glyph path.
+ab_glyph = "0.2"
 # M16: the launcher's app registry (/var/apps scan + app.toml schema)
 # lives in the agsvc crate so the format has exactly one definition.
 agsvc = { path = "../agsvc" }
