@@ -5078,3 +5078,405 @@ succ=1 tries=6。
 设备终态：bake #12 slot _b（aginxos 6d6665f）；M36b carrier
 f7145cb8…；四件套 v0.2.0 全装；agsecretd 常驻（baked）；crond 常驻；
 备份基线 1 份。
+
+## 2026-09-03 — 推送：双仓上 GitHub + carrier v0.3.0 release + 镜像四件套上线（实测）
+
+### git 推送（收据剥离手术）
+
+- 两仓长期未推：aginxos ahead 26（16 代码 + 10 收据）、carrier ahead 19（纯代码）。
+  收据提交夹在代码中间，且 258968b/37d5f7d/c793bad 三个代码提交夹带了
+  HARDWARE.md hunks —— 直接 push 会把收据带上公开 remote。
+- 手术：push-queue 分支按序 cherry-pick 16 个代码提交；HARDWARE.md 冲突一律
+  `--ours`（第一次尝试用 `git add -A` 把工作区未跟踪的 ARCH/CARRIER/SYSTEM 卷进了
+  3 个冲突提交，`git diff` 校验抓住，reset 重来改用精确 `git add docs/HARDWARE.md`）。
+  校验三关：HARDWARE.md delta vs origin = 0；docs/ 仅 DECISIONS.md +18（60bd53c 的
+  修宪，属可推）；`git diff push-queue backup-master` 仅 HARDWARE.md 一个文件。
+- 推送：aginxos `e3084fe→bad3a82`；本地 master 重排为 pushed 代码 + 单个收据重放
+  提交 ccebdc8（10 个收据提交压成 1 个，树与术前逐字节一致）。备份分支
+  `m36-prepush-backup` 留存术前历史（可删）。carrier `9a2b10b→d64f2fb` 直推 main。
+
+### release + 镜像
+
+- yinnho/aginx-carrier 5 个 release：v0.3.0（build d64f2fb，musl 27,638,520 B，
+  sha256 ada7d7ed…）+ agb/agf/agmem/dup v0.2.0 四件套 tar。gh `--target <短sha>` 报
+  422（target_commitish invalid）——去掉走默认分支即成。GitHub 侧 asset digest
+  逐一 API 核对与本地 pin 一致（v0.2.1 重切教训照办）。
+- 86quan sync.sh 扩展：case 加 `agb|agf|agmem|dup → aginx-carrier releases/download/$1-$2`
+  一行；追加 5 条 fetch pin。5 个工�� scp 直传后跑 sync.sh，11/11 OK(skip)
+  （sha 门即信任边界，scp 与代理回填同权）。
+- manifest 重签（agsign，verify valid）：carrier 行 v0.2.1→v0.3.0 + dup/agb/agf/
+  agmem 四行 core（runtime 桥依赖，bare rootfs 没它们 carrier 不会浏览/读/记忆）。
+  check.sh 全绿后提交 ec4822f 推送。
+
+### 设备验证（bake #12 换机后的实机）
+
+- 新 manifest+sig adb 推入 /etc → `ag pkg available` 验签通过（未拒签）。
+- `ag pkg sync`：10 包全部 "up to date"（新 4 包 + carrier v0.3.0 pin 被正确识别，
+  已装 sha 与 pin 一致）。
+- 真线证明：httpget 只收 http 且被 nginx 301（169 字节重定向体 sha 相同假文件——
+  不跟随重定向）；`ag pkg install` v0 只收本地路径（"no such file: https://…"）。
+  最终 `/usr/bin/agdl https://pkgs.aginx.net/agmem/v0.2.0/agmem-v0.2.0-4pc.tar` →
+  HTTP 200，3,185,664 B，sha256 4b9c4690… 与 pin 逐字一致。镜像新工件端到端通。
+- 化身对话实测：`ag agent send me --message "测试消息：请用一句话回复确认你在线"
+  --sender sophie-test` → 内联一轮，回复「在线确认：我在的，「我」随时待命 ✅」
+  （carrier→brain API→回复全链活）。
+
+设备终态：slot _b（aginxos 6d6665f 烤盘）+ /etc manifest 9 行新版 + M36b carrier
+（f7145cb8，= release v0.3.0 资产）。/etc/hosts 的 pkgs.aginx.net pin 仍在（临时）。
+
+## 2026-09-03 — M38a: aterm 中文渲染（ab_glyph + Noto Mono CJK 子集，实测）
+
+### 做了什么
+
+- `crates/aterm/src/cjk.rs`（新）：ab_glyph 光栅化宽字符。字体 = Noto Sans Mono
+  CJK SC 子集 `boot/rootfs/usr/share/fonts/agterm-cjk.otf`（1,529,716 B，md5
+  4d5de7fe39be9bfd1780f35f6e1ed715；`scripts/subset-cjk-font.sh` 产出：全 GB2312
+  6763 汉字 + A1/A3 标点行 + ASCII，no-hinting；16MB 上游只留 /tmp 不进仓）。
+  ASCII 仍走 5×8 位图快路径；coverage 缓存按 (char, px) 上限 1024。字体缺失时
+  优雅降级回 `?`（recovery boot 不挂）。
+- 宽字符 cell 模型（term.rs）：首格放本字、尾格放 `WIDE_TAIL` 哨兵；put() 带
+  放不下先换行、覆盖半宽字时孤儿格清空、wrap_pending 延迟换行。窄非 ASCII
+  （— · … ℃ GB2312 A1 行）也走 ab_glyph，1 格宽、px = cell 高 × 0.8 居中。
+- **ab_glyph 陷阱（记录给下次动字体的人）**：`PxScale` 是行高（ascent+descent+
+  gap）像素而非 em 像素——Noto CJK 行高 1.448 em，直传 PxScale=40 字形只有
+  0.69×。修法 `scale = px · height_unscaled/upem`。另外 `OutlineGlyph::draw` 的
+  (x,y) 已相对 px_bounds.min，直接索引别再减。
+
+### 验证（host → device）
+
+- host：`aterm --ppm`（ATERM_PPM_DEMO / ATERM_CJK_FONT 覆盖）像素级核对——
+  48px cell 内 ~44px 笔画、—— 居中横线、wrap/bold/光标全对。check.sh 全绿。
+- device（bake #12 换机后实机，slot _b）：musl 构建 adb 推入，md5 双验（aterm
+  b014d9a8…，字体 4d5de7fe…；备份 /usr/bin/aterm.pre-m38a）。`ATERM_INJECT=1`
+  经 /etc/init.d/aterm-handoff 常驻（pid 2083 的 environ 验证）。SH 瓦片进终端
+  后 `printf '…\r' > /run/aterm.inject` 注入 `echo 你好，世界 —— 化身·互联·记忆在线`，
+  文件被即时消费自删，**屏幕人眼确认（2026-09-03）：汉字抗锯齿清晰可读、长破折号
+  与间隔号居中、无错位撕裂**。中文显示闭环。
+- rootfs 折叠未做（下次重烤 #13 时 cp 字体 + musl aterm，走 clean-reflash 验收）。
+
+设备终态：slot _b 烤盘 + adb 版 aterm（M38a，pre-m38a 备份在位）+ /usr/share/fonts/
+agterm-cjk.otf 已推。ATERM_INJECT=1 随 aterm-handoff 常驻（ASR 未来入口，同 inject()）。
+
+## 2026-09-03 — M39: 照片查看器（agimg JPEG 软解 + DRM 直出 + PHOTOS 瓦片，实测）
+
+### 背景（SM7250 编解码器盘点，probe 实证）
+
+对 vendor 模块清单（334 个 .ko）strings + 设备 /vendor/firmware 盘点：**SM7250
+没有 JPEG 解码硬件**——msm-vidc.ko（Venus）解码面是 H264/HEVC/VP9/VP8/MPEG2、
+编码面 H264/HEVC，无 JPEG；camss cam_jpeg*.ko ×4 是相机管线**编码**件；无其他
+编解码硬件。正常 Android 手机照片也是 CPU 软解——所以照片走 libjpeg-turbo（NEON），
+视频才走 Venus 硬解（M41，venus.b00-b04+mdt 固件已在设备、模块在清单内）。
+用户拍板：**照片软解 + 视频硬解**。
+
+### 做了什么
+
+- `crates/agimg`（新）：vendored libjpeg-turbo 2.1.5.1 子集（~830KB；上游 16MB
+  全树只在 /tmp，vendor/README.md 记再生法）。build.rs 编 51 个核心 C + aarch64
+  NEON_INTRINSICS 路径（13 个 arm neon .c + aarch64 jsimd/jchuff-neon；musl 交叉
+  构建确认 67 个 .o 含 *-neon.o）。所有 jpeglib 结构知识留在 C——agimg_shim.c 一
+  个函数过 FFI：longjmp 错误管理、DCT 缩放从 1/1 向下走到能塞进屏幕的最大档、
+  JCS_EXT_BGRX 直出 = LE u32 0x00RRGGBB = DRM XRGB8888 原样 blit。
+- `crates/aterm/src/photos.rs`（新）：Mode::Photos 状态机（Picker 同款非终端
+  全屏模式）。照片住 `/home/photos`（state tar 含 /home，重刷存活），mtime 倒序、
+  tap 右/左半屏翻页带环绕、BACK 视图→列表→启动器、img=None 释放 ~3MB。列表空态
+  提示 `AG CAM-SHOT --JPEG-OUT /HOME/PHOTOS/...`。启动器新 PHOTOS 瓦片（永远
+  可用，纯 aterm 状态无 pty）。
+- 拍照入口 = 既有 cam-shot：`--stream --rear --jpeg --jpeg-out <path>`（注意：
+  **不带 --stream 只探测不拍**；--frames N 连拍时所有帧写同一 jpeg-out 路径——
+  后帧覆盖前帧，要连拍出多文件用 --out 分帧的 raw 路径约定）。
+
+### 验证（host → device）
+
+- host：agimg 4/4 测试（全尺寸/1:4 DCT 缩放/渐变往返像素断言/垃圾输入 None）；
+  aterm --ppm 第三帧照片路径像素核对（渐变 fixture 左蓝右红、居中偏移精确）；
+  check.sh 27 命令全绿。
+- device（bake #12 slot _b）：musl aterm（840,688 B，md5 b9e0d62f52cc3fe90a28cb
+  261750）推入 /usr/bin/aterm，pre-m39 备份在位；kill 后 handoff 复活 pid 5767、
+  ATERM_INJECT=1 仍在。实拍两张：桌面黑帧 32,045 B（0.11 bpp）+ 举机窗景
+  159,474 B（0.56 bpp），均 2016×1136 color q85、~0.19 s/帧编码。
+- **人眼验收（2026-09-03）**：PHOTOS 瓦片 → 列表两行 → 点开窗景照正常显示居中、
+  黑帧与窗景两张都渲染、翻页/返回路径走过。**用户指出颜色不正常**——已知 M19
+  软件去马赛克固定白平衡局限（无硬件 ISP AWB），归 M19d IFE PIX 线（短期可先做
+  软件灰世界 AWB 小步）。
+- rootfs 折叠未做（重烤 #13 与 M38a 一起 cp + clean-reflash 验收）。
+
+设备终态：slot _b 烤盘 + adb 版 aterm（M39，pre-m39 备份在位）+ /home/photos 两张
+实拍。aterm-handoff 常驻照旧。
+
+## 2026-09-03 — M40: 拼音输入法（单音节 IME + iOS 键盘 + busybox 宽字符修复，实测）
+
+### 做了什么
+
+- `crates/aterm/src/pinyin.rs`（新）：单音节拼音 IME。413 音节候选表（14.5KB
+  TSV，频序排序，`scripts/gen-pinyin-table.sh` 从上游频表再生）include_bytes!
+  进二进制。ü 用 v 输入。`feed()` 吃 KeyEvent 出 Commit/Consumed/Pass——字母
+  进缓冲、空格/回车上屏首选、DEL 退格、非字母直通。
+- `crates/aterm/src/kb.rs`：键盘整排重写为 **iOS 布局**（用户拍板）。三字母行
+  qwertyuiop / asdfghjkl（居中内缩）/ SHF+zxcvbnm+DEL；底行 [123 w3][拼 w2]
+  [空格 w8][。/. w2][换行 w3]，按行归一权重。页模式闩锁（Letters/Num/Sym 仅经
+  123/#+=/ABC 切换）；shift 一次性；拼开启时句号键显 。、空格键显 空格。
+  ESC TAB CTL ←↓↑→ 留在键盘上方细行（Termux 式）。旧 hack（?↔/ 映射、
+  DIGIT_SHIFT、大写存储、SPECIALS 五键行）删除。
+- `crates/aterm/src/main.rs`：候选行 = 键盘上方 8 槽浮条（缓冲 | 6 候选 | 翻页
+  箭头），点候选即上屏并清缓冲（`take_candidate`——点候选和空格/回车一样是
+  提交）。提交走既有 inject() pty 注入路径，无新面。
+- **按压反馈**（用户轮 2）：手指按下到抬起期间，所按键帽亮——绿框 + 白字
+  （复用 keycap active 样式）。`Kb::pressed` 跟踪 (area,row,idx)，Down 定位、
+  Tap/Up 清除。
+- **busybox 1.36.1 重编**（shell 中文显示 `?` 的根修）：旧版
+  CONFIG_UNICODE_WIDE_WCHARS 关 → ash lineeditor 把 wcwidth==2 的 CJK 全部替换
+  成 CONFIG_SUBST_WCHAR=63（`?`）。新配置 WIDE_WCHARS+COMBINING 开、
+  LAST_SUPPORTED_WCHAR 65534、TC 关（zig musl 头缺 CBQ，设备无人用 tc）；
+  trylink 两处 -Wl,--warn-common/-Map 摘除（zig ld 不认）。zig cc 静态构建，
+  unstripped 1,248,040 B（macOS strip 与 zig objcopy 均不可用，无害）。
+  `scripts/build-busybox.sh` 固化再生法；boot/rootfs/busybox 已换新。
+
+### 验证（host → device）
+
+- host：pinyin 7 测试 + kb 5 测试（iOS 几何：行内缩/权重/DEL/空格中心/底边
+  对齐 2340；shift 一次性；页闩锁；句号随 拼 变化；ctrl 和弦+方向键）全绿；
+  `ATERM_IME_DEMO=ni --ppm` 帧像素断言：6 候选槽 hanzi 尺寸、拼/空格/换行 三
+  标签墨迹高度均 30px（字号统一，用户轮 2 ②）；check.sh 27 命令全绿。
+- device：busybox 推 /bin/busybox（备份 .pre-unicode）——pty 回显测试
+  （execv argv[0]='sh'，实测法：直接调 busybox 路径会让 shell 秒死、内核
+  termios 裸回显造成假阳性）确认 `你` 回显 `\xe4\xbd\xa0` 非替换；`echo 你好`
+  直出中文。aterm 推 /usr/bin/aterm（备份 .pre-m40，md5 cf6b8f9c）、kill 后
+  handoff 复活 pid 9722 ATERM_INJECT=1 保持；smoke 套件 11/11。
+- **用户上手实测（两轮）**：轮 1 后反馈三问题——shell 中文显示（busybox 根修）、
+  候选上屏后缓冲不清（take_candidate 修复）、键盘照 iOS 排版（重写）——全部
+  修复上机。轮 2 后反馈两打磨——按键按下变色（按压反馈实现）、拼/空格/换行
+  字号统一（空格 scale 3→4）——上机后用户确认"外面加一个框就挺好的"，验收过。
+
+设备终态：adb 版 aterm（M40 收口版）+ 新 busybox（unicode 版）在位，两备份
+（aterm.pre-m40 / busybox.pre-unicode）可回退。rootfs 折叠归重烤 #13。
+
+## 2026-09-03 — rootfs 重烤 #13：M38a+M39+M40+busybox unicode 折叠 + 首次零手工换机（实测）
+
+**镜像**：`b32e1e7-20260903`（2 GiB 稀疏，sha 3c344acb…，140 MB 内容）。boot
+e2ce2f17 / vendor_boot d80b8098 复用（#11 起未变）。apply 走 agupd pre_staged
+路：2 GiB 体 host dd 直灌 92 s → boot_a/vendor_boot_a sha 过 → state tar
+59,453,440 B 落 64 GiB → 体原位哈希过 → swap committed（old fs 2,040,373,248
+B）→ slot _a 激活。18:38:38 reboot2 → 18:41:18 起机（~160 s 含蹦床换血）。
+
+**首次 apply 翻车两记（协议使用面，非协议本身）**：① manifest 里 rootfs sha
+手抄多了一位（65 hex）→ pre_staged 哈希比对差一位失败；教训=**manifest 的
+sha 必须脚本化 `shasum | cut` 注入，不手抄**。② `agupd apply --no-reboot
+<m>` 参数序错（flag 在前被当 URL 吃掉）；正确 `apply <m> --no-reboot`。另
+adb shell PATH 无 /usr/bin，agupd/agctl 都要全路径。
+
+**折叠内容**：M38a 字体（build-rootfs.sh 补 `cp usr/share/fonts`——此前
+recipe 有文件但烤盘脚本漏拷）、M39 agimg+照片模式、M40 拼音 IME+iOS 键盘
+（均在 aterm 二进制 cf6b8f9c 内）、busybox 1.36.1 unicode 重编 2d9909b3、
+ATERM_INJECT=1 入 aterm-handoff（8257e39——M17 起手工导出的环境变量，烤后
+首靴丢失才暴露这笔债）。
+
+**首启全链 ok**：wifi Legrand AP → dhcp 192.168.0.166 → internet → time
+2026-09-03（时钟闸先于 pkg）→ pkg ok → py ok 3.12.14。provision resync 自动
+补回全部 /var/bin：五件 must-exist **加四件套 agmem/agb/agf/dup 首次全自动回**
+（#87 镜像清单已含四件套——**换机零手工恢复首次达成**）；carrier 补回
+f7145cb8（镜像现供=M36b 版，与烤前一致，无需手推）。/home/photos 两张实拍
+经 state tar 存活。agctl 全 ready（aginx/carrier/browser/agsecretd/net-watch）。
+
+**二靴**：b32e1e7 原样、pkg ok 快道、ATERM_INJECT=1 在位（新 handoff 生
+效）、slot _a pri=3 act=1 succ=1。
+
+**验收**：13 套件 12 全绿 + m35 首轮 47/3——二、三轮连跑 50/0 复绿（首靴
+窗口竞态，不立案）。烤盘 busybox echo 中文正常；**新 busybox awk 仍段错误**
+（1.36.1 上游问题未随 unicode 修复——sed/set-- 纪律不变）。
+
+设备终态：bake #13 slot _a（aginxos b32e1e7）纯烤盘运行——烤前的 adb 版
+aterm/busybox 与其 .pre-* 备份已随旧 fs 换血淘汰；四件套+备份基线在位。
+
+## 2026-09-03 — M41：Venus 视频硬解首帧（V4L2 M2M stateful H264 → NV12）
+
+**模块与节点**：boot/out/vendor-modules 全装（msm_vidc + videocc_lito 为新增两枚，
+fastcvpd/subsys_restart/ion_alloc/qtee_shm_bridge/llcc_slice 等既有依赖随载）；
+mknod /dev/video32(81:32 解码) video33(81:33 编码)。fw 经 PIL 加载：
+VenusHostDriver VIDEO.IR.1.2-000，built Jun 9 2023。**rmmod 依旧禁止**（整机纪律）。
+
+**解码路径**（`/tmp/probe vidc decode <in.h264> <out> [n]`，md5 e0b0d922）：ION
+heap_mask 0x2000000 分 dmabuf → mmap；QBUF 契约 = USERPTR + fd 放
+planes[0].reserved[0]（MSM_VIDC_BUFFER_FD），plane 长 4K 对齐；S_EXT_PADS 编码端
+31 缓冲，capture 最小 4；poll 需 POLLIN|POLLOUT|POLLPRI 三事件。本核 v4l2_buffer
+88 B（planes 走 m 指针）、v4l2_plane 64 B。
+
+**首帧不出的根因（源码级）**：AU 切分器原把首个 slice 前的 SPS/PPS/SEI 全丢 →
+fw H264 slice-header 解析器失步：每条 EBD 带 DATA_CORRUPT（EBD flags 0x404000；
+该 flag 只在 msm_vidc_common.c:2557 对 VIDC_ERR_BITSTREAM_ERR 置位），fw printf
+`h264VspRefPicListReordering(383): RES_EMPTY_CHECK: status: 1001`，EBD offset 卡
+在 AU 中段，FBD 零条。**修法**：AU0 = slice 前全部参数集（config-only 探测 +
+V4L2_BUF_FLAG_CODECCONFIG 标注；该 flag 经 msm_vidc_qbuf → vb2
+__fill_vb2_buffer 三层不丢，已逐层核对）。修复后一次出帧。
+
+**观测**（trace /tmp/trace-m41.txt，2691 行）：testsrc2 H264 320×240 54642 B /
+31 AU → **10 帧硬解**：frame0 flags 0x4008 KEYFRAME、1–9 0x4010 PFRAME，全部
+EBD 干净（0x4000 = TIMESTAMP_COPY）。
+
+**NV12 布局**（320×240，逐字节画像得出）：plane0 393216 B = Y@0（stride 512 ×
+240 行）+ 128KB 对齐缝 + UV@0x40000（stride 512 × 120 行）；plane1 16384 B。
+
+**像素级验证（host 对照 ffmpeg 同流软解）**：去 stride 的 Y 平面 vs ffmpeg
+yuv420p passthrough 原生 Y：**76800 像素中 76480 bit-exact（99.6%），MAE
+0.496**；差异 320 px 全在 row 0（两解码器顶边 deblock 行为差，视觉不可见）。
+stride 判别：512 假设 MAE 0.5 vs packed 320 假设 89.6。**Y 为 limited range**
+（Venus 直出流原生值；ffmpeg `-pix_fmt gray` 会做 full-range 展开——对照必须走
+yuv420p passthrough 取 Y，本节首版对照 MAE 8.5 即踩此坑）。帧号核对：our dec0
+对 ffmpeg 帧 0–4 MAE 单调升（8.5→15.7），索引对齐无漂移。
+
+host 侧 check.sh 全绿（ioctl/errno 跨平台化后 probe crate 进 cargo test 门）。
+
+设备终态：模块全载（不卸）、tracefs 挂在 /sys/kernel/tracing（tracing_on=0）、
+/dev/video32/33 在位、/tmp/dec.{0..9}.{p0,p1} 十帧在盘、/tmp/probe=e0b0d922。
+
+## 2026-09-03 — M41（下）：NV12 零拷贝 DPU 直出（VIG plane + 硬件缩放）
+
+`/tmp/probe vidc show <in.h264> [hold_s]`：解码 FBD 里把 venus capture dmabuf
+经 PRIME_FD_TO_HANDLE 直入 DPU（ADDFB2 NV12 双平面：pitch=512、offset
+[0,0x40000]——UV 用逐字节扫描定位，与本页上节数字一致），SETPLANE 等比放大
+（320×240→1080×810 居中于 1080×2340），CPU 全程不碰像素。**肉眼收据：上屏
+确认**（黑底中央 1080×810 视频窗，约 1 s 30 帧播完 + hold 定格；`plane off
+rc=0`，全程零 scanout 报错、零新 SDE error）。
+
+四道门，逐个排掉（源码级，redbull 树核对）：
+
+1. **plane 不可见**：不带 `DRM_CLIENT_CAP_UNIVERSAL_PLANES` 时 GETPLANE 只列
+   overlay，而 sde 的 overlay（DMA pipe）全 RGB-only（8 个 plane，37 格式表
+   完全一致）。带 cap 后多出 plane 54/74（VIG，48 格式含线性 NV12/NV21/
+   NV16/TP10/P010）——54 是 crtc105 的 primary（bound），**74 是空闲 VIG
+   overlay**（type=1），即目标。
+2. **EACCES**：本内核 ioctl 表把 SETPLANE/SETCRTC/OBJ_SETPROPERTY 全挂
+   `DRM_MASTER`（drm_ioctl.c:648），且 `drm_is_current_master` 无 root 旁路——
+   aterm 常驻持 master。**probe 自己持 master**：kill aterm 后 SET_MASTER
+   （ATERM respawn 循环有 2 s 缝，kill 后 sleep 1 起跑稳赢）。注意 aterm 之死
+   触发 msm master-drop 钩子**灭屏并清 CRTC**，所以持 master 的第一件事是
+   自己冷 modeset（DSI conn 29→enc 28→crtc 105，mode 1080x2340x60x60948cmd，
+   黑 dumb fb + SETCRTC 带空 connector 重试——aterm 配方原样）。probe 退出放
+   master→再灭屏→handoff 复活 aterm 重拿 master 重 modeset，自愈闭环。
+3. **EINVAL 甲（zpos 同台）**：sde custom-client 模式下**所有 plane 默认
+   zpos=0**（sde_plane.c:3562 只在非 custom 分支给 overlay 发 index+1 默认），
+   黑底与视频同落 blend stage 0，src-split 序检查拒叠全宽矩形（kmsg：
+   `invalid coordinates, stage:0 l:0-1080 r:0-1080`）。zpos 是原子属性，须先
+   `DRM_CLIENT_CAP_ATOMIC` 才在 OBJ_GETPROPERTIES 里现身（此前只列 10 个
+   legacy prop），然后**首个 SETPLANE 之前**把 plane 74 zpos→1。
+4. **EINVAL 乙（不值一提但记一笔）**：曾想把 zpos 设 255——custom-client 下
+   zpos_max=maxblendstages-1=7，越界即拒；1 就够。
+
+uv_off 扫描定位与 ADDFB2 的 offsets 联动：本地 stride×scanline 推算 UV 在
+98304（0x18000），解码实测 0x40000（两者不同：fw 对 UV 另有对齐规则，未深
+究）；scanout 取实测值。
+
+host check.sh 全绿。设备终态：模块全载（不卸）、aterm 存活（14263，handoff
+自愈正常）、/tmp/probe=12c457cd、/tmp/vidc-test.h264 在盘。
+M41 余项：PCM 音频同步（音频轨并行播 + 帧节奏对齐）；encode 线可选 M41b。
+
+## 2026-09-03 — M41（终）：PCM 音频同步（音频钟主时钟 + 节拍器感知收据）
+
+`/tmp/probe.new vidc play <in.h264> <in.s16> [vol]`：解码/直出链不动，帧节奏
+从 33 ms sleep 换成**音频设备时钟门控**。音频侧 = M18 说-路径原样（MM1
+`/dev/snd/pcmC0D0p` 48 kHz stereo S16_LE，HW_REFINE 只钉 format/rate/ch、
+period/buffer 松界——cDSP 只认自己的量子；audio-bringup 开机已铺好 mixer 路由），
+新原语只有一个：`SNDRV_PCM_IOCTL_DELAY`（0x80084121）作主时钟，
+`played = written − delay`。
+
+**感知收据（终局）**：节拍器测试片——host ffmpeg 生成 30 s：每秒首 100 ms
+白闪（geq 限幅 235/16，逐帧 YAVG 验证）+ 每秒首 70 ms 1 kHz 蜂鸣（aevalsrc，
+RMS 窗验证 −7.4 dB / −inf）。设备上闪与哔**用户判定「同时」**（2026-09-03，
+眼+耳）。机制收据：EXIT=0 ×3 轮、900 帧全解码、feeder 灌满 1,440,000 帧
+（=30.000 s 整）、`plane off rc=0`、播放全程 DELAY 活、无 fallback。
+
+三条设计决定（都有设备证据）：
+
+1. **fd 全程 O_NONBLOCK**（snd-play 是开完再清）：阻塞 WRITEI 会在 substream
+   锁路径里睡满一个 period，卡死解码循环的 DELAY 查询。feeder 用 poll(POLLOUT)
+   +部分写推进（alsa-lib 同款机制）。
+2. **音频时间线锚在首帧上屏之后**（frame 0 先 SETPLANE、再 start feeder——
+   采样 0 与画面 0 构造性对齐）。曾先启音频后显示，首帧测得恒定 +92 ms 领先。
+3. **DELAY 的域差与 SETUP 态 EBADFD**：遥测 delta 恒 +91.8 ms（10 s 内漂移
+   <0.1 ms，钟率精确）。锚定修正不改此数 → 它不是启动偏斜，而是 q6 FE 的
+   delay 上报不含全部 DSP 路径延迟的**恒定域差**；wait 门 LEAD=4 ms 下真实
+   闪/哔落地同时（用户收据），不需补偿常数。另：非阻塞 DRAIN 只翻 DRAINING
+   即返 EAGAIN（尾巴自己放空），放空后 SETUP 态 DELAY 答 EBADFD
+   （do_pcm_hwsync 无此分支）——feeder-done 标志下视为"音频已完、门全开"，
+   不算错误不触发 fallback。
+
+调试弯路记一笔：起跑版本里 `frames_done += 1` 在显示块**之前**，而启动闸写
+`frames_done == 0`——永假，feeder 从未启动，视频回落 33 ms 固定 pacing 且无
+任何报错（EXIT=0 照旧）。教训：静默降级路径也要有日志。
+
+host check.sh 全绿（27 commands OK）。设备终态：模块全载（不卸）、aterm 存活
+（自愈正常）、/tmp/probe.new=7a42915a、/tmp/sync.h264 + /tmp/sync.s16 在盘。
+**M41 全里程碑闭环**：decode（1f41bb0）→ 零拷贝直出（1f0207a）→ 音频同步
+（本次提交）。encode 线另立 M41b。
+
+## 2026-09-03 — M41b：Venus 硬编码 bring-up（msm_vidc_venc H264 encode）
+
+`vidc enc <in.yuv> <out.h264> <w> <h>` 一次通过。设备实测（redfin,
+/dev/video33, card=msm_vidc_venc）：
+
+- **协商几何**：CAPTURE(码流)=H264 1 plane sizeimage=245760；OUTPUT(原始)=
+  NV12 1 plane sizeimage=393216，**stride=512 scanlines=512（uv_off=0x40000）**。
+  S_FMT copy-back 即真相——bytesperline=VENUS_Y_STRIDE、plane_fmt[0].reserved[0]
+  (u16)=VENUS_Y_SCANLINES。320x240 下两者均 512 对齐（与 M41 解码侧实测的
+  UV 落位 0x40000 互证；techpack 的 DPU 头文件副本写 128/32 对齐是旧拷贝，
+  不可信）。
+- **yuv420p→venus NV12 转换**（设备侧）：逐行 Y 拷贝按 stride、UV 交错落
+  stride×scanlines，pad 清零。fw 按此布局读对（EBD 全净、无 CORRUPT）。
+- **EOS 路径**：本驱动无 V4L2_BUF_FLAG_LAST 通道——drain 用
+  `VIDIOC_DECODER_CMD`(_IOWR('V',96,72)=0xc0485660, cmd=V4L2_DEC_CMD_STOP)，
+  驱动自配内部 4K EOS 缓冲送 fw；完成信号 = **CAPTURE FBD 带
+  V4L2_BUF_FLAG_EOS=0x02000000（vendor 值）**，实测 `chunk#31 bytes=0
+  flags=0x2004000 EOS` 确定性收口。首跑按上游值 0x2000（=此内核的
+  TIMESTAMP_MONOTONIC 位）检测，永远等不到、靠 poll 超时收尾——vendor
+  uapi 的旗标值必须逐个核对，不能拿主线上游的记。
+- **双端口状态机与解码同源**：pre-feed OUTPUT 帧 + 双 STREAMON，deferred
+  flush 在 START_DONE 同一 ioctl 内完成。INPUT min_host=4、CAPTURE min_host=5
+  （queue_setup 低于 min 只警告）；实测 4+6 跑通。
+- **首块码流 flags=CONFIG（26 B SPS/PPS）**，chunk#1 KEY(3856 B IDR)，后续
+  P 帧 0x4010（PFRAME）。默认档：H264 **High** profile（驱动默认，未设 CID）。
+- **质量收据**：30 帧 320x240 → 22,410 B（~179 kbps）。host ffmpeg 解回
+  yuv420p 30/30 帧，IDR 42.3 dB、最差帧 27.4 dB、**全局 PSNR 29.41 dB**
+  （默认低码率下的正常有损压缩；码率/GOP/I 间隔 CID 未调，属后续）。
+- **闭环互证**：设备上 `vidc decode` 解这份硬编码输出——EXIT=0、3 帧、
+  无 DATA_CORRUPT。yuv→NV12→venc→H264→vdec→NV12 全链硬件。
+
+host check.sh 全绿（27 commands OK）。设备终态：模块全载（不卸）、aterm
+存活、/tmp/probe.new=b69ea3c5、/tmp/test30.yuv + /tmp/enc.h264 在盘；未动
+DRM/未重启。M41b 完成，Venus 编解双通。
+
+## 2026-09-03 — M41c：vidc play 三修 + 扬声器噪音立案（挂起）
+
+素材：~/Downloads/clip-shot-001.mp4（720x1280@24，5.04s，AAC 44.1k 立体声）。
+host 转码 `-c:v libx264 -profile:v baseline -bf 0 -g 48 -crf 20` 保原生分辨率
+（md5 f3bd760f），音频 `-ar 48000 -ac 2 pcm_s16le`（0a1e0ff1）。
+
+三修（全部设备观察收据）：
+
+- **全屏/画质**：decode() 的 S_FMT hint 从硬编码 320x240 参数化为
+  `vidc play <h264> <s16> [vol] [heapmask] [w h fps]`。720x1280 协商实测
+  OUTPUT sizeimage=7,077,888、CAPTURE=(2359296,16384) bpl=1024——venus
+  stride 1024/scanlines 1536 再次证明 S_FMT copy-back 是唯一几何真源
+  （host 侧 128/32 对齐算法会算出 1,474,560 严重低估）。DPU 1.5x 缩放出
+  1080x1920 满宽，用户判定「全屏，画面还行」。
+- **撕裂**：SETPLANE 后不再立即 requeue 显示缓冲——持帧一拍，
+  DRM_IOCTL_MODE_WAIT_VBLANK(0xc018643a，**union 必须按 24B reply 臂传，
+  16B 请求臂会被 copy-out 打爆栈**；pipe 骑在 type 位 30-31) 等翻转落定
+  后释放前一帧。实测 sde 接受该 wait（无 errno，vblank_ok 未触发降级）。
+- **挂死**：音轨比视频短 17ms 时，feeder done 后音频钟冻结在末值，最后
+  一帧 pts 永远等不到（45.25s vs 45.27s 实测挂死）。wait_until 在 done 后
+  改用 start_at 墙钟（两钟同源同 1x），收口 EXIT=0 确定性。
+
+扬声器噪音（**挂起，与 M19d 拍照/画质线合并处理**）：真人声音乐素材
+「太嘈杂、声音越大吵得越厉害」，同一文件 Mac 上干净；M18 老播放器
+ag-snd-play 同样嘈（排除 vidc play 链）。分诊记录：降电平 0.4x 仍不净、
+0.15x 好转；满电平切 180Hz 以下反而更糟（电平主导）；单声道 FE 会话
+（QUIN_TDM Channels=2 下）能开能放但**无声**。根因指向：CS35L41 智能功放
+裸奔——/vendor/firmware 无 cs35l41 固件、dmesg 无 amp 校准、无 ACDB HAL
+喂 /vendor/etc/acdbdata（校准数据在盘：Handset_cal 等）。已在 vidc play
+feeder 加软件护栏（180Hz 单极高通 + -4.2dBFS 跑动峰值限幅）但**用户判定
+仍不行**——软件护栏不解决功放无保护固件的失真，真解在厂商校准链
+（与 M19d ISP 画质同族）。omarchy-rs-main 已查：纯 CLI/插件生态
+（agents/cleaner/cli/compat/crash/learn/network/plugins/skills），零媒体代码。
+
+设备终态：aterm 存活（20700）、模块全载、/tmp/probe.new=7aefa0e7、
+clip.h264/clip.s16 与分诊素材在盘、混音器已恢复厂商值（AMP 17/PCM 817）、
+未动 DRM/未重启。host check.sh 全绿（27 commands OK）。
