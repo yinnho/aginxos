@@ -121,6 +121,20 @@ if [ -x /bin/crond ]; then
   /bin/crond -b -c /etc/crontabs -L /var/log/crond.log
 fi
 
+# Ops channel sshd (#142) — the maintenance face: ssh in over Wi-Fi, or
+# `adb forward tcp:2222 tcp:22` when the dev box sits on another subnet.
+# Key-only (-s: passwords off); host key lives under /root/.ssh so the
+# state tar carries it across system updates (first boot generates it).
+# Client keys are NOT baked — push your pubkey to /root/.ssh/authorized_keys.
+# -E logs to stderr (no syslogd here) → /var/log/dropbear.log.
+mkdir -p /root/.ssh
+if [ -x /bin/dropbear ]; then
+  [ -f /root/.ssh/dropbear_ed25519_host_key ] || \
+    /bin/dropbearkey -t ed25519 -f /root/.ssh/dropbear_ed25519_host_key >/dev/null 2>&1
+  /bin/dropbear -p 22 -s -r /root/.ssh/dropbear_ed25519_host_key -E \
+    >>/var/log/dropbear.log 2>&1
+fi
+
 # Boot-successful marker (M16) — ABL drains the GPT slot-retry attribute
 # on every unmarked boot and the phone ends up in fastboot (or falls
 # through to slot b's stock bootloader, which would format our userdata).

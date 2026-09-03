@@ -144,6 +144,17 @@ echo "built preload helpers (trace_open.so, fake-props.so)"
 # early-boot wall time true on the next HCTOSYS pass.
 "${ZIG}" cc -target aarch64-linux-musl -static -O2 \
   -o "${TREE}/bin/rtcal" "${RECIPE}/src/rtcal.c"
+# Ops channel sshd (#142, 2026-09-04) — the maintenance face: ssh in over
+# Wi-Fi or `adb forward tcp:2222 tcp:22` when the subnets differ. Static
+# musl dropbear triplet from scripts/build-dropbear.sh (zig cc; the AR must
+# be LLVM's — macOS BSD ar archives break lld member resolution). rcS starts
+# the daemon key-only with the host key under /root/.ssh.
+DROPBEAR="${ROOT}/.local/dropbear/bin"
+for b in dropbear dbclient dropbearkey; do
+  test -x "${DROPBEAR}/${b}" || { echo "missing ${b} — run scripts/build-dropbear.sh" >&2; exit 1; }
+  cp "${DROPBEAR}/${b}" "${TREE}/bin/${b}"
+  chmod 755 "${TREE}/bin/${b}"
+done
 # nlscan: nl80211 trigger-scan + dump client — busybox has no wireless tools
 # and we ship no libnl. Our WLAN operability check (M3f).
 "${ZIG}" cc -target aarch64-linux-musl -static -O2 \
