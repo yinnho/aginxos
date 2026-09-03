@@ -12,3 +12,4 @@ agent=avatar (clone) lifecycle
 cron=scheduled tasks
 web=browser, search and fetch tools (agb package)
 files=file read/write/list/convert tools (agf package)
+api=declarative API tool face (named/raw/register/cron)

@@ -1,0 +1,11 @@
+#!/bin/sh
+# ag:summary=declarative API tool face: named call, raw passthrough, register, cron tick
+# ag:args=call <name> [-p k=v]… [--json] | raw <METHOD> <URL> [--header k=v]… [--data <json>] | list [--json] | register [--global|--workspace <dir>] | cron [--json]
+# ag:examples=call weather_query -p city=Beijing
+# ag:examples=raw GET https://httpbin.org/get
+# ag:examples=list
+# ag:group=api
+# Pass-through to the provisioned carrier binary (M34: api_tools execution
+# moved to `aginx-carrier api` single source — resolve chain, HMAC signing,
+# extract, register write, cron fire).
+exec /var/bin/aginx-carrier api "$@"
