@@ -29,6 +29,7 @@ mod font;
 mod input;
 mod kb;
 mod launch;
+mod photos;
 mod term;
 
 use drm::Drm;
@@ -379,6 +380,10 @@ enum Mode {
     /// `agpkg available`; a tap runs `agpkg opt-in <name>` synchronously
     /// (INSTALLING frame drawn first) and refreshes both lists.
     Picker,
+    /// Photo viewer (launcher PHOTOS tile, M39): list screen of
+    /// /home/photos, then a full-frame view with tap-sides paging.
+    /// Decode is libjpeg-turbo (no JPEG decode hardware on SM7250).
+    Photos(photos::Photos),
 }
 
 // ---------------- render ----------------
@@ -449,6 +454,80 @@ impl<'a> Render<'a> {
         fill_rect(pix, self.pitch, self.w, self.h, 0, 0, self.w as i32, self.h as i32, BG);
         draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 8 * 5) / 2 - 60, "INSTALLING", 5, GREEN);
         draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 8 * 5) / 2 + 60, name, 5, WHITE);
+    }
+
+    /// LOADING frame while a JPEG decodes (same synchronous-block pattern
+    /// as `installing` — paint, present, then block in libjpeg).
+    fn loading(&self, pix: &mut [u32]) {
+        fill_rect(pix, self.pitch, self.w, self.h, 0, 0, self.w as i32, self.h as i32, BG);
+        draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 8 * 5) / 2, "LOADING", 5, GREEN);
+    }
+
+    /// Photo list screen (M39): picker-style rows of /home/photos
+    /// basenames, newest first, capped at 12 rows like the picker (Geom
+    /// arithmetic is unsigned; scrolling is a later milestone).
+    fn photos_list(&self, pix: &mut [u32], p: &photos::Photos, g: &launch::Geom) {
+        fill_rect(pix, self.pitch, self.w, self.h, 0, 0, self.w as i32, self.h as i32, BG);
+        self.toolbar(pix, g.m, g.toolbar_h);
+        draw_centered(pix, self.pitch, self.w, self.h, self.font, g.toolbar_h as i32 + 14, "PHOTOS", 5, GREEN);
+        let names = p.names();
+        if names.is_empty() {
+            draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 24) / 2, "(NO PHOTOS)", 3, UNAVAIL);
+            draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 24) / 2 + 60, "AG CAM-SHOT --JPEG-OUT /HOME/PHOTOS/...", 2, UNAVAIL);
+        } else {
+            for (i, n) in names.iter().take(12).enumerate() {
+                let y0 = (g.by0 + i * (g.bh + g.gap)) as i32;
+                fill_rect(pix, self.pitch, self.w, self.h, g.bx as i32, y0, g.bw as i32, 3, DIM);
+                fill_rect(pix, self.pitch, self.w, self.h, g.bx as i32, y0 + g.bh as i32 - 3, g.bw as i32, 3, DIM);
+                fill_rect(pix, self.pitch, self.w, self.h, g.bx as i32, y0, 3, g.bh as i32, DIM);
+                fill_rect(pix, self.pitch, self.w, self.h, (g.bx + g.bw - 3) as i32, y0, 3, g.bh as i32, DIM);
+                let n: String = n.chars().take(24).collect();
+                let tw = text_w(&n, 5) as i32;
+                let ty = y0 + (g.bh as i32 - 8 * 5) / 2;
+                draw_text(pix, self.pitch, self.w, self.h, self.font, g.bx as i32 + (g.bw as i32 - tw) / 2, ty, &n, 5, GREEN);
+            }
+        }
+        let total = names.len();
+        let footer = if !p.err.is_empty() {
+            p.err.clone()
+        } else if total == 0 {
+            "TAP BACK TO EXIT".to_string()
+        } else if total > 12 {
+            format!("{total} PHOTOS - NEWEST 12")
+        } else {
+            format!("{total} PHOTO{} - TAP TO VIEW", if total == 1 { "" } else { "S" })
+        };
+        let fc = if !p.err.is_empty() { GREEN } else { UNAVAIL };
+        draw_centered(pix, self.pitch, self.w, self.h, self.font, g.kb_panel_y as i32 - 40, &footer, 3, fc);
+    }
+
+    /// Full-screen photo view: decoded bitmap blitted 1:1, centered under
+    /// the toolbar (decode already DCT-scaled to fit the box), filename in
+    /// the footer. Tap the right half for next, left for previous.
+    fn photo_view(&self, pix: &mut [u32], p: &photos::Photos, g: &launch::Geom) {
+        fill_rect(pix, self.pitch, self.w, self.h, 0, 0, self.w as i32, self.h as i32, BG);
+        self.toolbar(pix, g.m, g.toolbar_h);
+        if let Some(b) = &p.img {
+            let dx = ((self.w - b.w as usize) / 2) as i32;
+            let avail_h = self.h - g.toolbar_h as usize;
+            let dy = (g.toolbar_h as i32 + ((avail_h - b.h as usize) / 2) as i32).max(g.toolbar_h as i32);
+            for j in 0..b.h as usize {
+                let py = dy + j as i32;
+                if py < 0 || py >= self.h as i32 {
+                    continue;
+                }
+                for i in 0..b.w as usize {
+                    let px = dx + i as i32;
+                    if px < 0 || px >= self.w as i32 {
+                        continue;
+                    }
+                    pix[py as usize * self.pitch + px as usize] = b.pix[j * b.w as usize + i];
+                }
+            }
+        }
+        let name = p.names().get(p.sel).cloned().unwrap_or_default();
+        draw_centered(pix, self.pitch, self.w, self.h, self.font, g.kb_panel_y as i32 - 36, &name, 3, WHITE);
+        draw_centered(pix, self.pitch, self.w, self.h, self.font, self.h as i32 - 30, "< TAP TO PAGE >", 2, DIM);
     }
 
     /// Header strip: [BACK] at the right, like the launcher header —
@@ -689,6 +768,35 @@ fn host_ppm(out: &str) {
     if let Err(e) = ppm_dump(&term_path, &pix2, w, h, pitch) {
         eprintln!("ppm: {e}");
     }
+
+    // third frame (M39): photo view — ATERM_PHOTOS_DEMO=<file.jpg> decodes
+    // through agimg (DCT-scaled to the panel box) and renders the real
+    // viewer screen, so the decode+blit path is host-verifiable.
+    if let Ok(demo) = std::env::var("ATERM_PHOTOS_DEMO") {
+        let bytes = std::fs::read(&demo).unwrap_or_default();
+        let mut p = photos::Photos {
+            files: vec![demo.clone()],
+            sel: 0,
+            img: agimg::decode_scaled(&bytes, w as u32, (h - lg.toolbar_h) as u32),
+            view: true,
+            err: String::new(),
+        };
+        if p.img.is_none() {
+            p.err = "DECODE FAILED".into();
+            p.view = false;
+        }
+        let mut pix3 = vec![0u32; pitch * h];
+        if p.view {
+            r.photo_view(&mut pix3, &p, &lg);
+        } else {
+            r.photos_list(&mut pix3, &p, &lg);
+        }
+        let photo_path = format!("{}-photo", out);
+        if let Err(e) = ppm_dump(&photo_path, &pix3, w, h, pitch) {
+            eprintln!("ppm: {e}");
+        }
+        println!("wrote {photo_path}");
+    }
     println!("wrote {out} and {term_path}");
 }
 
@@ -786,6 +894,13 @@ fn main() {
         match &mode {
             Mode::Launcher => r.launcher(buf, &entries, &lg),
             Mode::Picker => r.picker(buf, &pkgs, &pk_status, &lg),
+            Mode::Photos(p) => {
+                if p.view {
+                    r.photo_view(buf, p, &lg);
+                } else {
+                    r.photos_list(buf, p, &lg);
+                }
+            }
             Mode::Running(_) => {
                 fill_rect(buf, pitch, w, h, 0, 0, w as i32, h as i32, BG);
                 r.toolbar(buf, lg.m, lg.toolbar_h);
@@ -896,13 +1011,21 @@ fn main() {
                             }
                             if y < lg.toolbar_h {
                                 // BACK fires on press, same as keys
-                                if lg.toolbar_hit(x, y, matches!(mode, Mode::Running(_) | Mode::Picker))
+                                if lg.toolbar_hit(x, y, matches!(mode, Mode::Running(_) | Mode::Picker | Mode::Photos(_)))
                                     == Some(launch::Toolbar::Back)
                                 {
                                     if let Mode::Running(c) = &mode {
                                         unsafe { libc::kill(c.pid, libc::SIGHUP) };
                                     } else if matches!(mode, Mode::Picker) {
                                         mode = Mode::Launcher;
+                                    } else if let Mode::Photos(p) = &mut mode {
+                                        // view -> list -> launcher, one BACK each
+                                        if p.view {
+                                            p.view = false;
+                                            p.img = None; // free the ~3 MB
+                                        } else {
+                                            mode = Mode::Launcher;
+                                        }
                                     }
                                     redraw = true;
                                 }
@@ -913,6 +1036,9 @@ fn main() {
                                             pkgs = read_available();
                                             pk_status.clear();
                                             mode = Mode::Picker;
+                                            redraw = true;
+                                        } else if entries[i2].photos {
+                                            mode = Mode::Photos(photos::Photos::scan());
                                             redraw = true;
                                         } else if entries[i2].avail {
                                             let prog = entries[i2].bin.as_str();
@@ -988,6 +1114,31 @@ fn main() {
                                             pkgs = read_available();
                                             redraw = true;
                                         }
+                                    }
+                                } else if let Mode::Photos(p) = &mut mode {
+                                    // decode box: full width, below the BACK strip
+                                    let (mw, mh) = (w as u32, (h - lg.toolbar_h) as u32);
+                                    let n = p.names().len();
+                                    if p.view {
+                                        // paint-first, then block in libjpeg
+                                        // (the INSTALLING pattern)
+                                        {
+                                            let r = Render { font: &font, w, h, pitch };
+                                            r.loading(&mut canvas[..]);
+                                            d.back_buf().copy_from_slice(&canvas);
+                                            d.present();
+                                        }
+                                        p.step(if x >= w / 2 { 1 } else { -1 }, mw, mh);
+                                        redraw = true;
+                                    } else if let Some(i2) = lg.button_at(x, y, n.min(12)) {
+                                        {
+                                            let r = Render { font: &font, w, h, pitch };
+                                            r.loading(&mut canvas[..]);
+                                            d.back_buf().copy_from_slice(&canvas);
+                                            d.present();
+                                        }
+                                        p.open(i2, mw, mh);
+                                        redraw = true;
                                     }
                                 }
                             }
@@ -1156,6 +1307,14 @@ fn main() {
                 Mode::Picker => {
                     // picker() full-covers the canvas
                     r.picker(buf, &pkgs, &pk_status, &lg);
+                }
+                Mode::Photos(p) => {
+                    // both photo screens full-cover the canvas
+                    if p.view {
+                        r.photo_view(buf, p, &lg);
+                    } else {
+                        r.photos_list(buf, p, &lg);
+                    }
                 }
                 Mode::Running(_) => {
                     r.terminal(buf, &term, area_top, area_bottom(kb_visible) - area_top, scale, blink_on, lg.m);

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ag",
     "crates/agio",
+    "crates/agimg",
     "crates/aginxos-probe",
     "crates/aginxos-agent",
     "crates/aginxos-init",

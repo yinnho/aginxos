@@ -45,6 +45,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "agimg"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "aginxos-agent"
 version = "0.1.0"
 dependencies = [
@@ -149,6 +156,7 @@ name = "aterm"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "agimg",
  "agsvc",
  "libc",
  "vte",

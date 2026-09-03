@@ -11,6 +11,9 @@ vte = "0.13"
 # /usr/share/fonts/agterm-cjk.otf). Pure Rust, zero C deps — musl-static
 # friendly. ASCII stays on the 5x8 bitmap; this is the wide-glyph path.
 ab_glyph = "0.2"
+# M39: JPEG decode for the photo viewer — vendored libjpeg-turbo with NEON
+# (SM7250 has no JPEG decode hardware; this is the normal-phone path).
+agimg = { path = "../agimg" }
 # M16: the launcher's app registry (/var/apps scan + app.toml schema)
 # lives in the agsvc crate so the format has exactly one definition.
 agsvc = { path = "../agsvc" }

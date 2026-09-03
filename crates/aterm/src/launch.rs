@@ -28,6 +28,9 @@ pub struct Entry {
     /// "+" tile: instead of spawning, opens the optional-package picker
     /// (M23 tiering — `agpkg available` / `opt-in`). No pty involved.
     pub picker: bool,
+    /// "PHOTOS" tile: opens the M39 photo viewer (Mode::Photos) instead
+    /// of spawning. Same non-terminal pattern as the picker.
+    pub photos: bool,
 }
 
 /// Registry apps first (alphabetical by id), then the system actions.
@@ -48,6 +51,7 @@ fn app_entry(a: AppEntry) -> Entry {
         avail: std::path::Path::new(&a.binary).is_file(),
         scale: a.scale,
         picker: false,
+        photos: false,
     }
 }
 
@@ -60,10 +64,12 @@ fn builtins() -> Vec<Entry> {
         avail: std::path::Path::new(BIN_AGPKG).is_file(),
         scale: 5,
         picker: true,
+        photos: false,
     }];
     v.extend(
         [
-            ("SH", BIN_SH, &[][..], 5usize),
+            ("PHOTOS", "", &[][..], 5usize),
+            ("SH", BIN_SH, &[][..], 5),
             ("WIFI SETUP", BIN_WIZARD, &[][..], 5),
             ("RESTART", BIN_REBOOT2, &["reboot"][..], 5),
             ("POWER OFF", BIN_REBOOT2, &["poweroff"][..], 5),
@@ -73,11 +79,16 @@ fn builtins() -> Vec<Entry> {
             label: label.into(),
             bin: bin.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
-            // sh and reboot2 ship in the base image; the wizard is a rootfs
+            // the photo viewer is pure aterm state — always available; sh
+            // and reboot2 ship in the base image; the wizard is a rootfs
             // binary that always exists post-M5
-            avail: bin == BIN_SH || bin == BIN_REBOOT2 || std::path::Path::new(bin).is_file(),
+            avail: label == "PHOTOS"
+                || bin == BIN_SH
+                || bin == BIN_REBOOT2
+                || std::path::Path::new(bin).is_file(),
             scale,
             picker: false,
+            photos: label == "PHOTOS",
         })
         .collect::<Vec<_>>(),
     );
