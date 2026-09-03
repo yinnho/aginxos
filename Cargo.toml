@@ -11,6 +11,7 @@ members = [
     "crates/agsvc",
     "crates/agpkg",
     "crates/agdone",
+    "crates/agsecret",
     "crates/agupd",
     "crates/aterm",
     "crates/wifi-wizard",

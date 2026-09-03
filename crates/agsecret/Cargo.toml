@@ -1,0 +1,34 @@
+[package]
+name = "agsecret"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# agsecret (M36) — the secret sidecar. One local daemon (agsecretd) holds
+# every boundary credential; CLI faces and the carrier daemon ask over a
+# unix socket instead of inheriting env files. Scope-level allowlist by
+# peer exe (/etc/aginx/secret.policy, tracked, secret-free), HMAC signing
+# so relay/api chains never export key material. Spec: SYSTEM.md §7.1,
+# DECISIONS §9. Not a defense against hostile local root (single-user
+# phone — impossible by construction); a defense against ambient leakage:
+# env inheritance, argv, transcripts, backup tars.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+sha2 = "0.10"
+hmac = "0.12"
+agio = { path = "../agio" }
+
+[dev-dependencies]
+testkit = { path = "../testkit" }
+
+[[bin]]
+name = "agsecretd"
+path = "src/bin/agsecretd.rs"
+
+[[bin]]
+name = "agsecret"
+path = "src/bin/agsecret.rs"

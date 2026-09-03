@@ -34,6 +34,10 @@ cmd_now() {
         "$S/home/.aginx/carrier/data/carrier.db-wal" \
         "$S/home/.aginx/carrier/data/carrier.db-shm"
   cp -a /var/lib/ag "$S/var/" 2>/dev/null || true
+  # M36: the secret store never rides a backup — the #86 push half's auth
+  # must not bootstrap from its own cargo (DECISIONS §9). Keys are
+  # re-enterable (`ag secret set`); everything else here restores as-is.
+  rm -rf "$S/var/lib/ag/secret"
 
   # consistent snapshot of the live substrate (backup API, WAL-safe)
   PATH=/var/bin:$PATH python3 - "$DB" "$S/home/.aginx/carrier/data/carrier.db" <<'PY'

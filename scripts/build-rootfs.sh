@@ -241,6 +241,11 @@ cp "${TARGET}/agpkg" "${TREE}/usr/bin/agpkg"
 # agdone (M27) — provision done-markers for one-shot boot steps
 # (/var/lib/ag/done). The ag-done shim rides along via the cp -R above.
 cp "${TARGET}/agdone" "${TREE}/usr/bin/agdone"
+# agsecret (M36) — the secret sidecar: agsecretd daemon (unit in
+# /etc/agsvc.d) + agsecret admin client (router face via the ag-secret
+# shim in the recipe). Store lands at /var/lib/ag/secret/store at first
+# put; policy is the tracked /etc/aginx/secret.policy.
+cp "${TARGET}/agsecretd" "${TARGET}/agsecret" "${TREE}/usr/bin/"
 # package manifest rides SIGNED: the on-device default path requires a
 # detached sig or every `agpkg sync` refuses (fail-closed). Resign when
 # the manifest is newer than its sig; no key = hard error, not a silent
@@ -280,6 +285,7 @@ chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/usr/bin/wifi-wizard" "${TREE}/usr/bin/agsvc" \
   "${TREE}/usr/bin/agctl" "${TREE}/usr/bin/agboot-ok" \
   "${TREE}/usr/bin/agupd" \
+  "${TREE}/usr/bin/agsecretd" "${TREE}/usr/bin/agsecret" \
   "${TREE}/usr/bin/ag" \
   "${TREE}/usr/bin/net-rejoin" "${TREE}/usr/bin/net-watch" \
   "${TREE}/bin/wdt"

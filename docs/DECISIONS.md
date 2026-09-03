@@ -139,6 +139,24 @@ does an agent use this", then by "how does a human debug it".
   applications like codex/grok TUIs hard-require a real pty terminal), but the
   UI line ends there: no further human-facing UI work is in scope.
 
+## 9. Secret sidecar (2026-09-03)
+
+All boundary credentials (brain key, relay secret, memory token, api provider
+keys, future payment credentials) converge on one local daemon, `agsecretd`
+(crate `crates/agsecret`, baked `/usr/bin`, agsvc unit), spoken to over
+`/run/aginx/secret.sock` (unix stream, SO_PEERCRED + `/proc/<pid>/exe`
+allowlist from the tracked, secret-free `/etc/aginx/secret.policy`).
+Store: `/var/lib/ag/secret/store` (0600, rides the state tar, **excluded from
+ag-backup** — push-half auth must not bootstrap from its own cargo; lost keys
+are re-entered). Wire ops: `get`/`env`/`sign`/`issue`/`put`/`rm`/`list`
+(ndjson + agio envelope); `sign` is HMAC-SHA256 so relay/api chains never
+export key material. Client resolution order is real env var > sidecar > `.env`
+file — dev override and sidecar-less server twins keep working. Agents never
+hold plaintext; scope granularity is "our signed binaries" (exe), not per-face.
+Detailed spec: SYSTEM.md §7.1 (local docs). v1 customers: carrier brain key
+(`api_key_env`), `ag api` provider keys, `ag secret` human face; relay/memory/
+duphub/pay attach in their own milestones.
+
 ## Naming (unchanged)
 
 
