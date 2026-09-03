@@ -4471,3 +4471,610 @@ expect_py 参数序（name, expr）我写反——bash -x 才看见 expr 被展�
 provision sync 或换机自愈会拉回，**manifest 行 + release 资产待
 「推送」后补**）；/usr/bin/ag-agent shim 已更新（烤盘同款，重烤折叠）。
 注册表终态 = clone-creator + me（accept-m30 已卸），/.aginx 已清。
+
+## 2026-09-03 — M31: D3 批1 — browser/web 工具外置成 agb 包 + runtime 桥（实测）
+
+### M31c — agb 四件套上机 + ag-browser/ag-web 面 + 桥全回路（2026-09-03）
+
+Host 侧（M31a/M31b，见 aginx-carrier 仓 363c24f / de89073）：agb crate
+（browser/search/fetch 实现 verbatim 搬家，单真源）；runtime 三模块
+（browser.rs/web_search.rs/web_fetch.rs + toolset.rs）删，换 agb_bridge
+（12 个 ToolDefinition 逐字节保留，execute spawn `agb tool <name>`
+stdin-JSON/stdout-D1-信封）；tool_search 退役（宪法性替代 `ag commands`）。
+carrier workspace 全量 cargo test 1451 绿 + clippy -D warnings 0 + 两条
+工具面金样本重录后绿。
+
+**上机产物**：
+- `agpkg install agb <tar> <sha256>`（HOME=/home）rc 0 → /var/bin/agb
+  755（3,337,216 B musl static，md5 与 host 构建一致）+
+  /var/lib/agpkg/skills/agb/SKILL.md。`agb 0.2.0`；机读面
+  `agb tool browser_close` → `{"data":"…stateless…","ok":true}` rc 0；
+  带 api_key 的 URL → taint 信封 `"ok":false` rc 1（干净信封非崩溃）；
+  未知工具名 → `"ok":false` rc 1。
+- 新 aginx-carrier 27,531,832 B 入 /var/bin（staging+mv，重启后 daemon
+  PATH=/sbin:/bin:/usr/sbin:/usr/bin:/var/bin 含 /var/bin——桥 spawn
+  `agb` 可解析）。
+- /usr/bin/ag-browser + ag-web shim（group=web，烤盘同款）；设备
+  /etc/ag/groups.desc 追加 `web=` 行。`ag commands --check` 20 OK
+  （18+2）；菜单出 web 组两命令；`ag browser --help` 拦截目标未执行
+  （无信封/Title 痕迹）。
+- 真网络面：`ag web fetch https://example.com` HTTP 200 + EXTCONTENT
+  包裹；`ag browser navigate https://example.com` 引擎回
+  Title: Example Domain；`ag web search rust` 聚合真结果
+  （rust-lang.org / arxiv）。
+
+**桥全回路（M31b 的 bring-up 证据）**：直驱 ACP 桥（stdin ndjson：
+initialize → session/new → session/prompt）对 clone `me` 提令
+「调 web_fetch 抓 example.com，贴结果首行，输出 BRIDGE_OK」→ 13 s 内
+session/update 回全文 + resp `stopReason: end_turn`，回复含真实正文
+首行（# Example Domain）+ BRIDGE_OK。session jsonl 里 tool_use
+web_fetch{url,method:GET} → tool_result HTTP 200 + EXTCONTENT——即
+LLM → agb_bridge → spawn agb → 信封解包 → 结果回填全链在设备上走通
+（runtime 内已无 web_fetch 实现，唯一执行体是 agb CLI）。同轮观察：
+hub fallback flow 的 `tools:` 白名单不含 browser_*（agent 如实拒调
+browser_close、不编造结果）——flow 冻结语义符合设计，非桥缺陷。
+
+**顺手修的设备问题**：/etc/aginx/env 只剩 HOME=/home——AGINXBRAIN_API_KEY
+在历次重烤后丢了（rootfs 烤盘 /etc 不含 key），agent LLM 轮缺 key。已从
+Mac ~/.aginx/carrier/.env 取回补进 /etc/aginx/env（0600）+ 设备
+/home/.aginx/carrier/.env（0600，dotenv 面：adb 起的 acp/agb 进程靠它）；
+AGINXBROWSER_URL=http://127.0.0.1:8089 同入 .env（agb search 需要它，
+browser_* 默认值即可）。重启后 daemon environ 验证含 key。
+
+**网络面观察（Legrand AP，非 M31 缺陷但影响验收稳定性）**：
+- 直连 HTTPS 偶发 `error sending request`（同命令 3 试 2 成）；设备无
+  v6 默认路由但 DNS 回 AAAA（example.com 双栈）；agb 每调用新进程无
+  DNS 缓存，抖动放大。套件对策：网络面断言带 drv_net 重试（3 次）。
+- 引擎聚合搜索曾整排 engine "transient error"（冷 DNS），同 host python
+  v4 直连却通；数分钟后自愈出真结果——按瞬态记录，未改引擎。
+- net-watch 在本轮 boot 起 segmentation fault 循环（/var/log/agsvc/
+  net-watch.log 连续 Segmentation fault，agctl 仍显示 ready pid 在）；
+  relay 日志伴 DNS "Try again" 错误。**M20b 自愈链实际失效中，待查**
+  （非 M31 引入：M30c 会话同图未记，需单独立案）。
+- agb fetch 输出接 `head` 会 broken-pipe panic（Rust 默认忽略 SIGPIPE，
+  writeln! 报错即 panic）——CLI 人面小疵，桥路径不受影响（stdout 全量
+  消费）；carrier 侧待修。
+
+**验收**：新增 scripts/accept/m31-agb.sh 30 断言全绿（产物 4 + 信封面 8 +
+路由面 12 + 组表/门禁 4 + 清理 2，网络项 drv_net 重试）；七存量套件回归
+无恙（smoke 11 + m24 14 + m25 6 + m26 8 + m27 13 + m28 11 + m30 30）。
+
+设备终态：AginxOS boot、slot a、adb aginxosredfin；agb 四件套装成
+（v0.2.0 手装，manifest 行 + release 资产待「推送」后补）；/var/bin/
+aginx-carrier = M31 本地构建（27,531,832 B）；/usr/bin/ag-browser、
+ag-web 已推（重烤 #9 折叠）；/etc/aginx/env + /home/.aginx/carrier/.env
+含 brain key 与 AGINXBROWSER_URL（均 0600）；net-watch 崩溃循环待立案。
+
+## 2026-09-03 — net-watch 自愈失效根因：busybox awk 段错误 → 每 45 s 重连健康网络（已修）
+
+M31c 收尾立案（#112）当日结案。表象：本轮 boot 起 /var/log/agsvc/
+net-watch.log 连续 699+ 行 Segmentation fault；同时段直连 HTTPS 偶发
+`error sending request`（同命令 3 试 2 成）、relay 日志 DNS "Try again"、
+aginxbrowser 聚合搜索整排 engine transient error——网络"抖动"被当成
+Legrand AP 的锅写进了 M31 观察记录。
+
+**根因（逐层剥）**：`busybox awk` 在本机**无条件段错误**（rc=139，连
+`awk 'BEGIN{print 1}'` 都死）——案底早在 net-bringup（bringup 三脚本
+都有 sed/set-- 注释规避），但 M20b 的 net-watch/net-rejoin 漏带进 awk：
+
+- net-watch:52 `gw=$(ip route | awk …)` → awk 死、gw 恒空 →
+  `[ -n "$gw" ]` 恒假 → fail 计数每轮 +1 → **每 ~45 s 对健康网络
+  net-rejoin 一次**（wlan0 闪断 = 全部"偶发"网络失败的源头）；
+  agsvc 单元日志里的 Segmentation fault 行 = ash 报子进程 SIGSEGV
+  （子进程自身输出被重定向吞掉，报文落在单元 stderr）。
+- net-rejoin:39 lease ok 消息里的 awk 同死（纯外观：日志显示
+  `lease ok ()` 空 IP）。
+- M20b 验收当年只测了"人为断链 → 自愈"路径，gw=none 让 fail 计数
+  照样走满——**断链用例恰好掩盖了健康态误判**；健康态 45 s 一炸的
+  症状一直到 M31c 长验收会话才显形。
+
+**修复**：两处 awk → sed（烤盘 + 设备同步推，md5 一致）：
+- `gw=$(ip route 2>/dev/null | sed -n 's/^default via \([0-9.][0-9.]*\) .*/\1/p' | head -n 1)`
+- lease IP 同款 sed 解析（`^ *inet \([0-9.]*\)/`）。
+
+**实测**：sed 版在设备上解析 gw=192.168.0.1 / ip=192.168.0.166；
+`agctl restart net-watch` 后 55 s+ 无 probe fail 日志（健康分支静默
+设计）、单元日志停止增长（710 行封口）、前台直跑新版无 Segmentation
+fault。烤盘已修（重烤 #9 折叠）；**教训入册：本机 busybox 一律禁 awk，
+解析用 sed 或 set --，新脚本评审过一眼**。
+
+顺带修正 M31 记录的归因：当日"Legrand AP 直连偶发失败"至少大部分是
+net-watch 自炸，非 AP（AP 掐长传输的旧案仍成立——grok 172 MB 收据
+在前）。m31-agb.sh 的 drv_net 重试保留：多一层网络韧性无害。
+
+补记（同日）：agb SIGPIPE 修复上机——carrier 71bb9b6 在 main 恢复
+SIGPIPE 默认处置；musl 重建（3,327,680 B）推 /var/bin/agb（md5 一致），
+设备实测 `agb fetch … | head` 干净退出无 panic；out/agb 四件套 tar 重出
+（sha256 c960cab3…，待「推送」时用）。信封面/版本回归正常。
+
+## 2026-09-03 — M32: D3 批2 — 文件面工具外置成 agf 包 + runtime 桥（实测）
+
+### M32c — agf 四件套上机 + ag-file 面 + 桥全回路（2026-09-03）
+
+Host 侧（M32a/M32b，见 aginx-carrier 仓 e32bbe8 / 52acb1e）：agf crate
+（file_read/file_write/file_list/file_convert 从 filesystem.rs、
+image_analyze + 魔数/尺寸 helpers 从 media.rs verbatim 搬家，单真源）；
+runtime filesystem.rs 删，换 agf_bridge（5 个 ToolDefinition 逐字节保留，
+execute spawn `agf tool <name>` stdin-JSON/stdout-D1-信封）；桥经保留键
+`_ctx` 注入执行身份与预解析绝对路径——用户数据路由/沙箱/taint 权限留在
+kernel 侧（§9 随末模块退役）；截断留在 tool_meta，信封行为零漂移。
+carrier workspace 全量 cargo test 绿（runtime 547，agf_bridge 5/5，
+agf 19/19）+ clippy -D warnings 0。
+
+**四件套安装事故（收据，已修）**：第一次 `agpkg install agf` 用的 tar 是
+`tar -czf` 出的**gzip 压缩档**——gzip 头把 257 偏移的 ustar 魔数盖掉，
+is_tar 嗅探失败 → 走 v0 平面二进制路径 → **安装报成功**但 /var/bin/agf
+是原始 gzip 字节（magic 1F8B）、skills/agf/ 缺失。agb/dup 当年装得成是
+因为它们的 tar 是未压缩的。修复两步：
+- 重打未压缩 ustar（`tar --format=ustar -cf`，sha256 eed372ac…）→
+  重装即"installed agf bundle"，/var/bin/agf = ELF（1,171,304 B musl
+  static，md5 1317cb57… 与 host 构建一致）+ SKILL.md 落 skill 宇宙。
+- **agpkg 加 gzip 硬闸**：install_file 开头嗅 `\x1f\x8b` → `pkg_gzip`
+  干净报错 + hint「repack without -z: tar --format=ustar -cf …」。设备
+  实测：假 gzip 档被拒、/var/bin 与 skills 无残留；同二进制重装好
+  agf 包照常（happy path 无回归）。烤盘 /usr/bin/agpkg 已同步（重烤
+  #9 折叠）。教训入册：**agpkg 四件套 tar 一律未压缩 ustar**。
+
+**上机产物**：
+- /var/bin/aginx-carrier = M32 本地构建 27,494,536 B（md5 a9329815…，
+  staging+mv，agctl restart 后 ready）；/usr/bin/ag-file shim（group=files，
+  烤盘同款）+ 设备 /etc/ag/groups.desc 追加 `files=` 行。`ag commands
+  --check` 21 OK（20+1）；`ag file --help` 拦截目标未执行。
+- 机读面：`agf tool file_read /etc/hostname` → `{"data":"aginxos\n",
+  "ok":true}`；未知工具 → `"ok":false` rc 1；PNG 魔数 → 干净信封报错
+  并指路 image_analyze；image_analyze 回 format/size/base64 信封。
+- 人面：write→read 回路、`ls 文件` 纠偏提示改用 file_read（防工具循环）、
+  `ag file read` 路由直通均实测通过。
+
+**桥全回路（M32b 的 bring-up 证据）**：直驱 ACP 桥（stdin ndjson：
+initialize → session/new → session/prompt）对 clone `me` 提令「用
+file_write 把 output/m32-probe.md 写成 AGF_BRIDGE_WROTE_THIS，再用
+file_read 读回贴原文，输出 BRIDGE_OK」→ 14.9 s end_turn；回复含
+AGF_BRIDGE_WROTE_THIS 原文 + BRIDGE_OK。session jsonl 里 tool_use
+file_write → tool_result、tool_use file_read → tool_result 各一；文件
+实际落在用户数据路由位
+`/home/.aginx/carrier/workspaces/me/senders/acp:<sid>/output/m32-probe.md`
+——即 LLM → agf_bridge → spawn agf → 信封解包 → 结果回填全链在设备上
+走通（runtime 内已无文件工具实现，唯一执行体是 agf CLI）。
+
+**验收**：新增 scripts/accept/m32-file.sh 35 断言全绿（产物 5 + 信封面
+8 + 人面 6 + 路由面 8 + 组表/门禁 4 + 清理 2 + scratch 2）；八存量套件
+回归无恙（smoke 11 + m24 14 + m25 6 + m26 8 + m27 13 + m28 11 + m30 30 +
+m31 30）；check.sh host gate 绿。
+
+设备终态：AginxOS boot、slot a、adb aginxosredfin；agf 四件套装成
+（v0.2.0 手装，manifest 行 + release 资产待「推送」后补）；/var/bin/
+aginx-carrier = M32 本地构建；/usr/bin/agpkg = gzip 闸版（md5 d3a652b0…）；
+/usr/bin/ag-file 已推、groups.desc 含 files= 行（均待重烤 #9 折叠）。
+M32 收口：media 余下 brain 耦合工具与 misc 面并入 M33（内核耦合批）。
+
+## 2026-09-03 — rootfs 重烤 #9：M30–M32 折叠 + gzip 闸 agpkg + net-watch sed 修（实测）
+
+配方沿 #8：SIZE=1g 烤（sha 7e398d29…，105 MB 内容/1 GiB fs，烤内
+`ag commands --check` 门禁过）；boot.img=e2ce2f17（复用）、vendor_boot=
+d80b8098（boot/out/vendor_boot-test.img，蹦床版）；rootfs pre_staged——
+host `cat img | adb shell dd bs=4096 seek=2097153` 流灌 userdata
+（=SWAP_OFF 8 GiB+头 4096）；manifest+sig（agsign）推 /tmp/agupd；
+`agupd apply --no-reboot` 全绿（boot_a/vendor_boot_a sha 过、state tar
+59,748,864 B 落 64 GiB、pre_staged 体原位哈希过、swap committed、
+old fs 1,020,702,720 B）；reboot2 后 ~110 s 起机 `aginxos c793bad`。
+
+折叠内容：M30 ag-agent 真 shim、M31 ag-browser/ag-web + web= 组行、
+M32 ag-file + files= 组行、gzip 闸版 /usr/bin/agpkg（md5 d3a652b0…）、
+net-watch/net-rejoin awk→sed 修、manifest v0.2.1 pin（c0d490d3）。
+
+**首启三观察**：
+1. `pkg fail`（boot.state）——直连 github timeout（AP 冷网络老图景），
+   本boot未自愈；手工 `agpkg sync` 即全绿（python3 47 MB + codex 233 MB
+   走 gh-proxy 落地，aginx/aginx-carrier/aginxbrowser 同步重装——
+   M26 修复2 的 stamp+binary 存在性判据工作正常）。
+2. **aginx 单元 5 连败**：起机时 /var/bin/aginx-carrier 还没被 sync 装
+   回（swap 清空 /var/bin），网关"no agents configured"退出；sync 完成后
+   restart 即回岗。结构性：单元启动早于网络自愈装包，属首启窗口竞态，
+   第二靴（包已在位）不再现——记录不立案。
+3. **python-finalize 标记撒谎**：标记在 /var/lib（state tar，swap 存活），
+   而它的工件 /lib/ld-musl-aarch64.so.1 软链在 state tar 外——swap 后
+   python3 死于缺 musl interpreter（报错是迷惑性的 "No such file or
+   directory"）。手工 reset+重跑 finalize 即愈；**修**：provision 守卫
+   加 `[ ! -e /lib/ld-musl-aarch64.so.1 ]` 重验工件（信工件不信标记，
+   烤盘+设备同步推，m28 套件 11/11 恢复）。
+
+**swap 损失清单（全部手工补回）**：/var/bin 全清（manifest 件 sync 自愈；
+agf/agb/dup 本地四件套重装——tar+sha 直推即过 gzip 闸）；/data/local/tmp
+清空；M32 carrier 构建（a9329815…）重推。状态面完好：wifi.conf、
+/etc/aginx/env（brain key）、/home 工作区+会话、/var/lib stamps×8、
+groups.desc（web=+files= 都在——state-restore 盖烤盘同内容）。
+
+**第二靴全绿**：touch/camera/battery/modem/audio/wifi/dhcp/internet/
+time/pkg/done 全 ok，四单元首试 ready，carrier=M32 构建 md5 不变，
+九套件回归 11+14+6+8+13+11+30+30+35=158 断言 0 败。
+
+设备终态：bake #9（c793bad）slot _a active；/var/bin 八件（aginx/
+aginx-carrier=M32 构建/aginxbrowser/codex/python3 + agf/agb/dup 手装）；
+python-finalize 重验守卫在位（烤盘已改，下一烤折叠）。
+
+## 2026-09-03 — M33 D3 批3：内核耦合工具外置成 carrier CLI 面（实测）
+
+M33a（`aginx-carrier tool/sys` 机读+人面 CLI，内核耦合 13 工具单真源）+
+M33b（runtime misc/agent_mgmt/scheduling 三模块退役 → carrier_bridge，
+spawn `aginx-carrier tool <name>`，`_ctx` 身份+递归深度跨进程续传）上机。
+部署：musl 构建（sha 1a5b727a16758c07…）→ /var/bin/aginx-carrier，
+`agctl restart aginx-carrier` 换血（pid 5052）；四 shim 推 /usr/bin
+（ag-cron/ag-agent 扩子命令 + 新 ag-sys-time/ag-sys-location）。
+
+**adb HOME 复发**：手跑 CLI 时 adb shell HOME=/，kernel boot 在 /.aginx
+刻出空注册表 → "Agent not found: me"；HOME=/home（lib.sh 已钉）即对上
+守护的 /home/.aginx/carrier。M30 发现的手跑面复发，机制记录。
+
+**机读面收据**：`tool system_time` 信封 ok rc=0；`tool nope_such` →
+tool_unknown 信封 rc=1；`tool cron_create` 缺 `_ctx` → "Agent ID
+required for cron_create" rc=1（干净错误面，kernel boot 路径在设备走通）。
+
+**cron DB-as-bus 收条**（CLI 落任务 → 守护收养 → 发射）：23:40:05
+`tool cron_create`（caller me，one_shot at in_secs=45，system_event）
+→ job_id 5108d909…；`tool cron_list`（另一进程、独立 boot）见
+next_run 23:40:50；守护日志 23:40:20 `Cron reconciled from database
+added=1`（15s tick）；23:41:12 `cron list` 已空——到点发射+one_shot
+自动删除。发射本身无 INFO 行（低于 info 级）。
+
+**schedule kv 回路**：create（"every 5 minutes"→cron */5 解析）→ list
+见条目 → delete → "No scheduled tasks"。**agent 三件套扫**：极简
+manifest（module=builtin:chat）`tool agent_spawn` → m33-probe
+（8903f2a2…）入册 → `tool agent_list` 见 3 agents → `tool
+agent_kill` → 回 2。
+
+**sys location 修**：上机 403——ip-api.com 免费档只开明文 HTTP
+（HTTPS 全局 403，host 复核同象；上游 misc.rs 遗传 bug）。单真源侧
+https→http 后重推：Nanjing/Jiangsu 信封 rc=0。
+
+**LLM 回路 agent_send（桥全链）**：ACP ask 模式
+（`echo 提示 | aginx-carrier acp --clone me`）驱动。三层发现：
+1. me 的 hub flow 白名单只有 contact_prompt（无 agent_send）——首轮
+   LLM 诚实说明并改道 contact_prompt（contact 面在设备亦通）；
+2. 白名单真源在 flows/hub/flow.md frontmatter `tools:`（非
+   agent.toml [capabilities].tools——后者改了无效）；
+3. 静态表 PermissionLevel::for_tool(agent_send)=Execute > me 的
+   max_tool_level=write → flow 声明也被 level 闸拦（警告文案是
+   "工具目录中不存在"，实为权限不足——文案误导记此）。
+临时 max_tool_level=execute + flow 加 agent_send + `agent restart me`
+（restart 会 reload agent.toml）后：me 的 LLM 调 `agent_send` →
+CarrierBridge spawn `aginx-carrier tool agent_send` 子进程 → 子进程
+kernel boot → clone-creator 真轮（第二次 LLM 调用）→ 原话回传
+"收到，桥上机通信正常——我是 Clone Creator…"，22 s/2 轮 success。
+runtime 内已无 agent_send 实现（agent_mgmt.rs 删），唯一执行体是
+CLI 子进程——跨进程桥+嵌套轮全链在设备走通。证毕还原
+agent.toml/flow.md（md5 复核）+ restart me，无残留。
+
+**网络**：Legrand AP 对 LLM 长流敏感（多次 Request timed out，
+wlan0 NO-CARRIER 或关联在但出不去），`net-rejoin` 原地恢复即续——
+M20b 图景，本轮 3 次 rejoin 后证明落袋。
+
+**验收**：scripts/accept/m33-kernel.sh 35 断言全绿（shim/路由面 6 +
+机读信封 7 + schedule 回路 8 + agent 面 2 + 人面新语法闸 1 + 组表/
+门禁 4 + 清理 2 + scratch 5）；smoke 11/11 回归无恙。
+
+设备终态：bake #9（c793bad）slot a；/var/bin/aginx-carrier = M33
+构建（1a5b727a…）；守护 pid 5052 跑同版；四 M33 shim 在 /usr/bin
+（adb 推，待重烤 #10 折叠）；注册表 me/clone-creator 无探针残留，
+schedule/cron 表清空。M33 收口：D3 三批全落（批1 agb / 批2 agf /
+批3 carrier 面），runtime 内核耦合工具零残留实现。
+
+## 2026-09-03 — M34: api_tools → `aginx-carrier api` 命令层（实测）
+
+**改动**：api_tools 执行链（resolve 链/ctx 注入/HMAC 签一发一/extract
+tiers/cron 落库/注册写盘）自 runtime 整体搬进 `aginx-carrier api`
+（子命令 call/raw/list/register/cron）——单真源在 CLI；runtime 侧只剩
+ToolDefinition 广播 + spawn 桥（toml 面 = 全局 + 本化身工作区，per-agent
+同名覆盖）+ DYNAMIC_TOOLS 进程内注册表。原 `api_tools/cron.rs` 的
+`register_cron_tools` 从未接线（死码），删；活的节拍在 daemon start.rs：
+30s 一跳 spawn `api cron`，空载门先扫 toml 有无 `[tool.cron]`——零配置
+设备不付 spawn 代价（功耗线 M23）。
+
+**发现（硬伤，上机暴露）**：原 register.rs 的 `serialize_tool` 漏写
+`[tool.cron]` 节——注册带调度的工具会静默丢 cron，注册后永不发射。上
+机现象：`api cron --json` 在秒<30 窗口返回 `{"fired":[],"due_skipped":0}`
+（工具根本不被视为 cron 工具）。M34a 的搬运转写了同款 bug（忠实移植了
+上游缺陷）；注册面成为唯一写手后必须修：serialize 补 `[tool.cron]`
+（schedule/save_to/table）+ 往返测试。修复重推后同一命令 fired 一发
+入库。
+
+**收据（2026-09-03，serial aginxosredfin）**：
+- 新 brain key（ab_b320…）写入 /etc/aginx/env + agctl restart 后：
+  acp ask 全轮 `is_error:false`，result「收到」，5.4 s/1 turn。
+- 新二进制 /var/bin/aginx-carrier（md5 bdfe3672…，含 cron 修复），
+  守护 pid 9361 起同版；ag-api shim + api 组进 /usr/bin、groups.desc。
+- `api register --global`（ip_city，ip-api 明文 HTTP）→ `ag api list`
+  人面/信封面各一条；机读 call（stdin `_ctx`）D1 信封 data =
+  {city:"Nanjing", region:"Jiangsu"}；人面 --param 同源；raw 直通
+  通（期间一次 Legrand AP 瞬断，重试即过——老毛病，非本次回归）。
+- 同名重注册两次：api_tools.toml 恒 1 块（幂等）。
+- daemon 30s 委托节拍：注册 `* * * * *` 的 ip_city_cron 后约 70 s，
+  aginx-carrier.log 出 `api cron 委托一跳 tool="ip_city_cron" ok=true`
+  （00:50:24），/home/.aginx/carrier/data/m34-cron.db 落行
+  （python3 读：tool_name=ip_city_cron，raw_response 含 Nanjing）。
+  零 [tool.cron] 时无 spawn（空载门，日志无跳）。
+- LLM 回路过桥：acp ask「调用工具 ip_city 查出口城市」→ 2 turns、
+  12.3 s、is_error:false、result「南京」（城市为工具事实，brain 无从
+  知晓——证明 provider 桥 spawn CLI 执行链在轮内闭环）。
+- 套件：m34-api.sh 31/31；smoke 11/11；m33 35/35（回归）；host
+  check.sh 全绿 + 设备 `ag commands --check` 24 commands OK（+ag-api）。
+
+设备终态：全局 api_tools.toml 仅存 ip_city（无 cron，守护节拍空载）；
+m34-cron.db 与 /var/tmp 探针已清；bake #9（c793bad）slot a 未动，
+ag-api shim 与 api 组行待重烤 #10 折叠。M34 收口：api_tools 执行、
+写盘、cron 发射全部单源于 `aginx-carrier api`；runtime 侧零执行残留。
+
+## 2026-09-03 — #87: pkgs.aginx.net 软件镜像上机（agpkg 包源迁自 GitHub）
+
+**动机（实测）**：本网络（Legrand AP）对 GitHub 长传输必杀——bake #10
+恢复期 aginxbrowser 走 GitHub 39MB/64MB 后静默（agdl 无读超时，挂在
+sk_wait_data；kill 后换本地资产）；host 侧 curl 同样截断（847KB/64MB）。
+grok 先前 172MB@27KB/s 拉了整晚。镜像为国内直连，一劳永逸。
+
+**架设**：86quan（106.75.32.216，UCloud；用户加的 Cloudflare 解析）。
+nginx vhost 443（LE 证书 CN=pkgs.aginx.net，YR2 链，2026-12-02 到期，
+webroot 续期）；root=/data/pkgs.aginx.net，autoindex off，
+octet-stream，immutable 缓存头，deny sync.sh/sync.log。布局
+`<pkg>/<短版本>/<asset>`——与签名 manifest 的 URL 一字不差。
+
+**回填脚本** /data/pkgs.aginx.net/sync.sh：从 GitHub releases 经
+socks5h://127.0.0.1:8800 拉，sha256 闸（代理不信任，只信哈希），
+5×重试。收据一：Azure blob 对连发大文件限流——200 状态码 + XML 错
+误体（四文件同一错误 sha），重试环必须。收据二：yinnho/aginxos 的
+release tag 带 pkg 前缀（aginxbrowser-v0.2.5/python3-v3.12.14/
+codex-v0.151.0/grok-v1.0.12），aginx 与 aginx-carrier 才是裸 v-tag
+——短 tag 全 404（404 页 sha 0019dfc4…），脚本 case 已按全 tag 映射。
+
+**踩坑**：初填目录双层嵌套（pkg/全tag/全tag/asset，手铺目录残留）→
+manifest URL 404（153B nginx 默认页），拉平后全通。sync.sh 幂等复跑
+OK(skip)×6。设备侧新 DNS 记录间歇 NXDOMAIN——/etc/hosts 临时钉
+106.75.32.216 pkgs.aginx.net（下次换机消失，属过渡）。
+
+**收据（2026-09-03，serial aginxosredfin）**：六资产服务器侧 sha 全
+对（共 ~524MB）；Mac + 服务器本环 curl TLS 校验过（TLSv1.3，LE 链）。
+设备 `agpkg sync`：aginxbrowser 64,037,544 B + codex 233,773,456 B
+自镜像 HTTP 200 安装、sha 过闸（当日早先同路径走 GitHub 是死路）；
+aginx/aginx-carrier/python3 up to date。agb --help、codex 0.151.0
+实跑验证。客户端零改动：只换 manifest URL（sha 不动）+ 重签 + 推
+/etc/。观察：agpkg "up to date" 以 stamp 为准——设备 bdfe3672（M34
+构建）≠ manifest 钉 c0d490d3，sync 未回滚。gh-proxy 保留为应急文档
+路径。
+
+## 2026-09-03 — rootfs 重烤 #10：M33/M34 折叠 + 换机收口（879afe8）
+
+**镜像**：SIZE=1g，版本戳 `aginxos 879afe8 2026-09-03`，in-bake 门
+`ag commands --check` 24 OK；boot.img 复用 e2ce2f17；vendor_boot
+d80b8098（ROOTFS=1 trampoline）。换机走 host dd（seek=2097153，
+userdata 8GiB+4096）+ agupd apply --no-reboot（注意：manifest 参数
+必须在 --no-reboot 之前，否则报 unsupported url）+ /bin/reboot2
+reboot，~2 分钟到 boot complete。
+
+**发现（硬伤，新烤才暴露）**：fresh 镜像没有 /var/tmp——build-rootfs
+的 mkdir 清单、rcS、aginxos-init 三处都不造它；旧文件系统有是当年
+手工 mkdir 的遗产。后果：provision 的 `>$LOG` 重定向失败 → `pkg
+fail` 且无日志可看（agdl 亦在 /var/tmp 下暂存）。修复：
+build-rootfs.sh mkdir 清单补 var/tmp；在机 mkdir 补救。agdl 无读超
+时（AP 掐流后永挂 sk_wait_data）——已知，另案。
+
+**换机后恢复（USB）**：/var/bin 与 /data/local/tmp 被 swap 清空——
+按序重推 python3/agf/agb/dup 四件套、ag-done python-finalize、M34
+carrier bdfe3672 + 单元重启；/etc/aginx（新 brain key）经 state tar
+存活，env.bak-key 清理。
+
+**验收**：m33 35/35；m34 三次 29/2（ip-api 明文 HTTP 在本 AP 瞬断，
+每次挂不同断言对——直探 6/6 + 0% loss，判网络非回归），镜像通后
+31/31；smoke 先 10/11（pkg 行缺席）→ 镜像 sync + provision 后 11/11
+（boot.state 尾部 `pkg ok` 落袋）。
+
+设备终态：879afe8 slot a；/var/bin 八件齐（aginx/aginx-carrier
+bdfe3672/aginxbrowser/codex/agb/agf/dup/python3→symlink）；守护单元
+aginx/aginx-carrier/net-watch ready；/etc/hosts 含 pkgs.aginx.net 钉
+（临时，传播稳后可撤）。重烤 #10 收口：M24–M34 骨架全部进 baked
+镜像，设备不再依赖 adb 推的 /usr/bin shim。
+
+## 2026-09-03 — M35: agmem 四件套上机 + runtime 记忆面桥（实测）
+
+M35a/b/c（host 侧，见 aginx-carrier 仓）：agmem crate（kv/tree/knowledge/
+flows 单真源，19 工具名契约定死；`agmem tool <name>` 机读面 D1 信封）+
+runtime kv/memory/knowledge 三模块退役 → agmem_bridge（18 工具，spawn
+`agmem tool`，`_ctx` 注入身份三元组/home_dir/workspace_root；apply_patch
+与 session_summarize 留守 runtime——内核耦合面）。
+
+### M35d — 四件套安装 + 桥全回路 + m35 套件
+
+- **四件套**：`ag pkg install agmem /tmp/agmem-v0.2.0-4pc.tar <sha>`
+  （uncompressed ustar 3,185,664 B）→ /var/bin/agmem（3,178,912 B，md5
+  0703be45…）+ /var/lib/agpkg/skills/agmem/SKILL.md；`agmem --version`
+  → agmem 0.2.0。
+- **新 carrier 上机**：M35c 构建 27,634,040 B（md5 de63f583…，staging+mv
+  +agctl restart 后 ready）。daemon 内已无 kv/memory/knowledge 实现，
+  唯一执行体是 agmem CLI。
+- **人面（真实 substrate）**：`agmem set/get/list` 直开守护同一个
+  /home/.aginx/carrier/data/carrier.db（WAL 并发安全），kv 行落
+  (me, default, local) 域。
+- **机读面**：`agmem tool kv_get` → `{"ok":true,"data":…}`；未知工具
+  ok:false rc 1；显式 null owner/user 走 (86bus,"","") 域——与人域互
+  不可见（kv_store 表三行三种身份实证）。
+- **坑（探针实捉）**：桥全回路首跑失败——db 路径推导出
+  `/home/.aginx/carrier/.aginx/carrier/data/carrier.db`（`.aginx/
+  carrier` 拼两遍）。根因：runtime ToolContext.home_dir = config.home_dir
+  是 **carrier home**（agf 的 sender_data_dir 同语义），而 agmem 原推导
+  把 `_ctx.home_dir` 当**用户主目录**。修：agmem `db_path_of` 分语义——
+  `_ctx.home_dir`（carrier home）→ `{home}/data/carrier.db`；`$HOME`
+  （用户主目录）→ `{HOME}/.aginx/carrier/data/carrier.db`；默认布局下
+  同库。agmem 24/24 host 测试改判后全绿，重打包重装。
+- **桥全回路（M35c 的 bring-up 证据）**：直驱 ACP 桥（stdin ndjson：
+  initialize → session/new → session/prompt）对 clone `me` 提令「kv_set
+  写 m35.probe=AGMEM_BRIDGE_WROTE_THIS，kv_get 读回贴原文，输出
+  AGMEM_BRIDGE_OK」→ end_turn；会话 jsonl 含 kv_set + kv_get 各一次
+  （tool_result 分别为 "Stored value" 与 `"AGMEM_BRIDGE_WROTE_THIS"`）；
+  kv_store 表 (me, "", "acp:<sid>") 域 03:47:48 落值；CLI 按同三元组
+  独立读回成功。首跑（修前）还实捉了缺包净错路径：agent 自报
+  `agmem CLI not available` 并拒绝输出 OK（探针进程 PATH 不含 /var/bin
+  ——守护单元无此问题）。
+- **路由面**：/usr/bin/ag-mem shim（group=mem，烤盘同款）+ 设备
+  /etc/ag/groups.desc 追加 `mem=` 行；`ag mem --help` 拦截目标未执行；
+  `ag mem get/set/del` 直通真实 substrate；`ag commands --check` 25 OK
+  （24+1）。
+- **knowledge 面**：`--workspace …/me k ls` → 1 文件；`evaluate` →
+  Quality Score 73/100（良好），SOUL/SP/MEMORY 全 true。
+
+**验收**：新增 scripts/accept/m35-mem.sh 43 断言全绿（产物 5 + 信封/身份
+13 + 人面 6 + knowledge 4 + 路由面 8 + 组表/门禁 2 + 清理 3 + scratch 2）；
+十二套件回归 267 断言 0 败（smoke 11 + m24 14 + m25 6 + m26 8 + m27 13 +
+m28 11 + m30 30 + m31 30 + m32 35 + m33 35 + m34 31 + m35 43）；check.sh
+host gate 绿（25 commands OK）。
+
+设备终态：bake #10（879afe8）slot a；agmem 四件套装成（v0.2.0 手装，
+manifest 行 + 镜像资产待「推送」/重烤 #11）；/var/bin/aginx-carrier =
+M35c 构建 de63f583…；/usr/bin/ag-mem 已推、groups.desc 含 mem= 行（待
+重烤 #11 折叠）。M35 收口在 #86 备份通道（M35d 尾件）。
+
+### #86 v1 — 备份通道（设备侧纪律 + 调度，2026-09-03）
+
+**范围**：服务器推送半边依赖 M36 secret sidecar（hub 鉴权），本收据只
+落设备侧：一致快照 + 打包 + 保留 + 每日调度。
+
+- **/usr/bin/ag-backup**（group=mem，路由 `ag backup now|list|verify`）：
+  python3 sqlite backup API 对活库 carrier.db 做一致快照（WAL 下安全，
+  不停守护）；快照 + /home/.aginx（剔除活 db 三件套）+ /var/lib/ag 打
+  tar.gz 落 /var/backups/aginx/；保留最新 7 份。实测：/home/.aginx 全量
+  5.4 MB → 备份 128K（224 成员），verify（gzip -t + 快照成员在位）过。
+- **调度**：busybox crond（rcS 起，`-c /etc/crontabs`——默认
+  /var/spool/cron/crontabs 不存在，首启动静默死，-c 钉目录后才活）；
+  /etc/crontabs/root 每日 04:17 跑 ag-backup now，日志 /var/log/
+  ag-backup.log。**调度链实测**：临时装下一分钟行 → crond log 出
+  `USER root pid … cmd /usr/bin/ag-backup now` → backup-040500.tar.gz
+  落地 → 行已撤、恢复正典表。
+- **已知边界**：busybox crond 无 suspend 补跑（M23b 深睡会跳过夜间槽，
+  下一日自续）；/var/backups 不在 state tar（换机丢历史——/home 本身由
+  state tar 保，备份是二次防线，接受）。恢复路径手工（脚本头有指引）。
+- 上述 rcS/crontabs/ag-backup 均已推设备 + 烤盘在册（待重烤 #11 折叠）；
+  `ag commands --check` 26 OK。
+
+m35 套件增 7 断言（50/50）：工件在位、`ag backup list` 路由、crond 活、
+crontab 行在册、≥1 备份、最新备份 verify 过。
+
+设备终态（M35 全收口）：bake #10 slot a；agmem 四件套 v0.2.0（md5
+0703be45…）；carrier M35c 构建 de63f583…；ag-mem/ag-backup shim + mem=
+组行 + crond 常驻。#86 服务器推送半边挂 M36 后续。
+
+## 2026-09-03 — rootfs 重烤 #11：M35 折叠 + provision 时钟闸（实测）
+
+**镜像**：`817df38-20260903`（1 GiB，sha 98fad04c…），M35 全部 /usr/bin 件
+入盘（ag-mem / ag-backup 755、/etc/crontabs/root、rcS crond 块、mem= 组
+行）。apply 前先踩一跤：manifest boot.size 误填 14516224（boot-test 的
+尺寸），agupd 尺寸闸先于任何分区写拒绝——修正为 100663296（boot/boot.img
+实尺，sha 不变 e2ce2f17…）重签后一次过：boot_a + vendor_boot_a 写入、
+预置 rootfs 体 sha 过、换机头提交、slot a 激活。reboot2 起机
+`aginxos 817df38`，boot.state 全绿至 done ok。
+
+**首启抓到 provision 时钟竞态（新 bug，已修）**：换机后 /var/bin 空，
+provision 只等 `internet ok` 就 sync，而 ntpd 的 `time ok` 在其后才落——
+冷启时钟 1970 下所有镜像 TLS 下载死于证书校验（"certificate not valid
+yet: verification time 1831772"），boot.state `pkg fail`。此前每靴 /var/bin
+都在（sha 合、零下载）故从未暴露。修复：provision 在 internet 后加等
+`time (ok|fail)` 的有界闸（net-bringup 同步写该行，不拖靴）；重启实测
+boot.state 顺序变 `time ok → pkg run → pkg ok`。此修复为 adb 推送
+（/etc/init.d/provision），下烤（#12）折叠——本轮烤盘在闸之前。
+
+**换机后手工恢复清单（每烤必做，四件套不在 manifest）**：`agpkg sync`
+补五件（aginx/carrier/browser/python3/codex，provision 竞态救起后手动跑
+一次即可）；重推 M35c carrier（de63f583…，**实测 sync 不回头覆盖**——
+按 stamp 判齐，直接推文件不触发重下）；重装 agmem/agb/agf/dup 四件套
+（各 v0.2.0 tar）；重链 /lib/ld-musl-aarch64.so.1（python-finalize 标记
+在 state tar 里活着而链接不在——bake #9 守卫下次自愈，本轮手动 ln）。
+/var/backups 换机清零（既知边界），手动 ag-backup now 重立基线
+（132K/224 成员，verify 过）。
+
+**换机后首次 crond 行为（观察）**：rcS 起 crond 后 ntpd 跳钟，crond 报
+`time disparity of 29776287 minutes detected` 并补跑 04:17 备份行——落在
+provision 竞态窗里（python3 未就位）而干净失败（脚本头 python3 探测先行，
+无半备份）。python3 就位后链路自愈。
+
+**验收**：12 套件 274/0（smoke 11、m24 14、m25 6、m26 8、m27 13、m28 11、
+m30 30、m31 30、m32 35、m33 35、m34 31、m35 50——m30/m31/m32 首跑红是
+四件套未重装，装后全绿）；check.sh 全绿 26 commands OK；重启一轮回
+（carrier M35c 原样、crond 自起、loader 链在位、pkg ok）。
+
+设备终态：bake #11 slot a（aginxos 817df38）；M35c carrier de63f583…；
+四件套 agmem/agb/agf/dup v0.2.0 全装；crond 常驻（每日 04:17 备份）；
+1 份基线备份在 /var/backups/aginx。
+
+## 2026-09-03 — M36 secret sidecar 上机 + USB 主机重启断连事故
+
+**agsecretd 真机 bring-up（M36a/b/c）**：agsecretd+agsecret+ag-secret
+shim+secret.policy+agsvc 单元五件 adb 推装（md5 全对）；`agctl start` 即起，
+**重启后随 /etc/agsvc.d/ 单元自动拉起**（无需手工）。socket
+/run/aginx/secret.sock 0600、目录 0700、store /var/lib/ag/secret/store 0600
+（tmp+rename 原子写）。
+
+真线实证（m36 套件 24/0）：put/list/rm 全走 stdin（值不进 argv）；**对端
+识别走真实 /proc/<pid>/exe**——admin exe（agsecret）在消费者 scope
+（brain.primary）被拒 code=denied；policy 热重载（denied→加白→denied，
+不重启守护，字节级还原）；日志只记 op+scope+peer 无值；ag-backup tar
+实证不含 secret store。
+
+**carrier sidecar 腿（M36b，f7145cb8… 推 /var/bin）**：`ag api call` 的
+hmac 凭证解析实测三级回退——无映射报 "not configured"；policy 加白 +
+store 注入后同命令越过解析、死在死端口（127.0.0.1:1 的 transport error）。
+即 env > sidecar > 缺席 的插腿在真 SO_PEERCRED 路径上闭环。注意
+busybox cp 覆盖运行中二进制报 `Text file busy`——换文件须 stop→cp→start。
+
+**USB 断连事故（根因记录）**：Mac 重启时 27MB adb push 在途，此后手机在
+USB 总线零枚举（adb 与 ioreg 均空）而手机用户态完全健康（aterm 界面与
+网络正常）。重插无效。电源键整机重启后 10 秒内重新枚举。机理（推断，
+非实测）：trampoline 开机一次性绑定 gadget（`usb gadget BOUND`，dmesg
+[4.2s]），运行态无重挂路径；主机在活跃传输中途掉电使 dwc3/ffs 端点态
+卡死，后续总线复位无应答。**UDC unbind("") 重挂恢复路径在此 4.19 gadget
+代码上有 panic 前科（v17 bootloop 尸检，见 trampoline.c:1001 注释），
+不可用作恢复手段**；本机已知恢复法 = 整机电源重启（今日实证）。此为
+首例，不建自动看护（会走 unbind 路径）。
+
+**验收**：13 套件 298/0（m36 新增 24；其余 274 复跑全绿——m34 首跑 4 红
+为设备刚重启网络未收敛的瞬时现象，数分钟后复跑 31/0）。
+
+设备终态：bake #11 slot a；M36b carrier f7145cb8… 在 /var/bin；agsecretd
+常驻；policy/store 原字节原空（套件自清理）；crond 常驻。
+
+## 2026-09-03 — rootfs 重烤 #12：M36 折叠 + provision 时钟闸入盘（实测）
+
+**镜像**：`6d6665f-20260903`（2 GiB 稀疏，sha fc62fca5…；烤盘脚本默认已从
+1 GiB 提到 2 GiB，换机协议尺寸无关）。apply 走既有 agupd pre_staged 路：
+boot_b+vendor_boot_b（sha 与 #11 同——boot e2ce2f17 / vb d80b8098）写入、
+state tar 56 MB 落 64 GiB、2 GiB 体块上哈希过、换机头提交、slot _b 激活。
+2 GiB 体由 host `cat img | adb shell dd seek=2097153` 直灌（live fs 空闲
+不足，push 不可行）。
+
+**时钟闸闭环（#11 遗留 bug 修复入盘）**：首启 boot.state 顺序
+`internet ok → time ok → pkg run → pkg ok`——#11 的 1970 证书竞态在烤盘
+路径上不再出现，五件 must-exist（aginx/carrier/browser/python3/codex）
+全数经镜像 TLS 重下成功。
+
+**agsecretd 从烤盘自起**：首启 `agctl list` 即 `agsecretd ready
+/usr/bin/agsecretd`（baked 单元拉起，无需 adb 推装）——M36 系统面就此
+脱离 adb 推送依赖。烤盘内 agsecretd/agsecret md5 与 host 构建逐字节同。
+
+**换机恢复清单（较 #11 简化）**：五件 sync 重下；M36b carrier 重推
+（f7145cb8…，ETXTBSY 纪律 stop→cp→start）；**注意镜像 provision 拉到的
+carrier 是 db8a2997…（镜像现供版本，非 M35c/M36b——推 carrier 后以 md5
+为准）**；agmem/agb/agf/dup 四件套 v0.2.0 tar 重装（四 sha 全过）；
+**ld-musl 链接这次由烤盘 python-finalize 守卫自愈**（#11 需手工 ln）；
+备份基线重立（132K）。
+
+**验收**：13 套件 12 绿 + m34 29/2——两红均为 ip-api.com 外部腿
+（`error sending request`）。立案排查结论：**外部路径丢包，非本烤、非
+手机、非 carrier**——同 NAT 的 Mac 直连 ip-api 连发 8 发也丢 1 发
+（curl 000）；设备侧 DNS/TCP/网关/conntrack（0/262144）逐项实证健康；
+当日早间（换机前）同一二进制同一套件曾 31/0 两回。排障中两条设备事实
+记录在案：reqwest 直打 `1.1.1.1` 会跟 301 跳 https 而设备无 CA 权
+（报 error sending request，勿误判断网）；打路由器管理页回 HTML 报
+parse error 同理。
+
+**重启一轮**：6d6665f 原样、pkg ok 快道（done 标记活）、agsecretd
+自起、carrier f7145cb8 在位、loader 链在位、crond 常驻；slot _b
+succ=1 tries=6。
+
+设备终态：bake #12 slot _b（aginxos 6d6665f）；M36b carrier
+f7145cb8…；四件套 v0.2.0 全装；agsecretd 常驻（baked）；crond 常驻；
+备份基线 1 份。
