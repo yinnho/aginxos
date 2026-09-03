@@ -1,0 +1,6 @@
+# crond root crontab (#86, M35d) — busybox crond reads /etc/crontabs/root.
+# Daily memory backup: consistent carrier.db snapshot + /home/.aginx +
+# /var/lib/ag tar to /var/backups/aginx (retention 7). Suspend (M23b) may
+# skip a nightly slot — busybox crond has no catch-up; acceptable, noted in
+# docs/HARDWARE.md M35.
+17 4 * * * /usr/bin/ag-backup now >> /var/log/ag-backup.log 2>&1

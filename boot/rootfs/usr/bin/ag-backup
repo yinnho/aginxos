@@ -1,0 +1,83 @@
+#!/bin/sh
+# ag:summary=memory state backup — consistent sqlite snapshot + tar + retention (#86)
+# ag:args=now | list | verify <file>
+# ag:examples=now
+# ag:examples=list
+# ag:examples=verify /var/backups/aginx/backup-<ts>.tar.gz
+# ag:group=mem
+# M35d/#86 v1 — device-local backup discipline. The live carrier.db is
+# snapshotted through sqlite's backup API (consistent even under the
+# daemon's WAL), then packed with /home/.aginx (minus live db files) and
+# /var/lib/ag. Retention keeps the newest 7. Server push rides the M36
+# secret sidecar (hub auth) — see docs/HARDWARE.md M35.
+# Restore is manual: unpack a backup and copy home/ over /home (stop the
+# carrier unit first), or fish a single knowledge file out of the tar.
+set -eu
+
+B=/var/backups/aginx
+DB=/home/.aginx/carrier/data/carrier.db
+KEEP=7
+
+die() { echo "ag-backup: $*" >&2; exit 1; }
+
+cmd_now() {
+  command -v python3 >/dev/null 2>&1 || PATH=/var/bin:$PATH command -v python3 >/dev/null 2>&1 \
+    || die "python3 not available — run: ag pkg sync"
+  TS=$(date +%Y%m%d-%H%M%S)
+  S=$B/.build-$TS
+  mkdir -p "$S/home/.aginx/carrier/data" "$S/var"
+  [ -f "$DB" ] || die "substrate not found at $DB"
+
+  # file tree minus the live db trio (snapshot replaces them)
+  cp -a /home/.aginx "$S/home/"
+  rm -f "$S/home/.aginx/carrier/data/carrier.db" \
+        "$S/home/.aginx/carrier/data/carrier.db-wal" \
+        "$S/home/.aginx/carrier/data/carrier.db-shm"
+  cp -a /var/lib/ag "$S/var/" 2>/dev/null || true
+
+  # consistent snapshot of the live substrate (backup API, WAL-safe)
+  PATH=/var/bin:$PATH python3 - "$DB" "$S/home/.aginx/carrier/data/carrier.db" <<'PY'
+import sqlite3, sys
+src, dst = sys.argv[1], sys.argv[2]
+s = sqlite3.connect(src, timeout=30)
+d = sqlite3.connect(dst)
+with d:
+    s.backup(d)
+s.close()
+d.close()
+PY
+
+  OUT=$B/backup-$TS.tar.gz
+  tar czf "$OUT" -C "$S" home var
+  rm -rf "$S"
+
+  # retention: keep the newest KEEP, drop older (ls -t newest first)
+  ls -1t "$B"/backup-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | while read -r f; do
+    [ -n "$f" ] && rm -f "$f"
+  done
+
+  echo "backup: $OUT ($(du -h "$OUT" | cut -f1))"
+}
+
+cmd_list() {
+  [ -d "$B" ] || { echo "no backups yet ($B missing)"; exit 0; }
+  ls -1t "$B"/backup-*.tar.gz 2>/dev/null | while read -r f; do
+    echo "$(du -h "$f" | cut -f1)  $f  $(tar -tzf "$f" 2>/dev/null | wc -l | tr -d ' ') members"
+  done
+}
+
+cmd_verify() {
+  [ -f "$1" ] || die "no such file: $1"
+  gzip -t "$1" || die "gzip integrity check failed"
+  tar -tzf "$1" 2>/dev/null | grep -q 'home/.aginx/carrier/data/carrier.db$' \
+    || die "snapshot member missing"
+  n=$(tar -tzf "$1" 2>/dev/null | wc -l | tr -d ' ')
+  echo "verify: ok (${n} members, snapshot present)"
+}
+
+case "${1:-}" in
+  now)    cmd_now ;;
+  list)   cmd_list ;;
+  verify) [ $# -ge 2 ] || die "usage: ag-backup verify <file>"; cmd_verify "$2" ;;
+  *)      echo "usage: ag-backup now | list | verify <file>" >&2; exit 2 ;;
+esac

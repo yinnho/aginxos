@@ -129,6 +129,29 @@ drv 'ag commands --check'
 expect_rc 0 "ag commands --check rc 0"
 expect_out '[0-9]+ commands OK' "metadata gate green"
 
+# --- 备份通道 v1（#86）：ag-backup + crond ------------------------------------
+# 只读断言：跑备份本身写 /var/backups（非 scratch），由 crond 日常承担；
+# 套件只验证工件在位、调度器活着、既有备份可通过完整性校验。
+
+drv 'test -x /usr/bin/ag-backup'
+expect_rc 0 "ag-backup script is executable"
+
+drv 'ag backup list'
+expect_rc 0 "ag backup list routes rc 0"
+
+drv 'busybox ps -o comm | grep -qx crond'
+expect_rc 0 "crond scheduler is running"
+
+drv 'grep -q "ag-backup now" /etc/crontabs/root'
+expect_rc 0 "daily backup line registered in crontab"
+
+drv 'ls /var/backups/aginx/backup-*.tar.gz >/dev/null 2>&1 && test $(ls /var/backups/aginx/backup-*.tar.gz | wc -l) -ge 1'
+expect_rc 0 "at least one backup exists"
+
+drv 'F=$(ls -1t /var/backups/aginx/backup-*.tar.gz | sed -n 1p); ag-backup verify "$F"'
+expect_rc 0 "newest backup passes gzip+member verify"
+expect_out '^verify: ok' "verify prints its verdict"
+
 # --- 清理 --------------------------------------------------------------------
 
 drv "rm -rf ${M}"

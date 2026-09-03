@@ -111,6 +111,16 @@ echo $! > /run/bootcard.pid
 # it after agpkg installs.
 /etc/init.d/app-registry
 
+# Memory backup scheduler (#86, M35d) — busybox crond runs /etc/crontabs/
+# root (daily ag-backup at 04:17; -c pins the dir — busybox defaults to
+# /var/spool/cron/crontabs which we don't create). Fire-and-forget daemon;
+# log at /var/log/crond.log. No catch-up across suspend (M23b) — see
+# docs/HARDWARE.md M35.
+mkdir -p /var/backups/aginx /var/log
+if [ -x /bin/crond ]; then
+  /bin/crond -b -c /etc/crontabs -L /var/log/crond.log
+fi
+
 # Boot-successful marker (M16) — ABL drains the GPT slot-retry attribute
 # on every unmarked boot and the phone ends up in fastboot (or falls
 # through to slot b's stock bootloader, which would format our userdata).
