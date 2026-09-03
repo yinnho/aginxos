@@ -58,6 +58,10 @@ const IME_STRIP_H: usize = 120;
 const POWER_HOLD: Duration = Duration::from_millis(1200);
 const IDLE_BLANK: Duration = Duration::from_secs(60);
 
+// M42a voice face: sole writer is the voiced daemon (atomic tmp+rename);
+// aterm only polls mtime and renders. Display-only modality.
+const VOICE_FACE: &str = "/run/voice/face";
+
 fn fill_rect(pix: &mut [u32], pitch: usize, w: usize, h: usize, x: i32, y: i32, rw: i32, rh: i32, c: u32) {
     let (mut x, mut y, mut rw, mut rh) = (x, y, rw, rh);
     if rw <= 0 || rh <= 0 {
@@ -227,6 +231,24 @@ fn draw_centered(pix: &mut [u32], pitch: usize, w: usize, h: usize, font: &[[u8;
     draw_text(pix, pitch, w, h, font, (w as i32 - tw) / 2, y, s, scale, c);
 }
 
+/// Truncate a string to `cols` display columns (CJK counts 2, matching
+/// text_w) — voice-face strings come from ASR/SSID scans and can be long.
+fn clip_cols(s: &mut String, cols: usize) {
+    let mut used = 0usize;
+    let mut cut = s.len();
+    for (i, ch) in s.char_indices() {
+        used += if cjk::char_width(ch) == 2 { 2 } else { 1 };
+        if used > cols {
+            cut = i;
+            break;
+        }
+    }
+    if cut < s.len() {
+        s.truncate(cut);
+        s.push('…');
+    }
+}
+
 // ---------------- pty ----------------
 
 struct Child {
@@ -389,6 +411,75 @@ enum Mode {
     /// /home/photos, then a full-frame view with tap-sides paging.
     /// Decode is libjpeg-turbo (no JPEG decode hardware on SM7250).
     Photos(photos::Photos),
+    /// Voice dialog face (launcher VOICE tile, M42a): display-only
+    /// rendering of /run/voice/face, written by the voiced daemon.
+    /// No pty, no keyboard — PTT (volume-down) is the input path.
+    Voice,
+}
+
+// ---------------- voice face ----------------
+
+/// M42a: the JSON voiced writes to /run/voice/face. Every field defaults
+/// so a partially-written doc never kills the renderer; `alive` lives on
+/// VoiceView, not here — it means "the file read+parsed at least once".
+#[derive(serde::Deserialize, Default)]
+struct FaceDoc {
+    state: String,
+    #[serde(default)]
+    listening: bool,
+    #[serde(default)]
+    busy: bool,
+    #[serde(default)]
+    lines: Vec<(bool, String)>,
+    #[serde(default)]
+    list: Vec<String>,
+    #[serde(default)]
+    sel: usize,
+    #[serde(default)]
+    psk: String,
+    #[serde(default)]
+    hint: String,
+}
+
+#[derive(Default)]
+struct VoiceView {
+    doc: FaceDoc,
+    mtime: Option<std::time::SystemTime>,
+    alive: bool,
+}
+
+impl VoiceView {
+    /// mtime-gated poll (same pattern as the /run/aterm.inject watch):
+    /// stat is one syscall per loop pass, parse only on change. Returns
+    /// true when the view changed and needs a repaint. Setting mtime to
+    /// None forces the next poll to re-read (mode entry).
+    fn poll(&mut self) -> bool {
+        let mtime = std::fs::metadata(VOICE_FACE)
+            .and_then(|m| m.modified())
+            .ok();
+        if mtime == self.mtime {
+            return false;
+        }
+        self.mtime = mtime;
+        match mtime {
+            Some(_) => {
+                if let Ok(s) = std::fs::read_to_string(VOICE_FACE) {
+                    if let Ok(d) = serde_json::from_str::<FaceDoc>(&s) {
+                        self.doc = d;
+                        self.alive = true;
+                        return true;
+                    }
+                }
+                false
+            }
+            None => {
+                // voiced never wrote / went away — keep the last frame's
+                // content but flag it dead
+                self.alive = false;
+                true
+            }
+        }
+    }
 }
 
 // ---------------- render ----------------
@@ -533,6 +624,62 @@ impl<'a> Render<'a> {
         let name = p.names().get(p.sel).cloned().unwrap_or_default();
         draw_centered(pix, self.pitch, self.w, self.h, self.font, g.kb_panel_y as i32 - 36, &name, 3, WHITE);
         draw_centered(pix, self.pitch, self.w, self.h, self.font, self.h as i32 - 30, "< TAP TO PAGE >", 2, DIM);
+    }
+
+    /// Voice dialog face (M42a, launcher VOICE tile): pure rendering of
+    /// the doc voiced writes to /run/voice/face. Phosphor rules — agent
+    /// lines green, user lines white (prefixed ">"), selected SSID white,
+    /// psk shown verbatim (read-back confirmation needs to be visible).
+    /// No touch targets below the BACK toolbar: the screen is a display.
+    fn voice(&self, pix: &mut [u32], v: &VoiceView, g: &launch::Geom) {
+        fill_rect(pix, self.pitch, self.w, self.h, 0, 0, self.w as i32, self.h as i32, BG);
+        self.toolbar(pix, g.m, g.toolbar_h);
+        draw_centered(pix, self.pitch, self.w, self.h, self.font, g.toolbar_h as i32 + 14, "VOICE", 5, GREEN);
+        if !v.alive {
+            draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 8 * 3) / 2, "(语音服务未运行)", 3, UNAVAIL);
+            return;
+        }
+        let d = &v.doc;
+        // status strip under the title
+        if d.listening {
+            draw_centered(pix, self.pitch, self.w, self.h, self.font, g.toolbar_h as i32 + 90, "正在听", 4, WHITE);
+        } else if d.busy {
+            draw_centered(pix, self.pitch, self.w, self.h, self.font, g.toolbar_h as i32 + 90, "处理中", 4, DIM);
+        }
+        // fresh boot, nothing said yet: the one big affordance
+        if d.state == "idle" && d.lines.is_empty() && d.list.is_empty() {
+            draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 8 * 4) / 2, "按住音量下键说话", 4, GREEN);
+        }
+        let mut y = g.toolbar_h as i32 + 170;
+        // dialog transcript: last 6 lines, user white / agent green
+        for (is_user, line) in d.lines.iter().rev().take(6).rev() {
+            let (c, pfx) = if *is_user { (WHITE, ">") } else { (GREEN, "") };
+            let mut s = format!("{pfx}{line}");
+            clip_cols(&mut s, 52);
+            draw_text(pix, self.pitch, self.w, self.h, self.font, g.m as i32, y, &s, 3, c);
+            y += 52;
+        }
+        // SSID list: numbered rows, selection white (voice says 第几个)
+        if !d.list.is_empty() {
+            y = y.max(g.toolbar_h as i32 + 520);
+            for (i, ssid) in d.list.iter().take(10).enumerate() {
+                let n = i + 1;
+                let c = if n == d.sel { WHITE } else { GREEN };
+                let mut s = format!("{n:2}. {ssid}");
+                clip_cols(&mut s, 48);
+                draw_text(pix, self.pitch, self.w, self.h, self.font, g.m as i32, y, &s, 4, c);
+                y += 72;
+            }
+        }
+        // in-progress password — shown verbatim, this is the confirm surface
+        if !d.psk.is_empty() {
+            let mut s = format!("密码 {}", d.psk);
+            clip_cols(&mut s, 48);
+            draw_text(pix, self.pitch, self.w, self.h, self.font, g.m as i32, g.kb_panel_y as i32 - 120, &s, 4, WHITE);
+        }
+        // hint line (voiced's default: how to talk, how to bail)
+        let hint = if d.hint.is_empty() { "按住音量下键说话 · 说取消退出" } else { d.hint.as_str() };
+        draw_centered(pix, self.pitch, self.w, self.h, self.font, g.kb_panel_y as i32 - 40, hint, 3, UNAVAIL);
     }
 
     /// Header strip: [BACK] at the right, like the launcher header —
@@ -954,6 +1101,8 @@ fn main() {
     let mut term = Term::new(term_cols, rows_for(kb_visible, scale));
     let mut parser = vte::Parser::new();
     let mut mode = Mode::Launcher;
+    // M42a: voice dialog face view (polled from /run/voice/face)
+    let mut voice = VoiceView::default();
     // Debug/headless path: ATERM_START=<bin> skips the launcher and spawns
     // the program immediately (e.g. ATERM_START=/bin/sh).
     if let Ok(prog) = std::env::var("ATERM_START") {
@@ -1010,6 +1159,7 @@ fn main() {
                     r.photos_list(buf, p, &lg);
                 }
             }
+            Mode::Voice => r.voice(buf, &voice, &lg),
             Mode::Running(_) => {
                 fill_rect(buf, pitch, w, h, 0, 0, w as i32, h as i32, BG);
                 r.toolbar(buf, lg.m, lg.toolbar_h);
@@ -1123,7 +1273,7 @@ fn main() {
                             }
                             if y < lg.toolbar_h {
                                 // BACK fires on press, same as keys
-                                if lg.toolbar_hit(x, y, matches!(mode, Mode::Running(_) | Mode::Picker | Mode::Photos(_)))
+                                if lg.toolbar_hit(x, y, matches!(mode, Mode::Running(_) | Mode::Picker | Mode::Photos(_) | Mode::Voice))
                                     == Some(launch::Toolbar::Back)
                                 {
                                     if let Mode::Running(c) = &mode {
@@ -1138,6 +1288,8 @@ fn main() {
                                         } else {
                                             mode = Mode::Launcher;
                                         }
+                                    } else if matches!(mode, Mode::Voice) {
+                                        mode = Mode::Launcher;
                                     }
                                     redraw = true;
                                 }
@@ -1172,6 +1324,12 @@ fn main() {
                                             pkgs = read_available();
                                             pk_status.clear();
                                             mode = Mode::Picker;
+                                            redraw = true;
+                                        } else if entries[i2].voice {
+                                            // force the first face read (mtime
+                                            // reset), then poll paints it
+                                            voice.mtime = None;
+                                            mode = Mode::Voice;
                                             redraw = true;
                                         } else if entries[i2].photos {
                                             mode = Mode::Photos(photos::Photos::scan());
@@ -1468,6 +1626,18 @@ fn main() {
             }
         }
 
+        // M42a voice face: poll while the dialog is on screen. A live
+        // dialog counts as activity — the screen must not blank mid-flow
+        // (a face write arrives exactly when the user starts talking).
+        if matches!(mode, Mode::Voice) && voice.poll() {
+            last_input = Instant::now();
+            if blanked {
+                blanked = false;
+                d.dpms(true);
+            }
+            redraw = true;
+        }
+
         // blink toggle — repaint only the cursor's row
         if last_blink.elapsed() > Duration::from_millis(500) {
             blink_on = !blink_on;
@@ -1501,6 +1671,10 @@ fn main() {
                     } else {
                         r.photos_list(buf, p, &lg);
                     }
+                }
+                Mode::Voice => {
+                    // voice() full-covers the canvas
+                    r.voice(buf, &voice, &lg);
                 }
                 Mode::Running(_) => {
                     r.terminal(buf, &term, area_top, area_bottom(kb_visible) - area_top, scale, blink_on, lg.m);

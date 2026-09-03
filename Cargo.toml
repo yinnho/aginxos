@@ -15,6 +15,7 @@ members = [
     "crates/agsecret",
     "crates/agupd",
     "crates/aterm",
+    "crates/voiced",
     "crates/wifi-wizard",
     "crates/testkit",
 ]

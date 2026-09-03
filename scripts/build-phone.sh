@@ -34,7 +34,7 @@ build_musl() {
 
 pkgs=()
 case "${CRATE}" in
-  all) pkgs=(ag aginxos-probe aginxos-agent aginxos-init agdl agsvc agpkg agdone agsecret agupd aterm wifi-wizard) ;;
+  all) pkgs=(ag aginxos-probe aginxos-agent aginxos-init agdl agsvc agpkg agdone agsecret agupd aterm voiced wifi-wizard) ;;
   ag|router) pkgs=(ag) ;;
   probe|aginxos-probe) pkgs=(aginxos-probe) ;;
   agent|aginxos-agent) pkgs=(aginxos-agent) ;;
@@ -46,6 +46,7 @@ case "${CRATE}" in
   agsecret|secret) pkgs=(agsecret) ;;
   agupd) pkgs=(agupd) ;;
   aterm) pkgs=(aterm) ;;
+  voiced) pkgs=(voiced) ;;
   wifi-wizard) pkgs=(wifi-wizard) ;;
   *) echo "unknown crate: ${CRATE}" >&2; exit 1 ;;
 esac

@@ -31,6 +31,10 @@ pub struct Entry {
     /// "PHOTOS" tile: opens the M39 photo viewer (Mode::Photos) instead
     /// of spawning. Same non-terminal pattern as the picker.
     pub photos: bool,
+    /// "VOICE" tile: opens the M42a voice dialog face (Mode::Voice) —
+    /// the product's primary input modality. Pure aterm state; content
+    /// comes from polling /run/voice/face (written by the voiced daemon).
+    pub voice: bool,
 }
 
 /// Registry apps first (alphabetical by id), then the system actions.
@@ -52,6 +56,7 @@ fn app_entry(a: AppEntry) -> Entry {
         scale: a.scale,
         picker: false,
         photos: false,
+        voice: false,
     }
 }
 
@@ -65,10 +70,12 @@ fn builtins() -> Vec<Entry> {
         scale: 5,
         picker: true,
         photos: false,
+        voice: false,
     }];
     v.extend(
         [
-            ("PHOTOS", "", &[][..], 5usize),
+            ("VOICE", "", &[][..], 5usize),
+            ("PHOTOS", "", &[][..], 5),
             ("SH", BIN_SH, &[][..], 5),
             ("WIFI SETUP", BIN_WIZARD, &[][..], 5),
             ("RESTART", BIN_REBOOT2, &["reboot"][..], 5),
@@ -79,16 +86,18 @@ fn builtins() -> Vec<Entry> {
             label: label.into(),
             bin: bin.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
-            // the photo viewer is pure aterm state — always available; sh
-            // and reboot2 ship in the base image; the wizard is a rootfs
-            // binary that always exists post-M5
-            avail: label == "PHOTOS"
+            // the voice face and the photo viewer are pure aterm state —
+            // always available; sh and reboot2 ship in the base image; the
+            // wizard is a rootfs binary that always exists post-M5
+            avail: label == "VOICE"
+                || label == "PHOTOS"
                 || bin == BIN_SH
                 || bin == BIN_REBOOT2
                 || std::path::Path::new(bin).is_file(),
             scale,
             picker: false,
             photos: label == "PHOTOS",
+            voice: label == "VOICE",
         })
         .collect::<Vec<_>>(),
     );

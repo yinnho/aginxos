@@ -232,6 +232,10 @@ cp -R "${RECIPE}/usr/bin/." "${TREE}/usr/bin/"
 cp "${TARGET}/agdl" "${TREE}/usr/bin/agdl"
 # aterm (M11) — the on-device terminal UI: launcher + pty shell on the panel.
 cp "${TARGET}/aterm" "${TREE}/usr/bin/aterm"
+# voiced (M42a) — the voice dialog daemon: closed-vocabulary deterministic
+# protocol (no LLM needed to get on Wi-Fi), PTT on volume-down, brain
+# ASR/TTS, and the sole writer of /run/voice/face which aterm renders.
+cp "${TARGET}/voiced" "${TREE}/usr/bin/voiced"
 # CJK font subset (M38a) — aterm cjk.rs rasterizes through ab_glyph;
 # GB2312 full + ASCII + punct rows, ~1.5MB (scripts/subset-cjk-font.sh).
 cp -R "${RECIPE}/usr/share/fonts" "${TREE}/usr/share/fonts"
@@ -296,6 +300,7 @@ chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/camera-bringup" "${TREE}/etc/init.d/cell-bringup" \
   "${TREE}/etc/init.d/state-restore" \
   "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdone" "${TREE}/usr/bin/agdl" "${TREE}/usr/bin/aterm" \
+  "${TREE}/usr/bin/voiced" \
   "${TREE}/usr/bin/wifi-wizard" "${TREE}/usr/bin/agsvc" \
   "${TREE}/usr/bin/agctl" "${TREE}/usr/bin/agboot-ok" \
   "${TREE}/usr/bin/agupd" \

@@ -1,0 +1,15 @@
+# voiced (M42a) — the voice dialog daemon: product definition 2026-09-04,
+# the phone's primary input is voice (PTT = hold volume-down) and the
+# screen is a display. Closed-vocabulary deterministic protocol — Wi-Fi
+# must connect before any LLM exists. Owns /run/voice/face (aterm renders
+# it); spawns snd-cap/snd-play for ears and mouth. Reads the brain key
+# from the plain env file like the aginx unit (sidecar policy keeps
+# brain.primary for /var/bin/aginx-carrier only — this is the same
+# runtime-secret tier). No notify protocol, no svc socket: type = simple.
+[unit]
+name = voiced
+
+[service]
+cmd = /usr/bin/voiced
+type = simple
+env_file = /etc/aginx/env
