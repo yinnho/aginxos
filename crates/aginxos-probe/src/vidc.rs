@@ -7,6 +7,8 @@
 //!   vidc decode <in.h264> <out> [n] [heapmask]
 //!                                      — decode n frames (default 3),
 //!                                        dumps <out>.<i>.p0/.p1 planes
+//!   vidc enc <in.yuv> <out.h264> <w> <h> [frames] [heapmask]
+//!                                      — encode raw yuv420p frames to H264
 //!
 //! Two ABI facts measured on this kernel (android-msm-redbull-4.19, see the
 //! `sizes` sweep): sizeof(struct v4l2_format) is 208 (vendor +4 vs mainline)
@@ -44,6 +46,11 @@ const VIDIOC_STREAMOFF: u32 = ioc(1, b'V', 19, 4);
 // SUBSCRIBE_EVENT 0x4020565a (32B), DQEVENT 0x80885659 (136B)
 const VIDIOC_SUBSCRIBE_EVENT: u32 = ioc(1, b'V', 90, 32);
 const VIDIOC_DQEVENT: u32 = ioc(2, b'V', 91, 136);
+/// _IOWR('V', 96, struct v4l2_decoder_cmd) — 4.19 layout is cmd+flags+ a
+/// 64-byte union = 72 B. This driver shares the STOP branch between dec and
+/// enc (msm_comm's switch: "This case also for V4L2_ENC_CMD_STOP"), and the
+/// encoder's only EOS door is this ioctl (no V4L2_BUF_FLAG_LAST path).
+const VIDIOC_DECODER_CMD: u32 = ioc(3, b'V', 96, 72);
 const EVENT_SOURCE_CHANGE: u32 = 5;
 
 // ION uapi per redbull drivers/staging/android/uapi/ion.h (Qualcomm
@@ -64,6 +71,14 @@ const MEMORY_USERPTR: u32 = 2;
 const MSM_VIDC_BUFFER_FD: usize = 0;
 const MSM_VIDC_DATA_OFFSET: usize = 1;
 const TS_COPY: u32 = 1; // V4L2_BUF_FLAG_TIMESTAMP_COPY
+/// Vendor extensions (this kernel's uapi videodev2.h — NOT upstream values):
+/// EOS 0x02000000 would collide with upstream TSTAMP_SRC bits, so pinning
+/// each explicitly. First device run with 0x2000 (upstream monotonic ts bit)
+/// never saw EOS and drained on poll-timeout instead.
+const V4L2_BUF_FLAG_EOS: u32 = 0x0200_0000;
+const V4L2_BUF_FLAG_KEYFRAME: u32 = 0x0000_0008;
+const V4L2_BUF_FLAG_CODECCONFIG: u32 = 0x0002_0000;
+const V4L2_DEC_CMD_STOP: u32 = 1;
 
 const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
@@ -665,6 +680,10 @@ fn contains_slice(chunk: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 
 fn find_m2m_node() -> Result<String, String> {
+    find_vidc_node("msm_vidc_vdec", "decoder")
+}
+
+fn find_vidc_node(card: &str, what: &str) -> Result<String, String> {
     for n in 0..64u32 {
         let path = format!("/dev/video{n}");
         if fs::metadata(&path).is_err() {
@@ -683,12 +702,12 @@ fn find_m2m_node() -> Result<String, String> {
         if ioctl(f.as_raw_fd(), VIDIOC_QUERYCAP, &mut cap) < 0 {
             continue;
         }
-        if cstr(&cap.card) != "msm_vidc_vdec" {
+        if cstr(&cap.card) != card {
             continue;
         }
         return Ok(path);
     }
-    Err("no msm_vidc_vdec device found".into())
+    Err(format!("no msm_vidc {what} device found"))
 }
 
 pub fn decode(
@@ -1176,6 +1195,505 @@ pub fn decode(
     }
 
     eprintln!("decoded {frames_done} frames -> {out_prefix}.*");
+    let mut off: i32 = TYPE_CAPTURE_MPLANE as i32;
+    let _ = ioctl(fd, VIDIOC_STREAMOFF, &mut off);
+    let mut off: i32 = TYPE_OUTPUT_MPLANE as i32;
+    let _ = ioctl(fd, VIDIOC_STREAMOFF, &mut off);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// encode (ION + DMABUF) — M41b: raw yuv420p in, H264 bitstream out
+// ---------------------------------------------------------------------------
+
+/// v4l2_decoder_cmd, 4.19 layout: cmd, flags, then a 64-byte union we treat
+/// as an opaque array (the STOP variant only reads nothing extra from it).
+#[repr(C)]
+struct V4l2DecoderCmd {
+    cmd: u32,
+    flags: u32,
+    raw: [u32; 16],
+}
+
+/// Convert one yuv420p frame (Y then U then V planar, w×h each/4) into the
+/// venus linear NV12 layout: Y at `stride` pitch for `scanlines` rows, UV
+/// interleaved (U,V byte pairs) at `stride * scanlines`. Padding stays zeroed
+/// so the untouched alignment gap is deterministic.
+fn fill_venus_nv12(
+    dst: &mut [u8],
+    stride: usize,
+    scanlines: usize,
+    w: usize,
+    h: usize,
+    src: &[u8],
+) -> Result<(), String> {
+    let y_sz = w * h;
+    let c_sz = w * h / 4;
+    if src.len() < y_sz + 2 * c_sz {
+        return Err(format!("yuv frame too short: {} B", src.len()));
+    }
+    let uv_off = stride * scanlines;
+    if uv_off + stride * (h.div_ceil(2)) > dst.len() {
+        return Err(format!(
+            "venus layout exceeds buffer: need {} have {}",
+            uv_off + stride * (h.div_ceil(2)),
+            dst.len()
+        ));
+    }
+    for row in 0..h {
+        let s = row * w;
+        dst[row * stride..row * stride + w].copy_from_slice(&src[s..s + w]);
+    }
+    let (u_off, v_off) = (y_sz, y_sz + c_sz);
+    for row in 0..h / 2 {
+        let d = uv_off + row * stride;
+        for x in 0..w / 2 {
+            dst[d + 2 * x] = src[u_off + row * (w / 2) + x];
+            dst[d + 2 * x + 1] = src[v_off + row * (w / 2) + x];
+        }
+    }
+    Ok(())
+}
+
+pub fn encode(
+    yuv_path: &str,
+    out_path: &str,
+    w: usize,
+    h: usize,
+    want_frames: usize,
+    heap_mask: u32,
+) -> Result<(), String> {
+    let data = fs::read(yuv_path).map_err(|e| format!("read {yuv_path}: {e}"))?;
+    let yuv_frame = w * h * 3 / 2;
+    if data.len() < yuv_frame {
+        return Err(format!(
+            "{yuv_path}: {} B < one {}x{} yuv420p frame ({yuv_frame} B)",
+            data.len(),
+            w,
+            h
+        ));
+    }
+    let n_frames = (data.len() / yuv_frame).min(want_frames.max(1));
+    println!(
+        "input: {} bytes, {n_frames} yuv420p frames of {w}x{h} (encoding all)",
+        data.len()
+    );
+    let node = find_vidc_node("msm_vidc_venc", "encoder")?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&node)
+        .map_err(|e| format!("open {node}: {e}"))?;
+    let fd = file.as_raw_fd();
+    println!("device: {node}");
+
+    // CAPTURE first (bitstream port): the encoder's session-open + default
+    // profile (H264 -> HIGH) hook runs on this port's S_FMT in msm_venc.c.
+    let mut cap_fmt = PixFormatMplane {
+        width: w as u32,
+        height: h as u32,
+        pixelformat: FMT_H264,
+        field: 0,
+        colorspace: 0,
+        plane_fmt: [PlanePixFormat {
+            sizeimage: 512 * 1024,
+            bytesperline: 0,
+            reserved: [0; 6],
+        }; 8],
+        num_planes: 1,
+        flags: 0,
+        ycbcr_enc: 0,
+        quantization: 0,
+        xfer_func: 0,
+        reserved: [0; 7],
+    };
+    fmt_ioctl(fd, VIDIOC_S_FMT, TYPE_CAPTURE_MPLANE, &mut cap_fmt)?;
+    let (cw, ch, cfmt) = (cap_fmt.width, cap_fmt.height, cap_fmt.pixelformat);
+    let cap_planes = (cap_fmt.num_planes as usize).clamp(1, 4);
+    let bitstream_len = cap_fmt.plane_fmt[0].sizeimage as usize;
+    eprintln!(
+        "CAPTURE fmt: {cw}x{ch} {} planes={cap_planes} sizeimage={bitstream_len}",
+        fourcc_str(cfmt)
+    );
+
+    // OUTPUT (raw NV12 in): the S_FMT copy-back is authoritative for the
+    // venus geometry — bytesperline = VENUS_Y_STRIDE, reserved[0] (u16) =
+    // VENUS_Y_SCANLINES (the driver stores the u32 into the __u16 field;
+    // real heights fit).
+    let mut out_fmt = PixFormatMplane {
+        width: w as u32,
+        height: h as u32,
+        pixelformat: FMT_NV12,
+        field: 0,
+        colorspace: 0,
+        plane_fmt: [PlanePixFormat {
+            sizeimage: 0,
+            bytesperline: 0,
+            reserved: [0; 6],
+        }; 8],
+        num_planes: 1,
+        flags: 0,
+        ycbcr_enc: 0,
+        quantization: 0,
+        xfer_func: 0,
+        reserved: [0; 7],
+    };
+    fmt_ioctl(fd, VIDIOC_S_FMT, TYPE_OUTPUT_MPLANE, &mut out_fmt)?;
+    let (ow, oh, ofmt) = (out_fmt.width, out_fmt.height, out_fmt.pixelformat);
+    let out_planes = (out_fmt.num_planes as usize).clamp(1, 4);
+    let stride = out_fmt.plane_fmt[0].bytesperline as usize;
+    let scanlines = out_fmt.plane_fmt[0].reserved[0] as usize;
+    let yuv_len = out_fmt.plane_fmt[0].sizeimage as usize;
+    eprintln!(
+        "OUTPUT fmt: {ow}x{oh} {} planes={out_planes} sizeimage={yuv_len} stride={stride} scanlines={scanlines} (uv_off={})",
+        fourcc_str(ofmt),
+        stride * scanlines
+    );
+    if stride == 0 || scanlines == 0 {
+        return Err("driver reported zero stride/scanlines".into());
+    }
+
+    // same event set as decode: the private block narrates fw faults; the
+    // encoder's drain signal is instead V4L2_BUF_FLAG_EOS on a CAPTURE buffer
+    const EVENT_PRIVATE_START: u32 = 0x0700_0000;
+    const MSM_VIDC_EVENT_BASE: u32 = EVENT_PRIVATE_START + 0x1000;
+    let sub_types: Vec<(u32, &str)> = vec![
+        (EVENT_SOURCE_CHANGE, "SOURCE_CHANGE"),
+        (1, "EOS"),
+        (MSM_VIDC_EVENT_BASE + 1, "FLUSH_DONE"),
+        (MSM_VIDC_EVENT_BASE + 5, "SYS_ERROR"),
+        (MSM_VIDC_EVENT_BASE + 8, "HW_OVERLOAD"),
+        (MSM_VIDC_EVENT_BASE + 9, "MAX_CLIENTS"),
+    ];
+    for (ty, name) in &sub_types {
+        let mut sub = V4l2EventSubscription {
+            ty: *ty,
+            id: 0,
+            flags: 0,
+            reserved: [0; 5],
+        };
+        if ioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &mut sub) < 0 {
+            eprintln!("SUBSCRIBE_EVENT({name}) errno={}", errno());
+        }
+    }
+
+    // INPUT min_host = 4 (raw frames), CAPTURE min_host = 5 (bitstream);
+    // queue_setup only warns below min, but honor it anyway.
+    const NBUF_IN: usize = 4;
+    const NBUF_CAP: usize = 6;
+    let out_lens: [usize; 2] = [
+        align4k(yuv_len),
+        if out_planes > 1 {
+            align4k(out_fmt.plane_fmt[1].sizeimage.max(4096) as usize)
+        } else {
+            0
+        },
+    ];
+    let cap_len = align4k(bitstream_len.max(4096));
+    let mut out_bufs = Vec::new();
+    for i in 0..NBUF_IN {
+        out_bufs.push(IonBuf::alloc(out_lens[0], heap_mask).map_err(|e| format!("raw buf {i}: {e}"))?);
+    }
+    let mut cap_bufs = Vec::new();
+    for i in 0..NBUF_CAP {
+        cap_bufs.push(IonBuf::alloc(cap_len, heap_mask).map_err(|e| format!("bs buf {i}: {e}"))?);
+    }
+    eprintln!(
+        "ION: {nbuf_in} raw ({} B) + {nbuf_cap} bitstream ({cap_len} B), heap_mask={heap_mask:#x}",
+        out_lens[0],
+        nbuf_in = NBUF_IN,
+        nbuf_cap = NBUF_CAP,
+    );
+
+    let mut rb = V4l2Requestbuffers {
+        count: NBUF_IN as u32,
+        ty: TYPE_OUTPUT_MPLANE,
+        memory: MEMORY_USERPTR,
+        capabilities: 0,
+        flags: 0,
+        reserved: [0; 3],
+    };
+    if ioctl(fd, VIDIOC_REQBUFS, &mut rb) < 0 {
+        return Err(format!(
+            "REQBUFS(output) errno={} ({})",
+            errno(),
+            std::io::Error::from_raw_os_error(errno())
+        ));
+    }
+    let mut rb = V4l2Requestbuffers {
+        count: NBUF_CAP as u32,
+        ty: TYPE_CAPTURE_MPLANE,
+        memory: MEMORY_USERPTR,
+        capabilities: 0,
+        flags: 0,
+        reserved: [0; 3],
+    };
+    if ioctl(fd, VIDIOC_REQBUFS, &mut rb) < 0 {
+        return Err(format!(
+            "REQBUFS(capture) errno={} ({})",
+            errno(),
+            std::io::Error::from_raw_os_error(errno())
+        ));
+    }
+
+    // pre-queue every bitstream buffer
+    for i in 0..NBUF_CAP {
+        let ib = &cap_bufs[i];
+        let planes = (0..cap_planes)
+            .map(|_| qbuf_plane(ib.fd, ib.ptr, cap_len, 0))
+            .collect();
+        let mut b = mk_buffer(TYPE_CAPTURE_MPLANE, MEMORY_USERPTR, planes);
+        b.index = i as u32;
+        if ioctl(fd, VIDIOC_QBUF, &mut b) < 0 {
+            return Err(format!(
+                "QBUF(cap {i}) errno={} ({})",
+                errno(),
+                std::io::Error::from_raw_os_error(errno())
+            ));
+        }
+    }
+
+    let mut outfile = fs::File::create(out_path).map_err(|e| format!("create {out_path}: {e}"))?;
+
+    // feed raw frames into free OUTPUT buffers (pre-STREAMON ones ride the
+    // same deferred flush the decoder uses — msm_comm_qbufs at START_DONE)
+    let mut free_in: Vec<u32> = (0..NBUF_IN as u32).collect();
+    let mut next_frame = 0usize;
+    let mut fed = 0usize;
+    let mut stop_sent = false;
+    let mut chunks = 0usize;
+    let mut total_bytes = 0usize;
+    let mut first_chunk_flags = String::new();
+
+    while let Some(bi) = free_in.pop() {
+        if next_frame >= n_frames {
+            break;
+        }
+        let b = unsafe {
+            std::slice::from_raw_parts_mut(out_bufs[bi as usize].ptr, out_lens[0])
+        };
+        unsafe { libc::memset(b.as_mut_ptr() as *mut libc::c_void, 0, out_lens[0]) };
+        fill_venus_nv12(
+            b,
+            stride,
+            scanlines,
+            w,
+            h,
+            &data[next_frame * yuv_frame..(next_frame + 1) * yuv_frame],
+        )?;
+        let planes = if out_planes > 1 {
+            vec![
+                qbuf_plane(out_bufs[bi as usize].fd, out_bufs[bi as usize].ptr, out_lens[0], 0),
+                qbuf_plane(out_bufs[bi as usize].fd, out_bufs[bi as usize].ptr, out_lens[1], 0),
+            ]
+        } else {
+            vec![qbuf_plane(
+                out_bufs[bi as usize].fd,
+                out_bufs[bi as usize].ptr,
+                out_lens[0],
+                0,
+            )]
+        };
+        let mut vbuf = mk_buffer(TYPE_OUTPUT_MPLANE, MEMORY_USERPTR, planes);
+        vbuf.index = bi;
+        vbuf.timestamp = Timeval {
+            tv_sec: 0,
+            tv_usec: (next_frame as i64) * 33_333,
+        };
+        if ioctl(fd, VIDIOC_QBUF, &mut vbuf) < 0 {
+            return Err(format!(
+                "QBUF(in {bi}, frame {next_frame}) errno={} ({})",
+                errno(),
+                std::io::Error::from_raw_os_error(errno())
+            ));
+        }
+        next_frame += 1;
+        fed += 1;
+    }
+    eprintln!("pre-fed {fed} raw frames (deferred until streamon)");
+
+    let mut on = TYPE_OUTPUT_MPLANE as i32;
+    if ioctl(fd, VIDIOC_STREAMON, &mut on) < 0 {
+        return Err(format!("STREAMON(output) errno={} ({})", errno(), std::io::Error::from_raw_os_error(errno())));
+    }
+    let mut on = TYPE_CAPTURE_MPLANE as i32;
+    if ioctl(fd, VIDIOC_STREAMON, &mut on) < 0 {
+        return Err(format!("STREAMON(capture) errno={} ({})", errno(), std::io::Error::from_raw_os_error(errno())));
+    }
+    eprintln!("both ports streaming");
+
+    'outer: loop {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLOUT | libc::POLLPRI,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 15_000) };
+        if rc == 0 {
+            eprintln!("poll timeout after {chunks} chunks ({total_bytes} B)");
+            break;
+        }
+        if rc < 0 {
+            return Err(format!("poll errno={}", errno()));
+        }
+
+        if pfd.revents & libc::POLLPRI != 0 {
+            loop {
+                let mut ev = V4l2EventRaw { data: [0; 136] };
+                if ioctl(fd, VIDIOC_DQEVENT, &mut ev) < 0 {
+                    break;
+                }
+                let ty = u32::from_ne_bytes(ev.data[0..4].try_into().unwrap());
+                let changes = u32::from_ne_bytes(ev.data[4..8].try_into().unwrap());
+                let name = sub_types
+                    .iter()
+                    .find(|(t, _)| *t == ty)
+                    .map(|(_, n)| *n)
+                    .unwrap_or("UNKNOWN");
+                eprintln!("EVENT {name} (ty={ty:#x}) changes={changes:#x}");
+            }
+        }
+
+        // INPUT completion (raw frame consumed) → recycle to feed more, or
+        // send the STOP drain once the input is exhausted
+        let mut b = mk_buffer(
+            TYPE_OUTPUT_MPLANE,
+            MEMORY_USERPTR,
+            vec![qbuf_plane(0, std::ptr::null_mut(), out_lens[0], 0)],
+        );
+        if ioctl(fd, VIDIOC_DQBUF, &mut b) == 0 {
+            eprintln!(
+                "EBD idx={} frame consumed flags={:#x}",
+                b.index, b.flags
+            );
+            if next_frame < n_frames {
+                let ib = &out_bufs[b.index as usize];
+                let dst = unsafe { std::slice::from_raw_parts_mut(ib.ptr, out_lens[0]) };
+                unsafe { libc::memset(dst.as_mut_ptr() as *mut libc::c_void, 0, out_lens[0]) };
+                fill_venus_nv12(
+                    dst,
+                    stride,
+                    scanlines,
+                    w,
+                    h,
+                    &data[next_frame * yuv_frame..(next_frame + 1) * yuv_frame],
+                )?;
+                let planes = if out_planes > 1 {
+                    vec![
+                        qbuf_plane(ib.fd, ib.ptr, out_lens[0], 0),
+                        qbuf_plane(ib.fd, ib.ptr, out_lens[1], 0),
+                    ]
+                } else {
+                    vec![qbuf_plane(ib.fd, ib.ptr, out_lens[0], 0)]
+                };
+                let mut vbuf = mk_buffer(TYPE_OUTPUT_MPLANE, MEMORY_USERPTR, planes);
+                vbuf.index = b.index;
+                vbuf.timestamp = Timeval {
+                    tv_sec: 0,
+                    tv_usec: (next_frame as i64) * 33_333,
+                };
+                if ioctl(fd, VIDIOC_QBUF, &mut vbuf) < 0 {
+                    return Err(format!("reQBUF(in {}) errno={}", b.index, errno()));
+                }
+                next_frame += 1;
+                fed += 1;
+            } else if !stop_sent {
+                // drain: the driver allocates its own internal EOS buffer and
+                // queues it to the fw (state must already be START_DONE)
+                let mut dcmd = V4l2DecoderCmd {
+                    cmd: V4L2_DEC_CMD_STOP,
+                    flags: 0,
+                    raw: [0; 16],
+                };
+                if ioctl(fd, VIDIOC_DECODER_CMD, &mut dcmd) < 0 {
+                    return Err(format!(
+                        "DECODER_CMD(STOP) errno={} ({})",
+                        errno(),
+                        std::io::Error::from_raw_os_error(errno())
+                    ));
+                }
+                stop_sent = true;
+                eprintln!("all {fed} frames fed — drain requested");
+            }
+            continue;
+        }
+
+        // CAPTURE completion (bitstream chunk)
+        let mut b = mk_buffer(
+            TYPE_CAPTURE_MPLANE,
+            MEMORY_USERPTR,
+            (0..cap_planes)
+                .map(|_| qbuf_plane(0, std::ptr::null_mut(), cap_len, 0))
+                .collect(),
+        );
+        if ioctl(fd, VIDIOC_DQBUF, &mut b) < 0 {
+            let e = errno();
+            if e == libc::EAGAIN {
+                continue;
+            }
+            return Err(format!("DQBUF errno={e}"));
+        }
+        let pls: Vec<V4l2Plane> = unsafe {
+            std::slice::from_raw_parts(b.m as *const V4l2Plane, b.length as usize).to_vec()
+        };
+        let pl = pls.first().copied().unwrap_or_else(|| qbuf_plane(0, std::ptr::null_mut(), 0, 0));
+        let n = pl.bytesused as usize;
+        if n > 0 {
+            let start = unsafe { cap_bufs[b.index as usize].ptr.add(pl.data_offset as usize) };
+            let chunk = unsafe { std::slice::from_raw_parts(start, n) };
+            outfile
+                .write_all(chunk)
+                .map_err(|e| format!("write {out_path}: {e}"))?;
+            total_bytes += n;
+        }
+        let flag_str = {
+            let mut s = String::new();
+            if b.flags & V4L2_BUF_FLAG_KEYFRAME != 0 {
+                s.push_str(" KEY");
+            }
+            if b.flags & V4L2_BUF_FLAG_CODECCONFIG != 0 {
+                s.push_str(" CONFIG");
+            }
+            if b.flags & V4L2_BUF_FLAG_EOS != 0 {
+                s.push_str(" EOS");
+            }
+            s
+        };
+        if chunks < 4 || b.flags & V4L2_BUF_FLAG_EOS != 0 {
+            eprintln!(
+                "chunk#{} buf={} seq={} bytes={n} flags={:#x}{}",
+                chunks, b.index, b.sequence, b.flags, flag_str
+            );
+        }
+        if chunks == 0 {
+            first_chunk_flags = flag_str.clone();
+        }
+        chunks += 1;
+
+        // requeue the bitstream buffer
+        let ib = &cap_bufs[b.index as usize];
+        let planes = (0..cap_planes)
+            .map(|_| qbuf_plane(ib.fd, ib.ptr, cap_len, 0))
+            .collect();
+        let mut vbuf = mk_buffer(TYPE_CAPTURE_MPLANE, MEMORY_USERPTR, planes);
+        vbuf.index = b.index;
+        if ioctl(fd, VIDIOC_QBUF, &mut vbuf) < 0 {
+            return Err(format!("reQBUF(cap {}) errno={}", b.index, errno()));
+        }
+
+        // HAL_BUFFERFLAG_EOS rides the last bitstream buffer — drain complete
+        if b.flags & V4L2_BUF_FLAG_EOS != 0 {
+            eprintln!("EOS flag seen — encode complete");
+            break 'outer;
+        }
+    }
+
+    let _ = outfile.flush();
+    println!(
+        "encoded {fed} frames -> {out_path} ({total_bytes} B, {chunks} chunks, first{})",
+        if first_chunk_flags.is_empty() { String::new() } else { format!(" chunk{first_chunk_flags}") }
+    );
     let mut off: i32 = TYPE_CAPTURE_MPLANE as i32;
     let _ = ioctl(fd, VIDIOC_STREAMOFF, &mut off);
     let mut off: i32 = TYPE_OUTPUT_MPLANE as i32;
@@ -1973,6 +2491,28 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("usage: vidc caps | vidc sizes [node] | vidc ion | vidc decode <in.h264> <out> [n] [heapmask] | vidc show <in.h264> [hold] [heapmask] | vidc play <in.h264> <in.s16> [vol] [heapmask]".into()),
+        Some("enc") => {
+            let in_path = args.get(1).ok_or(
+                "usage: vidc enc <in.yuv> <out.h264> <w> <h> [frames] [heapmask]",
+            )?;
+            let out_path = args.get(2).ok_or(
+                "usage: vidc enc <in.yuv> <out.h264> <w> <h> [frames] [heapmask]",
+            )?;
+            let w: usize = args
+                .get(3)
+                .and_then(|s| s.parse().ok())
+                .ok_or("usage: vidc enc <in.yuv> <out.h264> <w> <h> [frames] [heapmask]")?;
+            let h: usize = args
+                .get(4)
+                .and_then(|s| s.parse().ok())
+                .ok_or("usage: vidc enc <in.yuv> <out.h264> <w> <h> [frames] [heapmask]")?;
+            let want = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+            let heap = args
+                .get(6)
+                .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(DEFAULT_ION_HEAP_MASK);
+            encode(in_path, out_path, w, h, want, heap)
+        }
+        _ => Err("usage: vidc caps | vidc sizes [node] | vidc ion | vidc decode <in.h264> <out> [n] [heapmask] | vidc show <in.h264> [hold] [heapmask] | vidc play <in.h264> <in.s16> [vol] [heapmask] | vidc enc <in.yuv> <out.h264> <w> <h> [frames] [heapmask]".into()),
     }
 }
