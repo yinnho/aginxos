@@ -327,6 +327,37 @@ impl AvAudio {
                             *s = v.clamp(-32768, 32767) as i16;
                         }
                     }
+                    // Speaker guard (observed 2026-09-03): the CS35L41 smart
+                    // amps run WITHOUT their protection firmware (no cs35l41
+                    // fw in /vendor/firmware, no ACDB HAL to calibrate it),
+                    // so drive is unbounded — loud or bass-heavy content
+                    // buzzes the speakers, worse the louder it gets (same
+                    // file clean on a Mac; beeps/TTS never triggered it).
+                    // Until the vendor protection chain is ported, music/
+                    // video through this path gets a one-pole 180 Hz
+                    // high-pass (excursion) plus a running peak limiter at
+                    // ~-4 dBFS (peaks), applied after the volume knob.
+                    let hp_a = (-2.0 * std::f32::consts::PI * 180.0 / player.rate as f32).exp();
+                    let mut hp_x = vec![0.0f32; chans];
+                    let mut hp_y = vec![0.0f32; chans];
+                    let mut env = 0.0f32;
+                    let mut g = 1.0f32;
+                    const CEIL: f32 = 20_300.0; // ≈ -4.2 dBFS
+                    for (i, s) in scaled.iter_mut().enumerate() {
+                        let c = i % chans;
+                        let x = *s as f32;
+                        let y = x - hp_x[c] + hp_a * hp_y[c];
+                        hp_x[c] = x;
+                        hp_y[c] = y;
+                        env = env.max(y.abs()) * 0.999_92;
+                        let target = (CEIL / env.max(1.0)).min(1.0);
+                        g = if target < g {
+                            target // attack: pull down immediately
+                        } else {
+                            g + (target - g) * 0.000_2 // release: ease back up
+                        };
+                        *s = (y * g).clamp(-32768.0, 32767.0) as i16;
+                    }
                     let mut off = 0usize;
                     while !stop.load(Ordering::SeqCst) && off < scaled.len() {
                         let end = (off + period * chans).min(scaled.len());
@@ -383,10 +414,19 @@ impl AvAudio {
 
     /// Block until the audio clock reaches `pts_us` (minus a small submit
     /// lead so the vblank-timed SETPLANE lands on the audio instant).
+    /// After the feeder drains, the sample counter freezes at the audio
+    /// end — a pts past it (video one frame longer than the audio track;
+    /// observed as a permanent hang on a 45.25 s track vs 45.27 s video)
+    /// would spin forever. Both clocks tick 1x from the same origin, so
+    /// the tail paces on the wall clock anchored at feeder start instead.
     pub fn wait_until(&self, pts_us: i64) {
         const LEAD_US: i64 = 4_000;
         loop {
-            let now = self.played_us();
+            let now = if self.done.load(Ordering::SeqCst) {
+                self.start_at.elapsed().as_micros() as i64
+            } else {
+                self.played_us()
+            };
             if now + LEAD_US >= pts_us {
                 return;
             }

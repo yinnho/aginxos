@@ -717,6 +717,9 @@ pub fn decode(
     heap_mask: u32,
     disp: Option<&mut DrmDisplay>,
     av: Option<&mut crate::snd::AvAudio>,
+    hint_w: u32,
+    hint_h: u32,
+    frame_us: i64,
 ) -> Result<(), String> {
     let mut disp = disp;
     let mut av = av;
@@ -743,10 +746,13 @@ pub fn decode(
     let fd = file.as_raw_fd();
     println!("device: {node}");
 
-    // OUTPUT: H264 bitstream
+    // OUTPUT: H264 bitstream. w/h is only a session hint — this probe does
+    // not parse the SPS; the hint must be >= the real stream geometry so
+    // the pre-parse CAPTURE allocation covers it (a smaller real stream
+    // inside a bigger allocation is fine; bigger real than hint truncates).
     let mut out_fmt = PixFormatMplane {
-        width: 320,
-        height: 240,
+        width: hint_w,
+        height: hint_h,
         pixelformat: FMT_H264,
         field: 0,
         colorspace: 0,
@@ -775,8 +781,8 @@ pub fn decode(
     // exists after the firmware parses SPS/PPS, reported as a SOURCE_CHANGE
     // event, then read back with G_FMT.
     let mut cap_fmt = PixFormatMplane {
-        width: 320,
-        height: 240,
+        width: hint_w,
+        height: hint_h,
         pixelformat: FMT_NV12,
         field: 0,
         colorspace: 0,
@@ -944,6 +950,9 @@ pub fn decode(
     let mut pending_feed = true;
     let mut ts: i64 = 0;
     let mut frames_done = 0usize;
+    // one-frame hold: the buffer just SETPLANE'd is being scanned by the DPU
+    // until the NEXT flip latches — it must not go back to the fw before that
+    let mut held: Option<u32> = None;
     feed_aus(
         fd,
         &mut free_out,
@@ -1137,7 +1146,7 @@ pub fn decode(
             if clocked {
                 if let Some(clk) = av.as_deref_mut() {
                     let n = frames_done - 1;
-                    let pts = (n as i64 + au0_config_only as i64) * 33_333;
+                    let pts = (n as i64 + au0_config_only as i64) * frame_us;
                     clk.wait_until(pts);
                     if n % 300 == 0 {
                         let now = clk.played_us();
@@ -1179,15 +1188,31 @@ pub fn decode(
             }
         }
 
-        // requeue the capture buffer
-        let ib = &cap_bufs[b.index as usize];
-        let planes = (0..cap_planes)
-            .map(|p| qbuf_plane(ib.fd, ib.ptr, cap_lens[p.min(1)], 0))
-            .collect();
-        let mut vbuf = mk_buffer(TYPE_CAPTURE_MPLANE, MEMORY_USERPTR, planes);
-        vbuf.index = b.index;
-        if ioctl(fd, VIDIOC_QBUF, &mut vbuf) < 0 {
-            return Err(format!("reQBUF(cap {}) errno={}", b.index, errno()));
+        // requeue the capture buffer — except the one on screen. File-dump
+        // runs (no display) requeue immediately; with a display the shown
+        // buffer stays held until the NEXT flip has latched (WAIT_VBLANK
+        // after this SETPLANE) and the PREVIOUS one goes back instead —
+        // requeueing the shown one let venus rewrite it mid-scan (the
+        // tearing seen on real content). STREAMOFF reclaims whatever is
+        // still held at the end.
+        let release = if disp.is_some() {
+            if let Some(d) = disp.as_deref_mut() {
+                d.wait_vblank();
+            }
+            held.replace(b.index)
+        } else {
+            Some(b.index)
+        };
+        if let Some(ri) = release {
+            let ib = &cap_bufs[ri as usize];
+            let planes = (0..cap_planes)
+                .map(|p| qbuf_plane(ib.fd, ib.ptr, cap_lens[p.min(1)], 0))
+                .collect();
+            let mut vbuf = mk_buffer(TYPE_CAPTURE_MPLANE, MEMORY_USERPTR, planes);
+            vbuf.index = ri;
+            if ioctl(fd, VIDIOC_QBUF, &mut vbuf) < 0 {
+                return Err(format!("reQBUF(cap {ri}) errno={}", errno()));
+            }
         }
         if frames_done >= want_frames {
             break 'outer;
@@ -1925,6 +1950,11 @@ pub struct DrmDisplay {
     zpos_prop: u32, // 0 = no zpos prop found
     mode_w: u32,
     mode_h: u32,
+    /// CRTC index in the card resource list — the vblank pipe selector.
+    pipe: u32,
+    /// WAIT_VBLANK still works (first refusal flips this off; the
+    /// one-frame hold alone then bounds the tear to flip latency).
+    vblank_ok: bool,
     /// GEM handle + FB per capture buffer index (lazily imported).
     gem: [u32; 4],
     fb: [u32; 4],
@@ -2312,6 +2342,8 @@ impl DrmDisplay {
             zpos_prop,
             mode_w,
             mode_h,
+            pipe: crtc_idx,
+            vblank_ok: true,
             gem: [0; 4],
             fb: [0; 4],
         })
@@ -2410,6 +2442,41 @@ impl DrmDisplay {
         let rc = ioctl(self.file.as_raw_fd(), DRM_IOCTL_MODE_SETPLANE, &mut sp);
         eprintln!("drm: plane off rc={rc}");
     }
+
+    /// Block until the next vblank on our CRTC — after a SETPLANE submit
+    /// this is when the new fb latches and the OLD one stops being scanned,
+    /// i.e. the release point for the one-frame hold. Best effort: the pipe
+    /// rides in the type flags (bits 30-31, only pipes 0-3 selectable); if
+    /// sde refuses the wait we disable it and fall back to hold-only, which
+    /// still bounds the tear window to flip latency.
+    fn wait_vblank(&mut self) {
+        if !self.vblank_ok {
+            return;
+        }
+        // union drm_wait_vblank: the reply arm is the largest member (24 B)
+        // — passing the 16 B request arm would smash the stack on copy-out
+        #[repr(C)]
+        struct WaitVblank {
+            ty: u32, // _DRM_VBLANK_RELATIVE(0) | (pipe & 3) << 30
+            sequence: u32,
+            tval_sec: i64,
+            tval_usec: i64,
+        }
+        const DRM_IOCTL_MODE_WAIT_VBLANK: u32 = ioc(3, b'd', 0x3a, 24);
+        let mut w = WaitVblank {
+            ty: (self.pipe & 3) << 30,
+            sequence: 0, // relative: next vblank
+            tval_sec: 0,
+            tval_usec: 0,
+        };
+        if ioctl(self.file.as_raw_fd(), DRM_IOCTL_MODE_WAIT_VBLANK, &mut w) < 0 {
+            self.vblank_ok = false;
+            eprintln!(
+                "drm: WAIT_VBLANK errno={} — disabled, hold-only (tear window = flip latency)",
+                errno()
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2444,19 +2511,21 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 .get(4)
                 .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(DEFAULT_ION_HEAP_MASK);
-            decode(in_path, out_prefix, want, heap, None, None)
+            decode(in_path, out_prefix, want, heap, None, None, 320, 240, 33_333)
         }
         Some("show") => {
             let in_path = args
                 .get(1)
-                .ok_or("usage: vidc show <in.h264> [hold_secs] [heapmask]")?;
+                .ok_or("usage: vidc show <in.h264> [hold_secs] [heapmask] [w h]")?;
             let hold: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
             let heap = args
                 .get(3)
                 .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(DEFAULT_ION_HEAP_MASK);
+            let w: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(320);
+            let h: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(240);
             let mut disp = Some(DrmDisplay::open()?);
-            decode(in_path, "", usize::MAX, heap, disp.as_mut(), None)?;
+            decode(in_path, "", usize::MAX, heap, disp.as_mut(), None, w, h, 33_333)?;
             if let Some(d) = disp.as_mut() {
                 eprintln!("holding plane for {hold}s...");
                 std::thread::sleep(std::time::Duration::from_secs(hold));
@@ -2471,18 +2540,22 @@ pub fn run(args: &[String]) -> Result<(), String> {
             // when the decoder's first frame is in hand.
             let in_path = args
                 .get(1)
-                .ok_or("usage: vidc play <in.h264> <in.s16> [vol] [heapmask]")?;
+                .ok_or("usage: vidc play <in.h264> <in.s16> [vol] [heapmask] [w h fps]")?;
             let pcm_path = args
                 .get(2)
-                .ok_or("usage: vidc play <in.h264> <in.s16> [vol] [heapmask]")?;
+                .ok_or("usage: vidc play <in.h264> <in.s16> [vol] [heapmask] [w h fps]")?;
             let vol: i32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(70);
             let heap = args
                 .get(4)
                 .and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                 .unwrap_or(DEFAULT_ION_HEAP_MASK);
+            let w: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(320);
+            let h: u32 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(240);
+            let fps: u32 = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(30);
+            let frame_us = 1_000_000 / fps as i64;
             let mut disp = Some(DrmDisplay::open()?);
             let mut av = crate::snd::AvAudio::new("/dev/snd/pcmC0D0p", 48_000, 2, pcm_path, vol)?;
-            decode(in_path, "", usize::MAX, heap, disp.as_mut(), Some(&mut av))?;
+            decode(in_path, "", usize::MAX, heap, disp.as_mut(), Some(&mut av), w, h, frame_us)?;
             // let the audio tail drain (feeder DRAINs at EOF), then tear
             // the plane down — the receipt window is the playing clip itself
             av.finish();

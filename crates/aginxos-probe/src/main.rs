@@ -31,7 +31,7 @@ fn main() {
                 std::process::exit(code);
             }
             other => {
-                eprintln!("unknown subcommand: {other} (try: vidc caps | vidc decode <in.h264> <out> [n] | vidc show <in.h264> | vidc play <in.h264> <in.s16> | vidc enc <in.yuv> <out.h264> <w> <h>)");
+                eprintln!("unknown subcommand: {other} (try: vidc caps | vidc decode <in.h264> <out> [n] | vidc show <in.h264> | vidc play <in.h264> <in.s16> [vol] [w h fps] | vidc enc <in.yuv> <out.h264> <w> <h>)");
                 std::process::exit(2);
             }
         }
