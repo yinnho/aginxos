@@ -648,7 +648,7 @@ impl<'a> Render<'a> {
         }
         // fresh boot, nothing said yet: the one big affordance
         if d.state == "idle" && d.lines.is_empty() && d.list.is_empty() {
-            draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 8 * 4) / 2, "按住音量下键说话", 4, GREEN);
+            draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 8 * 4) / 2, "按住音量下键说：连接无线网络", 4, GREEN);
         }
         let mut y = g.toolbar_h as i32 + 170;
         // dialog transcript: last 6 lines, user white / agent green
@@ -678,7 +678,7 @@ impl<'a> Render<'a> {
             draw_text(pix, self.pitch, self.w, self.h, self.font, g.m as i32, g.kb_panel_y as i32 - 120, &s, 4, WHITE);
         }
         // hint line (voiced's default: how to talk, how to bail)
-        let hint = if d.hint.is_empty() { "按住音量下键说话 · 说取消退出" } else { d.hint.as_str() };
+        let hint = if d.hint.is_empty() { "按住音量下键说：连接无线网络" } else { d.hint.as_str() };
         draw_centered(pix, self.pitch, self.w, self.h, self.font, g.kb_panel_y as i32 - 40, hint, 3, UNAVAIL);
     }
 

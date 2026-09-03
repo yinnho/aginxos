@@ -29,7 +29,7 @@ pub struct FaceDoc<'a> {
     pub hint: &'a str,
 }
 
-const HINT: &str = "按住音量下键说话 · 说取消退出";
+const HINT: &str = "按住音量下键说：连接无线网络";
 
 pub fn write(vm: &Vm, listening: bool, busy: bool) {
     let _ = fs::create_dir_all(FACE_DIR);

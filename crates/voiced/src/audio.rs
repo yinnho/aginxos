@@ -41,6 +41,12 @@ pub struct Brain {
     agent: ureq::Agent,
 }
 
+/// ASR 候选词提示——词表契约（见 asr() 注释：当前 brain audio 模型无视它）。
+const ASR_HINT: &str = "你听到的是一台中文设备的语音指令录音。请把听到的话原样转写成简体中文。\
+    可能出现的指令词：无线、网络、连网、上网、状态、时间、几点、电池、取消、算了、\
+    第一个、第二个、第三个、第四个、第五个、对、不对、是的、否、密码、大写、小写、\
+    数字零到数字九、完了、删掉、退格、你在吗、帮助。";
+
 impl Brain {
     /// key 从环境 AGINXBRAIN_API_KEY 读（agsvc 单元 env_file 注入）。
     pub fn from_env() -> Option<Brain> {
@@ -51,17 +57,27 @@ impl Brain {
     }
 
     /// WAV 字节 → 文本
+    ///
+    /// 2026-09-04 设备法医收据：brain 的 audio 模型无视 system 消息（有无
+    /// ASR_HINT 结果逐字相同），且对本机采集链音频一律幻听或返回空——同一
+    /// 句「连接无线网络」文件直喂全对（电平 12%/高通 200Hz 都过），经扬声
+    /// 器隔空进麦克风后满刻度放大也废（→「很遗憾的呃。」）。云 ASR 与未
+    /// 校准的 rt5514 裸 DMIC 链不兼容；真修法是 M42d 本地 ASR 换后端。
+    /// ASR_HINT 保留当词表契约，换尊重 system 的后端时直接生效。
     pub fn asr(&self, wav: &[u8]) -> Result<String, String> {
         let b64 = b64_encode(wav);
         let body = serde_json::json!({
             "model": "audio",
-            "messages": [{
-                "role": "user",
-                "content": [{
-                    "type": "input_audio",
-                    "input_audio": { "data": b64, "format": "wav" }
-                }]
-            }]
+            "messages": [
+                { "role": "system", "content": ASR_HINT },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "input_audio",
+                        "input_audio": { "data": b64, "format": "wav" }
+                    }]
+                }
+            ]
         });
         let resp = self
             .agent

@@ -92,6 +92,10 @@ fn daemon() {
                         }
                         ptt::PttEv::Up => {
                             if let Some(mut c) = capturing.take() {
+                                // 词尾冲刷：立即 kill 会截掉最后几百毫秒（snd-cap
+                                // 缓冲 + 松手瞬间）。2026-09-04 收据：「连接无线
+                                // 网络」只剩 0.96s，「络」被截，ASR 三连空串。
+                                std::thread::sleep(Duration::from_millis(600));
                                 let _ = c.kill();
                                 let _ = c.wait();
                                 if let Some(brain) = brain.as_ref() {

@@ -128,6 +128,10 @@ impl Vm {
             Ev::Heard(raw) => {
                 let text = norm(&raw);
                 if text.is_empty() {
+                    // 空 ASR 不静默：走到这的都是 ≥0.1s 的真尝试（真误触在
+                    // capture_take 已拦）。不吭声=用户以为死了（2026-09-04
+                    // 三连空串实测）。也不进对话行——屏上留空行难看。
+                    self.say(&mut outs, "没听清。请按住键，说完整的：连接无线网络。");
                     outs.push(Out::Show);
                     return outs;
                 }
@@ -158,7 +162,7 @@ impl Vm {
                 } else {
                     self.st = St::WifiList;
                     self.sel = 0;
-                    self.say(&mut outs, &format!("找到{n}个网络，屏幕上选，说第几个。"));
+                    self.say(&mut outs, &format!("找到{n}个网络，屏幕上选，说选第几个。"));
                 }
                 outs.push(Out::Show);
             }
@@ -190,11 +194,11 @@ impl Vm {
             self.say(outs, "看一下。");
             outs.push(Out::Act(Act::Status));
         } else if is_hello(text) {
-            self.say(outs, "我在。说无线连网，或说状态。");
+            self.say(outs, "我在。说连接无线网络，或说现在什么状态。");
         } else if is_help(text) {
-            self.say(outs, "我能连无线。按住音量下键说话。");
+            self.say(outs, "我能连无线。按住音量下键，说连接无线网络。");
         } else {
-            self.say(outs, "没听懂。说无线，或说状态。");
+            self.say(outs, "没听懂。说完整的：连接无线网络。");
         }
         outs.push(Out::Show);
     }
@@ -216,7 +220,7 @@ impl Vm {
             outs.push(Out::Act(Act::Scan));
         } else {
             self.st = St::WifiList;
-            self.say(outs, "说第几个，或者说取消。");
+            self.say(outs, "说选第几个，或者说取消退出。");
         }
         outs.push(Out::Show);
     }
@@ -580,7 +584,7 @@ mod tests {
         assert!(o.contains(&Out::Act(Act::Scan)));
         // 2. 扫描结果回来
         let o = vm.step(Ev::ScanDone(vec!["Legrand AP".into(), "2501".into()]));
-        assert_eq!(says(&o), vec!["找到2个网络，屏幕上选，说第几个。"]);
+        assert_eq!(says(&o), vec!["找到2个网络，屏幕上选，说选第几个。"]);
         assert_eq!(vm.list(), &["Legrand AP".to_string(), "2501".to_string()]);
         // 3. 序数选择
         let o = heard(&mut vm, "第二个");
@@ -668,14 +672,19 @@ mod tests {
     fn gibberish_gets_fixed_reply() {
         let mut vm = Vm::new();
         let o = heard(&mut vm, "今天天气哈哈哈");
-        assert_eq!(says(&o), vec!["没听懂。说无线，或说状态。"]);
+        assert_eq!(says(&o), vec!["没听懂。说完整的：连接无线网络。"]);
     }
 
     #[test]
-    fn empty_heard_is_silent_show() {
+    fn empty_heard_prompts_retry() {
+        // 2026-09-04 改：空 ASR 静默=用户以为死了；真误触(<0.1s)在
+        // capture_take 已拦，走到这的都是 ≥0.1s 的真尝试，必须开口。
         let mut vm = Vm::new();
         let o = heard(&mut vm, "。！？ ");
-        assert_eq!(o, vec![Out::Show]);
+        assert_eq!(
+            says(&o),
+            vec!["没听清。请按住键，说完整的：连接无线网络。"]
+        );
     }
 
     #[test]
