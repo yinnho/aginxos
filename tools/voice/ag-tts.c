@@ -1,18 +1,32 @@
 // ag-tts — M42d 本地语音合成 CLI（kokoro int8，bionic-static）。
-// 用法: ag-tts <text> [out.wav]  模型 /var/models/tts/kokoro-int8-multi-lang-v1_1
-//   AG_TTS_DIR / AG_TTS_SID(默认 8=中文女声) 可覆盖。出: stdout 打印 wav 路径。
+// 用法: ag-tts <text> [out.wav]   一次性：合成一句退出，stdout 打印 wav 路径
+//       ag-tts --serve [out.wav]  常驻（M42e）：stdin 一行文本一次合成，写
+//                                  out.wav 后 stdout 回一行 "OK <rate> <n>"
+//                                  / "ERR <why>"；EOF 退出。模型只加载一次
+//                                  ——装载 ~3.8s 是短句延迟的大头（M42e 收据）。
+// 模型 /var/models/tts/kokoro-int8-multi-lang-v1_1
+//   AG_TTS_DIR / AG_TTS_SID(默认 8=中文女声) 可覆盖。
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "c-api.h"
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: ag-tts <text> [out.wav]\n"); return 2; }
+    int serve = argc >= 2 && strcmp(argv[1], "--serve") == 0;
+    if (argc < 2 || (serve && argc > 3) || (!serve && argc > 3)) {
+        fprintf(stderr, "usage: ag-tts <text> [out.wav] | ag-tts --serve [out.wav]\n");
+        return 2;
+    }
     const char *dir = getenv("AG_TTS_DIR");
     if (!dir || !*dir) dir = "/var/models/tts/kokoro-int8-multi-lang-v1_1";
     const char *sid_s = getenv("AG_TTS_SID");
     int sid = sid_s && *sid_s ? atoi(sid_s) : 8;
-    const char *out = argc > 2 ? argv[2] : "/tmp/ag-tts-out.wav";
+    // 语音 UI 默认比 kokoro 原速利落一档（1.2×）；AG_TTS_SPEED 可覆盖。
+    const char *speed_s = getenv("AG_TTS_SPEED");
+    float speed = speed_s && *speed_s ? strtof(speed_s, NULL) : 1.2f;
+    const char *out = serve
+        ? (argc > 2 ? argv[2] : "/tmp/ag-tts-serve.wav")
+        : (argc > 2 ? argv[2] : "/tmp/ag-tts-out.wav");
 
     char model[512], voices[512], tokens[512], espeak[512], dictd[512], lex[512], fsts[768];
     snprintf(model, sizeof model, "%s/model.int8.onnx", dir);
@@ -43,7 +57,30 @@ int main(int argc, char **argv) {
     SherpaOnnxGenerationConfig gen;
     memset(&gen, 0, sizeof gen);
     gen.sid = sid;
-    gen.speed = 1.0f;
+    gen.speed = speed;
+
+    if (serve) {
+        char line[4096];
+        while (fgets(line, sizeof line, stdin)) {
+            line[strcspn(line, "\r\n")] = 0;
+            if (!line[0]) { printf("ERR empty\n"); fflush(stdout); continue; }
+            const SherpaOnnxGeneratedAudio *audio =
+                SherpaOnnxOfflineTtsGenerateWithConfig(tts, line, &gen, NULL, NULL);
+            if (!audio || audio->n == 0) {
+                if (audio) SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
+                printf("ERR generate\n"); fflush(stdout); continue;
+            }
+            if (!SherpaOnnxWriteWave(audio->samples, audio->n, audio->sample_rate, out)) {
+                printf("ERR write\n"); fflush(stdout);
+            } else {
+                printf("OK %d %d\n", audio->sample_rate, audio->n); fflush(stdout);
+            }
+            SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
+        }
+        SherpaOnnxDestroyOfflineTts(tts);
+        return 0; // stdin EOF — 宿主退了，别变僵尸
+    }
+
     const SherpaOnnxGeneratedAudio *audio =
         SherpaOnnxOfflineTtsGenerateWithConfig(tts, argv[1], &gen, NULL, NULL);
     if (!audio || audio->n == 0) { fprintf(stderr, "ag-tts: generate failed\n"); return 1; }

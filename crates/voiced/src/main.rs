@@ -70,6 +70,11 @@ fn daemon() {
         brain.is_some(),
         ptt.is_some()
     );
+    // M42e: 预载常驻嘴耳模型（spawn 即返回，���载在子进程里）——第一次
+    // 说话不再等 ~4s/侧 的装载。
+    if audio::local_voice_ready() {
+        audio::warm_local_voice();
+    }
 
     let mut capturing: Option<std::process::Child> = None;
     let mut deadline: Option<Instant> = None;
@@ -321,21 +326,24 @@ fn status_text() -> String {
     let time = Command::new("date").arg("+%H点%M分").output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
+        .map(|s| {
+            // 去前导零（"06点05分"→"6点5分"）——TTS 会把 0 也念出来
+            s.trim().trim_start_matches('0').replace("点0", "点")
+        })
         .unwrap_or_default();
     let bat = std::fs::read_to_string("/sys/class/power_supply/battery/capacity")
         .ok()
         .and_then(|s| s.trim().parse::<u8>().ok())
         .unwrap_or(0);
-    let ip = Command::new("ip").args(["-4", "addr", "show", "wlan0"]).output()
+    // 只报连没连——IP 逐位念出来又长又难听（数字展开还多 10s 合成+播放）
+    let net = Command::new("ip").args(["-4", "addr", "show", "wlan0"]).output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|t| {
-            t.lines().find_map(|l| {
-                let l = l.trim();
-                l.strip_prefix("inet ")?.split_whitespace().next().map(String::from)
-            })
+        .map(|t| {
+            t.lines()
+                .any(|l| l.trim().starts_with("inet "))
         })
-        .unwrap_or_else(|| "无网络".into());
-    format!("{time}，电池{bat}%，{ip}。")
+        .unwrap_or(false);
+    let net = if net { "网已连" } else { "没联网" };
+    format!("{time}，电池{bat}%，{net}。")
 }

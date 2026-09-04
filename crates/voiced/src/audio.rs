@@ -13,8 +13,9 @@
 //!   吃的格式。voice 缺省 longxiaochun_v2（"Cherry" 会 418）。
 
 use std::fs;
-use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 pub const PCM_CAP: &str = "/dev/snd/pcmC0D0c";
@@ -162,15 +163,35 @@ impl Brain {
         }
         let tmp = "/tmp/voiced-tts.raw";
         fs::write(tmp, &stereo).map_err(|e| format!("tts tmp: {e}"))?;
-        let budget = samples / RATE as usize + 5;
+        play_stereo_blocking(samples)
+    }
+}
+
+/// 放 /tmp/voiced-tts.raw（48k L=R stereo），阻塞到放完。
+///
+/// snd-play 的 open 会在上一个会话 teardown 的尾巴上吃 EBUSY（M42e 设备
+/// 收据：一次 exit 2 → 整句落 brain 云 TTS，用户听到慢的云嗓）。open 失败
+/// 是毫秒级退出——原地小睡重试；timeout（可能已放出半句）不重试。
+fn play_stereo_blocking(samples: usize) -> Result<(), String> {
+    let budget = samples / RATE as usize + 5;
+    let mut last_err = String::new();
+    for _ in 0..6 {
         let mut child = Command::new(SND_PLAY)
-            .args([PCM_PLAY, tmp, &RATE.to_string(), "2", VOL])
+            .args([PCM_PLAY, "/tmp/voiced-tts.raw", &RATE.to_string(), "2", VOL])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("snd-play spawn: {e}"))?;
-        wait_limited(&mut child, budget as u32)
+        match wait_limited(&mut child, budget as u32) {
+            Ok(()) => return Ok(()),
+            Err(e) if e == "timeout" => return Err(e),
+            Err(e) => {
+                last_err = e;
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
     }
+    Err(format!("snd-play: {last_err}"))
 }
 
 // ---------------- capture ----------------
@@ -266,42 +287,201 @@ pub fn local_voice_ready() -> bool {
         && std::path::Path::new(ASR_MODEL_DIR).exists()
 }
 
-/// WAV 字节 → 文本（sense-voice 子进程；模型加载在子进程内，失败即整程退出）。
-pub fn local_asr(wav: &[u8]) -> Result<String, String> {
-    fs::write("/tmp/voiced-hear.wav", wav).map_err(|e| format!("hear tmp: {e}"))?;
-    let out = Command::new(AG_ASR)
-        .arg("/tmp/voiced-hear.wav")
-        .output()
-        .map_err(|e| format!("ag-asr spawn: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "ag-asr {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+/// 钉推理子进程到大核（cpu6/7 = A76 2.2-2.4GHz）。不钉则调度器会把两个
+/// 推理线程摊上 A55——实测同一句 11.5s vs 8.7s（M42e）。pre_exec 里只能做
+/// async-signal-safe 的调用；sched_setaffinity 是裸系统调用零 malloc，安全。
+/// 钉不上（非本机拓扑/host 测试）就随它跑，不算错。
+#[cfg(target_os = "linux")]
+fn pin_big_cores(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(6, &mut set);
+            libc::CPU_SET(7, &mut set);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+            Ok(())
+        });
     }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+}
+#[cfg(not(target_os = "linux"))]
+fn pin_big_cores(_cmd: &mut Command) {}
+
+// ---------------- 常驻本地后端（M42e：摊模型加载）----------------
+// 一次性调用每次重付装载：ag-tts ~3.8s、ag-asr ~2s（cpufreq 拉满后实测，
+// HARDWARE.md M42e）——短句延迟的大头是装载不是推理。--serve 进程在
+// daemon 生命周期里只加载一次：stdin 一行一个请求，stdout 一行
+// "OK ..." / "ERR ..."。任何失败清空常驻、当次落回一次性老路径。
+// --say 一次性入口也走这里：起服务→一句→进程退出（stdin EOF 子进程自退），
+// 代价与老路径相同，代码单路径。
+
+/// 固定 wav 落点：daemon 与 --say 各有自己的 server 实例，写同一路径。
+/// 并发跑两个入口理论上互踩这个文件——调试面小概率可忍，产品面只有 daemon。
+const TTS_WAV: &str = "/tmp/voiced-tts.wav";
+const HEAR_WAV: &str = "/tmp/voiced-hear.wav";
+
+struct VoiceServer {
+    child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<std::process::ChildStdout>,
+}
+
+impl VoiceServer {
+    fn spawn(bin: &str, args: &[&str]) -> Result<VoiceServer, String> {
+        let mut cmd = Command::new(bin);
+        cmd.args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()); // sherpa 初始化告警没人读会塞满管道
+        pin_big_cores(&mut cmd);
+        let mut child = cmd.spawn().map_err(|e| format!("spawn {bin}: {e}"))?;
+        let stdin = child.stdin.take().ok_or("no stdin")?;
+        let reader = BufReader::new(child.stdout.take().ok_or("no stdout")?);
+        Ok(VoiceServer { child, stdin, reader })
+    }
+
+    /// 一行请求一行应答；poll 等应答行可读（挂死的子进程不能拖死 daemon
+    /// 主环）。首请求若赶上 spawn 后的模型装载，等的就是装载+推理，预算
+    /// 给足。
+    fn roundtrip(&mut self, req: &str, timeout: Duration) -> Result<String, String> {
+        use std::os::fd::AsRawFd;
+        writeln!(self.stdin, "{req}").map_err(|e| format!("write: {e}"))?;
+        self.stdin.flush().map_err(|e| format!("flush: {e}"))?;
+        let mut pfd = libc::pollfd { fd: self.reader.get_ref().as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let rc = unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as i32) };
+        if rc < 0 {
+            return Err(format!("poll: {}", std::io::Error::last_os_error()));
+        }
+        if rc == 0 {
+            return Err("timeout".into());
+        }
+        let mut line = String::new();
+        let n = self.reader.read_line(&mut line).map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            return Err("eof".into()); // server 死了
+        }
+        Ok(line.trim_end().to_string())
+    }
+
+    fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner()) // 中毒不拖死 daemon
+}
+
+fn tts_server() -> &'static Mutex<Option<VoiceServer>> {
+    static S: OnceLock<Mutex<Option<VoiceServer>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+fn asr_server() -> &'static Mutex<Option<VoiceServer>> {
+    static S: OnceLock<Mutex<Option<VoiceServer>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+/// 开机预载（M42e）：daemon 起来就 spawn 两个 --serve，模型在开机尾巴上
+/// 后台加载完，第一次说话即热路径。spawn 即返回，装载在子进程里，不挡环。
+/// 起不来（bin 不在位）就留 None——真调用时还会再试。
+pub fn warm_local_voice() {
+    let mut slot = lock(tts_server());
+    if slot.is_none() {
+        *slot = VoiceServer::spawn(AG_TTS, &["--serve", TTS_WAV]).ok();
+    }
+    drop(slot);
+    let mut slot = lock(asr_server());
+    if slot.is_none() {
+        *slot = VoiceServer::spawn(AG_ASR, &["--serve"]).ok();
+    }
+}
+
+/// 常驻合成一句到 TTS_WAV。Err = 常驻不可用（调用方落一次性路径）。
+fn resident_tts(text: &str) -> Result<(), String> {
+    let mut slot = lock(tts_server());
+    if slot.is_none() {
+        *slot = Some(VoiceServer::spawn(AG_TTS, &["--serve", TTS_WAV])?);
+    }
+    let srv = slot.as_mut().unwrap();
+    match srv.roundtrip(text, Duration::from_secs(120)) {
+        Ok(line) if line.starts_with("OK ") => Ok(()),
+        Ok(line) => Err(format!("ag-tts: {line}")), // server 活着，这句真失败
+        Err(e) => {
+            srv.kill();
+            *slot = None; // 死/挂——清掉，下一次调用重 spawn
+            Err(e)
+        }
+    }
+}
+
+/// 常驻识别 HEAR_WAV。Err = 常驻不可用（调用方落一次性路径）。
+fn resident_asr() -> Result<String, String> {
+    let mut slot = lock(asr_server());
+    if slot.is_none() {
+        *slot = Some(VoiceServer::spawn(AG_ASR, &["--serve"])?);
+    }
+    let srv = slot.as_mut().unwrap();
+    match srv.roundtrip(HEAR_WAV, Duration::from_secs(60)) {
+        Ok(line) if line.starts_with("OK ") => Ok(line[3..].trim().to_string()),
+        Ok(line) => Err(format!("ag-asr: {line}")),
+        Err(e) => {
+            srv.kill();
+            *slot = None;
+            Err(e)
+        }
+    }
+}
+
+/// WAV 字节 → 文本（sense-voice 子进程；常驻优先，失败落一次性）。
+pub fn local_asr(wav: &[u8]) -> Result<String, String> {
+    fs::write(HEAR_WAV, wav).map_err(|e| format!("hear tmp: {e}"))?;
+    let text = match resident_asr() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("voiced: asr serve {e} — one-shot");
+            let mut cmd = Command::new(AG_ASR);
+            cmd.arg(HEAR_WAV);
+            pin_big_cores(&mut cmd);
+            let out = cmd.output().map_err(|e| format!("ag-asr spawn: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "ag-asr {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+    };
     if text.is_empty() {
         return Err("ag-asr empty".into());
     }
     Ok(text)
 }
 
-/// 文本 → 扬声器：ag-tts 出 WAV（kokoro 24k mono）→ 升采样 48k → L=R 立体声
-/// → snd-play。播放链 48k stereo 是 MM1 已证形状；线性插值升采样语音足够。
+/// 文本 → 扬声器：ag-tts 出 WAV（kokoro 24k mono，常驻优先）→ 升采样 48k
+/// → L=R 立体声 → snd-play。播放链 48k stereo 是 MM1 已证形状；线性插值
+/// 升采样语音足够。
 pub fn local_speak(text: &str) -> Result<(), String> {
-    let out = Command::new(AG_TTS)
-        .args([text, "/tmp/voiced-tts.wav"])
-        .output()
-        .map_err(|e| format!("ag-tts spawn: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "ag-tts {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    if resident_tts(text).is_err() {
+        // 常驻不可用（起不来/挂死）——一次性老路径兜底
+        eprintln!("voiced: tts serve failed — one-shot");
+        let mut cmd = Command::new(AG_TTS);
+        cmd.args([text, TTS_WAV]);
+        pin_big_cores(&mut cmd);
+        let out = cmd.output().map_err(|e| format!("ag-tts spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "ag-tts {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
     }
-    let wav = fs::read("/tmp/voiced-tts.wav").map_err(|e| format!("tts read: {e}"))?;
+    let wav = fs::read(TTS_WAV).map_err(|e| format!("tts read: {e}"))?;
     let (off, len) = wav_data_span(&wav)?;
     let rate = wav_rate(&wav)?;
     let up = if rate != RATE {
@@ -316,14 +496,7 @@ pub fn local_speak(text: &str) -> Result<(), String> {
         stereo.extend_from_slice(s); // L = R
     }
     fs::write("/tmp/voiced-tts.raw", &stereo).map_err(|e| format!("tts tmp: {e}"))?;
-    let budget = samples / RATE as usize + 5;
-    let mut child = Command::new(SND_PLAY)
-        .args([PCM_PLAY, "/tmp/voiced-tts.raw", &RATE.to_string(), "2", VOL])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("snd-play spawn: {e}"))?;
-    wait_limited(&mut child, budget as u32)
+    play_stereo_blocking(samples)
 }
 
 /// 从 RIFF 头取采样率（fmt 块 body+4）。

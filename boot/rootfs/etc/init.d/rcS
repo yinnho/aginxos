@@ -28,6 +28,17 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null
 hostname aginxos
 ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null
 
+# cpufreq (M42e) — qcom-cpufreq-hw 不加载时两组核心都停在 RPMh 遗留的低频
+# （A76 钉核 TTS 22.9s；驱动加载升频后同句 8.7s，收据 HARDWARE.md M42e）。
+# 越早加载越好：下面所有 bring-up 脚本都吃满频。governor 用 schedutil——
+# 负载升频、空闲落回 300MHz，性能与 performance 无差而待机不烧。
+if [ -e /vendor_a/lib/modules/qcom-cpufreq-hw.ko ]; then
+  insmod /vendor_a/lib/modules/qcom-cpufreq-hw.ko 2>/dev/null
+  for P in /sys/devices/system/cpu/cpufreq/policy*; do
+    echo schedutil > "$P/scaling_governor" 2>/dev/null
+  done
+fi
+
 # Cross-boot forensics: the kernel has no pstore, so a death (PMIC power cut
 # vs kernel hang) leaves evidence only if something was already writing it
 # to the ext4 /var. The 2026-08-27 morning deaths were diagnosed as UVLO
