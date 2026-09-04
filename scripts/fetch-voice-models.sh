@@ -33,6 +33,22 @@ if [ ! -s "${M}/tts/kokoro-int8-multi-lang-v1_1/model.int8.onnx" ]; then
   tar -xjf "${DL}/kokoro-int8-multi-lang-v1_1.tar.bz2" -C "${M}/tts"
 fi
 
+# ---- TTS 小模型线（M42e：kokoro 暖合成 7 字句 4.1–4.9s RTF≈2.5 是延迟地板，
+# vits-melo ~163MB zh+en 单说话人 / matcha-baker 纯中文。质量由用户听判，
+# 默认仍 kokoro，AG_TTS_KIND=vits|matcha 切换）----
+if [ ! -s "${M}/tts/vits-melo-tts-zh_en/model.onnx" ]; then
+  gh release download tts-models --repo k2-fsa/sherpa-onnx \
+    --pattern 'vits-melo-tts-zh_en.tar.bz2' \
+    --dir "${DL}"
+  tar -xjf "${DL}/vits-melo-tts-zh_en.tar.bz2" -C "${M}/tts"
+fi
+if [ ! -s "${M}/tts/matcha-icefall-zh-baker/model-steps-3.onnx" ]; then
+  gh release download tts-models --repo k2-fsa/sherpa-onnx \
+    --pattern 'matcha-icefall-zh-baker.tar.bz2' \
+    --dir "${DL}"
+  tar -xjf "${DL}/matcha-icefall-zh-baker.tar.bz2" -C "${M}/tts"
+fi
+
 rm -rf "${DL}"
 du -sh "${M}/asr" "${M}/tts/kokoro-int8-multi-lang-v1_1"
 echo "models ready under ${M}"

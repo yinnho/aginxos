@@ -1,11 +1,15 @@
-// ag-tts — M42d 本地语音合成 CLI（kokoro int8，bionic-static）。
+// ag-tts — M42d 本地语音合成 CLI（bionic-static）。
 // 用法: ag-tts <text> [out.wav]   一次性：合成一句退出，stdout 打印 wav 路径
 //       ag-tts --serve [out.wav]  常驻（M42e）：stdin 一行文本一次合成，写
 //                                  out.wav 后 stdout 回一行 "OK <rate> <n>"
 //                                  / "ERR <why>"；EOF 退出。模型只加载一次
 //                                  ——装载 ~3.8s 是短句延迟的大头（M42e 收据）。
-// 模型 /var/models/tts/kokoro-int8-multi-lang-v1_1
-//   AG_TTS_DIR / AG_TTS_SID(默认 8=中文女声) 可覆盖。
+// 模型 /var/models/tts/ 下三种，AG_TTS_KIND 选（默认 kokoro，M42e 收据：
+// kokoro 暖合成 7 字句 4.1–4.9s、RTF≈2.5 是延迟地板 → 小模型线）：
+//   kokoro  kokoro-int8-multi-lang-v1_1（质量好，慢；AG_TTS_SID 默认 8=中文女声）
+//   vits    vits-melo-tts-zh_en（快，中英混）
+//   matcha  matcha-icefall-zh-baker（快，纯中文）
+//   AG_TTS_DIR 仍可整目录覆盖（此时 KIND 由 env 定，路径按 kind 缺省拼）。
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,8 +21,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: ag-tts <text> [out.wav] | ag-tts --serve [out.wav]\n");
         return 2;
     }
+    const char *kind_s = getenv("AG_TTS_KIND");
+    const char *kind = kind_s && *kind_s ? kind_s : "kokoro";
+    const char *defdir = !strcmp(kind, "vits") ? "/var/models/tts/vits-melo-tts-zh_en"
+                      : !strcmp(kind, "matcha") ? "/var/models/tts/matcha-icefall-zh-baker"
+                      : "/var/models/tts/kokoro-int8-multi-lang-v1_1";
     const char *dir = getenv("AG_TTS_DIR");
-    if (!dir || !*dir) dir = "/var/models/tts/kokoro-int8-multi-lang-v1_1";
+    if (!dir || !*dir) dir = defdir;
     const char *sid_s = getenv("AG_TTS_SID");
     int sid = sid_s && *sid_s ? atoi(sid_s) : 8;
     // 语音 UI 默认比 kokoro 原速利落一档（1.2×）；AG_TTS_SPEED 可覆盖。
@@ -28,27 +37,61 @@ int main(int argc, char **argv) {
         ? (argc > 2 ? argv[2] : "/tmp/ag-tts-serve.wav")
         : (argc > 2 ? argv[2] : "/tmp/ag-tts-out.wav");
 
-    char model[512], voices[512], tokens[512], espeak[512], dictd[512], lex[512], fsts[768];
+    char model[512], voices[512], tokens[512], espeak[512], dictd[512], lex[512], fsts[768], fars[512], vocoder[512];
     snprintf(model, sizeof model, "%s/model.int8.onnx", dir);
     snprintf(voices, sizeof voices, "%s/voices.bin", dir);
     snprintf(tokens, sizeof tokens, "%s/tokens.txt", dir);
     snprintf(espeak, sizeof espeak, "%s/espeak-ng-data", dir);
     snprintf(dictd, sizeof dictd, "%s/dict", dir);
-    snprintf(lex, sizeof lex, "%s/lexicon-zh.txt", dir);
+    snprintf(lex, sizeof lex, "%s/lexicon.txt", dir);
     snprintf(fsts, sizeof fsts, "%s/number-zh.fst,%s/date-zh.fst,%s/phone-zh.fst", dir, dir, dir);
+    snprintf(vocoder, sizeof vocoder, "%s/hifigan_v2.onnx", dir);
 
     SherpaOnnxOfflineTtsConfig config;
     memset(&config, 0, sizeof config);
     config.model.num_threads = 2;
-    config.model.kokoro.model = model;
-    config.model.kokoro.voices = voices;
-    config.model.kokoro.tokens = tokens;
-    config.model.kokoro.data_dir = espeak;
-    config.model.kokoro.dict_dir = dictd;
-    config.model.kokoro.lexicon = lex;
-    config.model.kokoro.length_scale = 1.0f;
-    config.model.kokoro.lang = "zh";
-    config.rule_fsts = fsts;
+    if (!strcmp(kind, "vits")) {
+        // melo: tarball 里的 model.int8.onnx 是 133B 的 git-lfs 指针（release
+        // 打包事故），真身只有 fp32 model.onnx（170MB）——vits 本来就小，
+        // fp32 也远快于 kokoro。sherpa v1.12.15 起 lexicon 自足不用 dict_dir。
+        // espeak-ng-data 不在 tarball 里——部署时软链到 kokoro 目录的（同一
+        // espeak 构建），纯中文走 lexicon 不碰它。规则用 melo 自带三 fst +
+        // new_heteronym.fst（多音字，rule_fars）。
+        snprintf(model, sizeof model, "%s/model.onnx", dir);
+        snprintf(fsts, sizeof fsts, "%s/number.fst,%s/date.fst,%s/phone.fst", dir, dir, dir);
+        snprintf(fars, sizeof fars, "%s/new_heteronym.fst", dir);
+        config.model.vits.model = model;
+        config.model.vits.lexicon = lex;
+        config.model.vits.tokens = tokens;
+        config.model.vits.data_dir = espeak;
+        config.model.vits.noise_scale = 0.667f;
+        config.model.vits.noise_scale_w = 0.8f;
+        config.model.vits.length_scale = 1.0f;
+        config.rule_fsts = fsts;
+        config.rule_fars = fars;
+    } else if (!strcmp(kind, "matcha")) {
+        snprintf(model, sizeof model, "%s/model-steps-3.onnx", dir);
+        config.model.matcha.acoustic_model = model;
+        config.model.matcha.vocoder = vocoder;
+        config.model.matcha.lexicon = lex;
+        config.model.matcha.tokens = tokens;
+        config.model.matcha.data_dir = espeak;
+        config.model.matcha.dict_dir = dictd;
+        config.model.matcha.noise_scale = 0.667f;
+        config.model.matcha.length_scale = 1.0f;
+    } else {
+        // kokoro（lexicon 用 -zh 变体）
+        snprintf(lex, sizeof lex, "%s/lexicon-zh.txt", dir);
+        config.model.kokoro.model = model;
+        config.model.kokoro.voices = voices;
+        config.model.kokoro.tokens = tokens;
+        config.model.kokoro.data_dir = espeak;
+        config.model.kokoro.dict_dir = dictd;
+        config.model.kokoro.lexicon = lex;
+        config.model.kokoro.length_scale = 1.0f;
+        config.model.kokoro.lang = "zh";
+        config.rule_fsts = fsts;
+    }
     config.max_num_sentences = 1;
 
     const SherpaOnnxOfflineTts *tts = SherpaOnnxCreateOfflineTts(&config);
