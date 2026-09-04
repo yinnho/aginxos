@@ -552,16 +552,17 @@ pub fn local_asr(wav: &[u8]) -> Result<String, String> {
 }
 
 /// 文本 → 扬声器：分句流水（M42e 续：整段合成完才放是长句延迟的大头）。
-/// 按停顿标点切句，第一句合成完立即起放音，后续句在放音中由常驻 server
+/// 按句读切句，第一句合成完立即起放音，后续句在放音中由常驻 server
 /// 并行合成——server 是独立进程，snd-play 放音不占它。TTS wav → FIR 升采
 /// 样 48k → L=R 立体声 → snd-play。常驻不可用/中途挂 → 整段一次性兜底。
 pub fn local_speak(text: &str) -> Result<(), String> {
-    if speak_streamed(&split_clauses(text)).is_ok() {
+    let spoken = expand_digit_chains(text);
+    if speak_streamed(&split_clauses(&spoken)).is_ok() {
         return Ok(());
     }
     eprintln!("voiced: tts serve failed — one-shot");
     let mut cmd = Command::new(AG_TTS);
-    cmd.args([text, TTS_WAV]);
+    cmd.args([&spoken, TTS_WAV]);
     pin_big_cores(&mut cmd);
     let out = cmd.output().map_err(|e| format!("ag-tts spawn: {e}"))?;
     if !out.status.success() {
@@ -576,22 +577,81 @@ pub fn local_speak(text: &str) -> Result<(), String> {
     play_stereo_blocking(samples)
 }
 
-/// 分句：按中英停顿标点切（。！？；，、及 ASCII 对应），句 ≥4 字（太短
-/// 并前句——放音 <0.5s 会踩接棒宽限期），无标点长段每 24 字硬切。
+/// TTS 前文本整形：长数字链（电话/IP/日期等，链内总位数 ≥5）展开成空格
+/// 分隔的逐位数字。melo 的 number.fst 把 11 位连写当整数读——ASR 回环收据
+/// 「13800138000」→「138亿0138000」，连字符/空格分段同病（8000→「八千」）；
+/// 空格分隔的 ASCII 数字实测逐位念（回环纯数位、无亿万，2026-09-04）。
+/// 短链（≤4 位：数量/年份/小数）保持原样交给前端按数读。
+fn expand_digit_chains(text: &str) -> String {
+    const SEP: &str = "-. "; // 链内组间分隔：连字符/点/空格
+    const MIN_DIGITS: usize = 5;
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // 吞整条链：数字组 (分隔 run + 数字组)*。分隔 run 只有后随数字才算
+        // 链内（「第 3 章」的空格不会把 3 和别的数粘起来）。
+        let mut j = i;
+        let mut groups: Vec<(usize, usize)> = Vec::new();
+        loop {
+            let gs = j;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            groups.push((gs, j));
+            let ss = j;
+            while j < chars.len() && SEP.contains(chars[j]) {
+                j += 1;
+            }
+            if !(j < chars.len() && chars[j].is_ascii_digit()) {
+                j = ss; // 分隔不属于链，吐回去
+                break;
+            }
+        }
+        let total: usize = groups.iter().map(|(a, b)| b - a).sum();
+        if total >= MIN_DIGITS {
+            // 整链逐位单空格分隔（组界不再多补）
+            for &(a, b) in &groups {
+                for &c in &chars[a..b] {
+                    out.push(c);
+                    out.push(' ');
+                }
+            }
+            out.pop(); // 尾随空格
+        } else {
+            // 短链原样（含组间分隔）—— chars[i..j] 正是整条链的原文跨度
+            out.extend(chars[i..j].iter());
+        }
+        i = j;
+    }
+    out
+}
+
+/// 分句：只在句读（。！？；及 ASCII 对应）切，句 ≥4 字（太短并前句——
+/// 放音 <0.5s 会踩接棒宽限期），无标点长段每 60 字硬切，且永不落在数字
+/// 链中间（切断 = 两段各自又被前端按整数读）。逗号不是切点——M42e 时为
+/// kokoro 慢合成压首响拆得细，melo 常驻后拆太散断语气（用户收据
+/// 2026-09-04「不用拆句拆的太散」）。
 fn split_clauses(text: &str) -> Vec<String> {
     const MIN: usize = 4;
-    const MAX: usize = 24;
+    const MAX: usize = 60;
+    let chars: Vec<char> = text.chars().collect();
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
-    for ch in text.chars() {
+    let mut n = 0;
+    for (idx, &ch) in chars.iter().enumerate() {
         cur.push(ch);
-        let stop = matches!(
-            ch,
-            '。' | '！' | '？' | '；' | '，' | '、' | '.' | '!' | '?' | ';' | ','
-        );
-        let n = cur.chars().count();
-        if (stop && n >= MIN) || n >= MAX {
+        n += 1;
+        let stop = matches!(ch, '。' | '！' | '？' | '；' | '.' | '!' | '?' | ';');
+        let next_digit = chars.get(idx + 1).is_some_and(|c| c.is_ascii_digit());
+        if (stop && n >= MIN || n >= MAX) && !next_digit {
             out.push(std::mem::take(&mut cur));
+            n = 0;
         }
     }
     if !cur.is_empty() {
@@ -1011,19 +1071,61 @@ mod tests {
 
     #[test]
     fn split_clauses_punctuation_and_limits() {
-        // 标点切句；尾句 3 字 <4 并前句
+        // 句读切句；尾句 3 字 <4 并前句
         assert_eq!(
             split_clauses("已连接无线网络。现在可以开始，对话。"),
             vec!["已连接无线网络。", "现在可以开始，对话。"]
         );
+        // 逗号不是切点（melo 常驻后拆散断语气，2026-09-04）——整句一口气
         let cs = split_clauses("无线网络已经连接成功，现在可以。");
-        assert_eq!(cs, vec!["无线网络已经连接成功，", "现在可以。"]);
-        // 无标点长段 24 字硬切，内容不丢
-        let long = "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十";
-        let cs = split_clauses(long);
-        assert!(cs.iter().all(|c| c.chars().count() <= 24));
+        assert_eq!(cs, vec!["无线网络已经连接成功，现在可以。"]);
+        // 无标点长段 60 字硬切，内容不丢
+        let long = "字".repeat(130);
+        let cs = split_clauses(&long);
+        assert!(cs.iter().all(|c| c.chars().count() <= 60));
         assert_eq!(cs.concat(), long);
+        // 硬切不落数字链中间：链后补刀，链完整进前句或后句
+        let t = format!("{}电话{}", "字".repeat(58), "13800138000");
+        let cs = split_clauses(&t);
+        assert!(cs.iter().all(|c| !c.ends_with(|c: char| c.is_ascii_digit())
+            || c.ends_with("13800138000")));
+        assert_eq!(cs.concat(), t);
+        // 小数点后跟数字不是切点（「3.14」不拦腰断）
+        assert_eq!(split_clauses("圆周率是3.14约等于。"), vec!["圆周率是3.14约等于。"]);
         // 空文本给单句（调用方兜底）
         assert_eq!(split_clauses(""), vec![""]);
+    }
+
+    #[test]
+    fn expand_digit_chains_phone_ip_and_short() {
+        // 电话（连字符分段）：总 11 位 ≥5 → 逐位
+        assert_eq!(
+            expand_digit_chains("TEL 138-0013-8000"),
+            "TEL 1 3 8 0 0 1 3 8 0 0 0"
+        );
+        // 连写
+        assert_eq!(
+            expand_digit_chains("电话13800138000。"),
+            "电话1 3 8 0 0 1 3 8 0 0 0。"
+        );
+        // IP（点分段，状态查询的话术）
+        assert_eq!(
+            expand_digit_chains("连上了，地址192.168.0.166。"),
+            "连上了，地址1 9 2 1 6 8 0 1 6 6。"
+        );
+        // 空格分段同样成链
+        assert_eq!(
+            expand_digit_chains("138 0013 8000"),
+            "1 3 8 0 0 1 3 8 0 0 0"
+        );
+        // 短链不动：数量/年份/小数/版本号交给前端按数读
+        assert_eq!(expand_digit_chains("找到3个网络"), "找到3个网络");
+        assert_eq!(expand_digit_chains("2026年"), "2026年");
+        assert_eq!(expand_digit_chains("3.14"), "3.14");
+        assert_eq!(expand_digit_chains("v1.2.3"), "v1.2.3");
+        // 「第 3 章」：空格后随数字才算链内，两组不相粘
+        assert_eq!(expand_digit_chains("第3章 第5节"), "第3章 第5节");
+        // 链前分隔不吞：空格留在原位
+        assert_eq!(expand_digit_chains("验证码 654321"), "验证码 6 5 4 3 2 1");
     }
 }
