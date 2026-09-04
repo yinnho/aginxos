@@ -36,7 +36,9 @@ VOICE="${ROOT}/out/voice"
 test -x "${VOICE}/bin/ag-asr" && test -x "${VOICE}/bin/ag-tts" \
   || { echo "missing out/voice/bin/ag-{asr,tts} — run scripts/build-voice.sh" >&2; exit 1; }
 test -s "${VOICE}/models/asr/model.int8.onnx" \
-  && test -s "${VOICE}/models/tts/kokoro-int8-multi-lang-v1_1/model.int8.onnx" \
+  && test -s "${VOICE}/models/tts/vits-melo-tts-zh_en/model.onnx" \
+  && test -s "${VOICE}/models/tts/vits-melo-tts-zh_en/lexicon.txt" \
+  && test -s "${VOICE}/models/tts/vits-melo-tts-zh_en/tokens.txt" \
   || { echo "missing voice models — run scripts/fetch-voice-models.sh" >&2; exit 1; }
 MKE2FS="$(command -v mke2fs || true)"
 test -z "${MKE2FS}" && MKE2FS=/opt/homebrew/bin/mke2fs
@@ -275,14 +277,19 @@ chmod 755 "${TREE}/var/bin/ag-ocr"
 mkdir -p "${TREE}/var/models/ocr"
 cp "${OCR}/models/det.onnx" "${OCR}/models/rec.onnx" \
    "${OCR}/models/dict.txt" "${TREE}/var/models/ocr/"
-# Voice models (M42d) — sense-voice int8 ASR + kokoro int8 TTS (~440MB).
-# NOT in the agupd state tar: they ride every baked image instead, so a
-# clean reflash AND a system update both carry them without a 440MB tar
-# staging pass per update.
+# TTS models (M42d→M45) — melo (vits-melo-tts-zh_en) is the product mouth
+# (ag-tts default KIND since the Latin-drop fix: kokoro's zh frontend drops
+# Latin words whole). The 170MB fp32 model.onnx is the real weights — the
+# tarball's model.int8.onnx is a 133B git-lfs pointer (release packaging
+# accident, M42e receipt); bake the fp32 only. kokoro (~206MB) dropped from
+# the image: nothing references it by default and fetch-voice-models.sh can
+# restock it for experiments. NOT in the agupd state tar: models ride every
+# baked image instead (voice is the bootstrap interface — see above).
 mkdir -p "${TREE}/var/models/tts"
 cp -R "${VOICE}/models/asr" "${TREE}/var/models/asr"
-cp -R "${VOICE}/models/tts/kokoro-int8-multi-lang-v1_1" \
-  "${TREE}/var/models/tts/kokoro-int8-multi-lang-v1_1"
+cp -R "${VOICE}/models/tts/vits-melo-tts-zh_en" \
+  "${TREE}/var/models/tts/vits-melo-tts-zh_en"
+rm -f "${TREE}/var/models/tts/vits-melo-tts-zh_en/model.int8.onnx"
 # CJK font subset (M38a) — aterm cjk.rs rasterizes through ab_glyph;
 # GB2312 full + ASCII + punct rows, ~1.5MB (scripts/subset-cjk-font.sh).
 cp -R "${RECIPE}/usr/share/fonts" "${TREE}/usr/share/fonts"
