@@ -5480,3 +5480,699 @@ feeder 加软件护栏（180Hz 单极高通 + -4.2dBFS 跑动峰值限幅）但*
 设备终态：aterm 存活（20700）、模块全载、/tmp/probe.new=7aefa0e7、
 clip.h264/clip.s16 与分诊素材在盘、混音器已恢复厂商值（AMP 17/PCM 817）、
 未动 DRM/未重启。host check.sh 全绿（27 commands OK）。
+
+## 2026-09-04 — 运维通道：dropbear 上机（#142）
+
+OTG 键盘实验跳过（手头无 USB-C OTG 转接头）——插入前快照已记：/dev/input 仅
+event0–2，/sys/bus/usb/devices 空，usbhid 不在 /proc/modules（疑内建）。拿到
+转接头后补一次实验收据即可。
+
+**构建**（scripts/build-dropbear.sh，产物 .local/dropbear/bin，gitignored）：
+dropbear 2026.94，zig cc aarch64-linux-musl 全静态三件（dropbear/dbclient/
+dropbearkey，各 ~2.7MB 含 debug_info）。坑三枚：①macOS BSD ar 打的档 lld 拉
+不出符号（全部 mp_*/sha256_*/ctr_* undefined）——AR/RANLIB 必须用 zig 的
+（LLVM）；②make 时覆盖 CFLAGS 会冲掉默认 -I 路径（dbmalloc.h not found，
+libtommath 编译炸）——不要动 CFLAGS；③zig 0.16 的 objcopy --strip-all
+"unimplemented"，瘦身放弃。重构建不可复现（md5 每次变）——按行为比不按哈希比。
+
+**设备收据**（redfin，adb 推 /tmp → /bin 两级都验）：
+- 机内环回：设备自身 dbclient -i /root/.ssh/id_ed25519 root@127.0.0.1 →
+  `uname` 出字 + `SSH_LOOPBACK_OK`（顺带收了出站 ssh 客户端）。
+- Mac→手机：`adb forward tcp:2222 tcp:22` → `ssh -p 2222 root@127.0.0.1`
+  公钥登录成功，`ag agent list` 面可跑；/var/log/dropbear.log 落
+  "Pubkey auth succeeded for 'root'"。
+- Wi-Fi 直连不通是网段问题非服务问题：手机 wlan0 192.168.0.166/24、Mac
+  192.168.3.26/24。同 AP 时应直通（Legrand AP 有掐长传输前科，届时复验）。
+- rcS 启动行原样验证：/bin 安装 + `-p 22 -s -r /root/.ssh/dropbear_ed25519_host_key
+  -E >>/var/log/dropbear.log 2>&1`，:22 LISTEN（/proc/net/tcp 00000000:0016 0A）。
+
+**坑**：adb shell 里跑 rcS 式 daemon 启动，会话被 daemonized 子进程拽住直到
+超时（2min，timeout 143）——无害，daemon 活着；真机 rcS 从 init 控制台跑无此
+问题。-E 是"日志走 stderr"不是日志文件参数；先 kill $(pidof dropbear) 清口再
+起新实例。host key 从 /etc/dropbear 挪到 /root/.ssh（跟 state tar 走，系统
+更新不换钥）——known_hosts 首连要清旧条目。
+
+**接线**：build-rootfs.sh 必需依赖块（缺 .local/dropbear/bin 直接 fail）+
+rcS dropbear 块（crond 同款模式）。authorized_keys 不烤进镜像——开发期 adb
+推。bake #14 折叠待做（现役实例是 adb 推的 /bin 版，重刷收敛）。
+
+**设备终态**：/bin/{dropbear,dbclient,dropbearkey} 在役监听 :22；host key
+/root/.ssh/dropbear_ed25519_host_key；authorized_keys 含 Mac 公钥+设备自身钥。
+
+## 2026-09-04 — M42a：语音对话协议 v0（voiced 守护 + PTT + 屏面对话）
+
+产品定义 2026-09-04：手机即智能体，人无键盘——输入=嘴（PTT 按住音量下键）+
+眼（M42b），输出=嘴（TTS）+脸（/run/voice/face JSON，aterm 渲染）。协议是封闭
+词表确定性状态机（无线/状态/取消/序数/数字密码回读确认），无 LLM——WiFi 必须
+在 LLM 之前连得上。调试收据阶梯（--say→--hear→--inject→daemon→PTT→屏面）逐级
+走完，本条记观察。
+
+**收据**（redfin，全部 adb 推 /usr/bin + md5 验证）：
+- `--say "现在连接无线网络。"`：brain TTS→snd-play 出声（人耳收据 M18 同链）。
+- `--hear speech.wav`（Mac say 制的干净中文 WAV，经设备自身网络上传）：
+  ASR 回「现在连接无线网络。」逐字全对。
+- `--inject "无线"`：状态机 SM 走通，nlscan 扫描→face 写入候选列表
+  ["2602","Legrand AP","2602_5G","2501","2501_5G"]，TTS 念列表。
+- voiced 守护 agsvc 单元在役（pid 2469 起，env_file 注入 brain key），
+  启动行 `voiced: up (brain=true, ptt=true)`，stderr 落 /var/log/agsvc/voiced.log。
+- sendevent 模拟 PTT 全环（event1 KEY_VOLUMEDOWN=114，须带 SYN 帧
+  `sendevent /dev/input/event1 0 0 0`）：Down 中段 face 抓到
+  `"listening":true`；Up 后 snd-cap 采集→ASR（环境音被认成「うん、うん。」，
+  无语音时段的正常认知）→状态机回「没听懂。说无线，或说状态。」写进对话行，
+  旗回落 false。三段时序全部定格。
+- aterm VOICE 磁贴：新二进制推入 + kill aterm 由 respawn loop 重拉（2079→2703，
+  /var/aterm.log 新起行）。磁贴与屏面渲染需人眼（物理 PTT 测试一并做）。
+
+**坑（全部 2026-09-04 实测定格）**：
+- **mono 放音=无声**：QUIN_TDM_RX_0 后端 2 通道，mono FE 会话健康
+  （RUNNING、hw_ptr 走、功放 DAPM 事件齐）但无声——mono 880Hz 环采 rms 26/
+  dft880 0.2，L=R 立体声 rms 3650/dft880 2396。speak() 必须 mono→双声道复制。
+  M18 原收据本就是 stereo，这次是忘了才踩。
+- **brain TTS WAV 流式哨兵**：RIFF size 和 data 块长都打成 0x7fffffff——
+  块遍历须对 data 收敛到 EOF（fmt 截断才是真错）。
+- **边放边采的数字回环是失真副本**：aDSP 回环 880Hz FFT 可验，语音 ASR 出
+  「うん、うん。」不可认。M18 早有告诫（agent 不该同时放和听）；产品路径本就
+  顺序（PTT 采完才 TTS），voiced 不做回环自检。
+- **nlscan 行形**：`<mac>  ch=<n>  -68.00  dBm  <ssid>`——"dBm" 是独立第 4
+  token；SSID 非ASCII 打成 \xNN 转义需解回；邻居有二进制 SSID（\x04\x00…）
+  和 <hidden>，必须滤（念不出画不出）。
+- **busybox sh `. file` 不导出**：env 只在 /etc/aginx/env（agsvc 注入），手工
+  调试面要 `set -a; . /etc/aginx/env; set +a`。
+- **中段 mixer 归零（未解立案）**：一次 6h43m uptime 的会话里 M18 全套 recipe
+  值被清零（audio-bringup 却报过 "mixer done"，期间无 SSR/dmesg 异常）——手动
+  重涂无效，重启后 recipe 完好。原因不明；若再现先查 audio-bringup 与 agsvc 启
+  动竞态。同类前科见 2026-09-03 M41c 立案。
+
+**接线**：crates/voiced（main/audio/face/ptt/protocol）；agsvc.d/voiced.toml
+（type=simple，env_file 同 aginx 单元档位）；aterm VOICE 模式（face mtime 轮询，
+对话行/列表/密码行/提示行渲染）；check.sh/build-phone.sh/build-rootfs.sh 全接。
+aterm 的 KeyReader 与 voiced Ptt 同读 event1 不冲突（aterm 不碰 114）。
+
+**待人收**：物理按住音量下键说「无线」全流程（耳听 TTS 念「找到N个网络」+
+数字串发音）；VOICE 磁贴与对话面渲染人眼确认。
+
+## 2026-09-04 — M42a（续）：PTT 实测翻车与 ASR 法医（云 ASR 与采集链不兼容，立案 M42d）
+
+用户物理 PTT 实测：链路全通（Down 采集/Up ASR/状态机/写屏），但自己的话被
+ASR 认成碎片（嗯。/空串×5/我是。/Yes./好。/也是。）或空串——「说了没动静」。
+
+**法医过程**（全部同一晚定格，逐嫌疑排除）：
+- **麦克风无罪**：采集回放（Mac afplay）人耳「很清晰」；能量时间轴正常
+  （1.9s 中 0.4s 语音，rms 536/753）；频谱基频簇正常（110-212Hz），无啸叫。
+- **mixer 无罪**：中段归零未复发，M18 全 recipe 值当场复读全对。
+- **电平无罪**：好文件压到 peak 12% ASR 照样全对；坏文件放大 ×5 结果不变。
+- **频谱无罪**：好文件高通 200Hz 全对；坏文件高通无效。
+- **短词弱**：Mac say「无线」0.49s →「面白。」；「连接无线」4 字 →「人间无
+  限。」；6 字整句全对。词表 11 条轰炸：长句全过（第三个/连接无线网络/现在
+  什么状态/完了），短词全灭，且短音频会**语种漂移到日语**（ゆく？/は、は。/
+  え、そ。）——无语言锚定的小模型症状。
+- **system 提示无效**：asr() 加候选词 system 消息后输出逐字不变——brain
+  audio 模型无视 system。提示保留作词表契约，注释已改真话。
+- **决定性实验**：同一句「连接无线网络」，文件直喂全对（各种变形），Mac
+  扬声器→空气→手机麦→**满刻度放大**后喂 →「很遗憾的呃。」。
+
+**判决**：云 ASR（brain model=audio）与未校准的 rt5514 裸 DMIC 采集链不兼
+容——其训练料是 ACDB/DSP 处理过的手机音频，裸麦音色它不认。与说话人、电
+平、时长、滤波均无关。真修法=换本地 ASR（M42d #144，候选 vosk-api[用户
+提名]/sherpa-onnx，其设计中心就是远场原始音频；模型走 agpkg 下发）。语音连
+WiFi 需网络而云 ASR 需网络=首次联网死结，本地化另有产品必要性。
+
+**随案修的三件**（全部上机）：① PTB 松手 kill 截词尾——Up 后冲刷 600ms 再
+kill（收据：修复前 0.96s 丢「络」三连空串，修复后 3.77s 完整）；② 空 ASR
+从静默改成开口「没听清。请按住键，说完整的：连接无线网络。」（静默=用户以
+为死了）；③ 全部提示语改教 6 字整句（「按住音量下键说：连接无线网络」/
+「说选第几个」/「说取消退出」）——词表 contains 本就兼容长短。
+
+**实验方法坑**：远程指挥说话窗口全失败两次（6s/12s 直采全空——人没赶上窗
+口）。要采真声，让手机屏当提示（face 写「现在说」）或干脆走 PTT 路径取
+/tmp/voiced-cap.raw。
+
+## 2026-09-04 — M42d：本地 ASR+TTS 上机（sherpa-onnx bionic-static，云脑耳死结解开）
+
+选型（Mac 侧烘焙赛，此前会话收据）：ASR=sense-voice-small int8（239MB）；
+TTS=kokoro-int8-multi-lang-v1_1（147MB，multi-lang 必须带 lexicon-zh+dict，
+数字要挂 rule_fsts number/date/phone-zh）；melo 官方 fp32 包在 1.13.7 下静音
+垃圾（int8 是 133 字节假档）、matcha 全渠道无 vocoder、zipvoice 硬拒无
+vocoder——三淘汰。
+
+**集成路线（关键工艺收据）**：zig musl 吃不下官方 linux .a（libstdc++/glibc
+符号 ABI 不合）；PyPI 无 musllinux 轮子；android 包只有 JNI .so。活路=
+**NDK bionic 全静态**：ORT 1.27.1 android arm64 static_lib（222,903,327 字节
+整，csukuangfj/onnxruntime-libs）+ sherpa-onnx v1.13.7 源码 cmake
+（BUILD_SHARED_LIBS=OFF、C_API=ON、JNI=OFF、TTS=ON、**ANDROID_PLATFORM=
+android-21**——21 是 sherpa 自家脚本的缺省，29 会撞 nnapi_provider_factory.h
+缺头）+ 终链 android29 clang++ -static（**api21 静态二进制在机上 abort
+"TLS segment underaligned"，29/35 能跑**——库编 21、链 29，两头都对）。
+NDK 只有 .so 没有 libandroid/liblog/libdl 静态版：垫片 android-shims.c——
+__android_log_* 转 stderr（诊断保命）、AAsset*/dl* 死码桩（CLI 走文件路径+
+cpu provider 内建）。产物 ag-asr/ag-tts 各 26MB strip 后，md5 双侧核对推
+/var/bin/。
+
+**设备收据（2026-09-04，全部当场观察）**：
+- `ag-asr`（模型加载 ~5.5s，出字 <1s）：kokoro 合成的 24k wav（内部重采样
+  24k→16k 日志在案）→「连接无线网络。」；**昨天云 ASR 全废的两条真实 DMIC
+  采集（cap3.wav=空串三连、speech.wav）本地全对**：「连接无线网络。」/
+  「现在连接无线网络。」——M42a 判决的「云 ASR 不认裸 rt5514」就此解开，
+  短词不再漂日语。
+- `ag-tts`：24k mono wav，时长/rms 与 Mac 逐字一致（1.97s/0.075）；lexicon
+  报「Unknown token: ❓」但产物健康（无害警告）。
+- **kokoro 线程扫描定案 2 线程**：4.95s 音频，2T=38.5s（load 5.3s+生成
+  RTF≈6.7）、3T=40.1s、4T=43.1s——big.LITTLE 上加线程反降（user 时间翻倍，
+  核间同步+带宽墙）。短句「我在」级约 12s 端到端，产品可用但钝；待办=
+  常驻进程摊加载或换小模型。
+- **voiced 全链**（新 voiced 带 local-first 嘴耳）：`--say 连接无线网络`
+  21.8s 全通（ag-tts→24k→线性升采样 48k→L=R 立体声→snd-play，扬声器出声）；
+  `--hear cap3.wav` 7.9s 出「连接无线网络。」；守护重启横幅
+  `up (local=true, brain=true, ptt=true)`；`--inject 现在连接无线网络`（带
+  「现在」前缀的自然说法）状态机照吃，进 list 并真扫出 3 网络。
+- 模型位：/var/models/asr + /var/models/tts/kokoro-int8-multi-lang-v1_1
+  （md5 核对在案）；二进制 /var/bin/ag-asr、ag-tts；voiced 新版在
+  /usr/bin/voiced（单元重启生效）。
+
+**RTF 注记**：Mac 4 线程 RTF 0.78-1.19 → redfin 2 线程 6.7，差距 ~7×，比
+预估（2-4）差；换机/常驻/小模型三选一留待后续里程碑。
+
+## 2026-09-04 — rootfs 重烤 #14：M42 语音栈折叠入盘 + 换机零手工（实测）
+
+**镜像**：`809f13b-20260904`（2 GiB 稀疏，sha 082a7ba2…，**634 MB 内容**——#
+13 的 140 MB + 语音栈 494 MB）。boot e2ce2f17（=stock-boot.img）/ vendor_boot
+d80b8098 复用（#11 起未变）。apply 走 agupd pre_staged 路：boot_b/vendor_boot_b
+sha 过 → state tar 59,956,224 B 落 64 GiB → 2 GiB 体 host `cat img | adb shell
+"dd bs=4096 seek=2097153 of=/dev/block/by-name/userdata"` 直灌 → 块上原位
+哈希过 → swap committed（old fs 2,040,373,248 B）→ slot _b 激活。12:43:11
+reboot2 → 12:47 起机（~4 min，含蹦床 2 GiB 哈希+备份+拷入——体比 #13 实，蹦床
+腿按比例变长）。manifest sha 全程 `shasum | cut` 脚本注入（#13 手抄教训固化）。
+
+**折叠内容**：M42d local-first voiced（6f0a757 重烤入盘）+ `/var/bin/ag-asr`/
+`ag-tts`（bionic-static 各 26 MB，md5 与 host 构建逐字节同：770ce73f…/
+efdd2c85…）+ `/var/models/`（asr=sense-voice int8 239 MB，tts=kokoro int8
+~185 MB）。**设计决策**：模型烤进镜像而非走 provision/状态包——语音是自举
+接口（连 WiFi 之前就得说话），重下载是鸡生蛋；也不入 agupd state tar——每次
+换机省 440 MB 暂存，镜像自带即两路（clean reflash 与系统更新）都携带。provision
+只补清单件不扫未知（实证：ag-asr/ag-tts 与 provision 下发的五件+四件套在
+/var/bin 共存）。
+
+**源与工艺入仓**：`tools/voice/`（ag-asr.c/ag-tts.c/android-shims.c + cmake/
+link 正典 + README 选型淘汰记录）+ `scripts/build-voice.sh`（铺树→ORT 静态
+库→cmake→终链→strip 一键）+ `scripts/fetch-voice-models.sh`（gh 拉 k2-fsa
+releases，asr 只取 int8+tokens）。产物与工作树 `out/voice/`（gitignored，
+含 sherpa-onnx-src v1.13.7 增量构建树）——删后两脚本完整再生。
+
+**首靴全链 ok**：wifi Legrand AP 192.168.0.166 回（state tar）/home/photos
+两张实拍回 / agctl 六单元 ready（aginx、carrier、browser、agsecretd、
+net-watch、voiced）/ provision 五件 must-exist + agmem/agb/agf/dup 四件套
+全自动回 / python-finalize 守卫跑。smoke 11/11。
+
+**语音收据（全本地、零 adb 推送）**：重启后 banner `voiced: up (local=true,
+brain=true, ptt=true)`——local_voice_ready() 四路径全在烤盘上成立。TTS→ASR
+本机闭环：`ag-tts '系统重装完成'` → `ag-asr` 回读 **"系统重装完成。"** 精确
+往返（sense-voice 补句号）。`voiced --say '刷机完成，语音栈已折叠进系统镜像'`
+扬声器播报 rc=0（人耳可闻）。slot _b pri=3 act=1 succ=1（agboot-ok 已标，
+ABL 不再计tries）。
+
+**陷阱记**：① 首读 /var/log/agsvc/voiced.log 看到 `(brain=true, ptt=true)`
+旧 banner——那是 state tar 带回的昨日 M42d 实验日志（/var/log 是暂存成员），
+判 local 必须看本次启动后的行。② adb shell 传中文 argv 偶发首字节损（"无"
+变坏字节进 ag-tts，ASR 忠实回读了坏输入）——语音文本走 adb 时先核对到达侧，
+或入文件。③ macOS `cp -R` 不建中间目录：烤 tts 模型要先 mkdir 父目录（asr
+因 var/models 已建而幸免，tts 首烤即炸）。
+
+设备终态：bake #14 slot _b（aginxos 809f13b）纯烤盘运行——语音栈（voiced
+local-first + 双 CLI + 双模型）全部来自镜像，/tmp 实验痕迹已随旧 fs 换血淘汰。
+
+## M43 — 扬声器 DSP 接线 + 喇叭校准（2026-09-04，用户判"好多了"）
+
+bake #14 后扬声器音质仍糊（"还是差不多"仅加载保护固件后）。根因不是固件缺
+失，是**固件加载了但不在信号通路上**，共四层缺口，全部由 vendor
+`crus_sp_cal_mixer_paths.xml` / `mixer_paths_noextcodec_snd.xml` 配方复原：
+
+1. `PCM Source=0`（ASP 旁路）——音频绕过 DSP 直通功放，`DSP Booted` 永不置
+   1。枚举 `{0:ASP, 1:DSP}`（模块 .rodata 指针数组 0x65d0 实证 + snd-mixer
+   枚举打印互证）。置 1 瞬间 `DSP Booted` 双功放跳 1。
+2. `DRE DRE Switch=0`——Cirrus 响度增强，Android 跑 1。置 1（双）。
+3. `R Main AMP Enable=0`——**M18 配方的老 bug**：audio-bringup 写的是
+   `R AMP Enable`，此控制不存在，右功放从未开过（单喇叭）。现名
+   `R Main AMP Enable Switch`。
+4. `CAL_R=0`——保护算法盲跑（不知喇叭真实阻抗）。
+
+四层补齐后用户判"好多了"。随后跑了完整校准舞步（vendor 流程逐 ioctl 复原）：
+
+- **固件切换序列**（EBUSY 两次后解出）：`DSP Booted=0`（停 DSP）→ 功放关 →
+  `DSP1 Preload=0`（**释放已加载固件**，不释放 fw 枚举写不进）→
+  `DSP1 Firmware=<枚举>` → `Preload=1`（加载新固件）。固件在
+  `/vendor/firmware`：prot 与 **cali 都在**（cs35l41-revB2-dsp1-spk-cali.wmfw
+  + 右声道专属 R-*.bin）。
+- **DSP1 Firmware 枚举 13 项**：9=Protection（默认自动选择）、10=Calibration、
+  11=Diagnostic（MBC/VSS 等 0-8 是其他用途）。枚举文本不在 .ko/.bin 里（运行
+  时从 wmfw 注册）——给 snd-mixer 加了枚举项打印（info ioctl 按 item 查询，
+  内核填 name[64]）解出。
+- **测量**（Calibration 固件）：`CAL_AMBIENT=25`（cd 控制是 **BE u32 落在
+  snd-mixer value[0]**：写 25 = 419430400）→ 功放开 → 播 4s 静音打 TDM 钟 →
+  1 秒 `CAL_STATUS=BE(1)` 双功放成功。读出：L CAL_R=3593207808、CHECKSUM=
+  3609985024；R CAL_R=3542417408、CHECKSUM=3559194624（ambient 双 25）。
+- **回注**（切回 Protection）：8 个 cd 控制原样 BE 透传 → 功放开 → 播放打钟
+  → `CAL_SET_STATUS=BE(2)` 双功放 = 算法验收。
+- **注入的时序铁律**：只在新固件实例上生效——热 DSP 写入 `CAL_SET_STATUS`
+  停 BE(1) 不验收（试了 DSP 冷启动热写两次都不行）；开机路径天然满足
+  （Preload 首次加载 → 注入 → 暖机播放才启动 DSP）。
+
+**固化**（audio-bringup M43 段，boot-2 收据零手工）：DRE/VBSTMON → Preload=1
+（冷卡上 cd 控制注册前置）→ sleep 2 → 从 `/etc/aginx/spk-cal`（8 行
+"控制名 BE值"，state tar 随 /etc/aginx 走）注入 → PCM Source=1。重启后
+CAL_R 回读原样 + CAL_SET_STATUS=BE(2)（暖机播放打钟验收）+ PCM Source=1 +
+DSP Booted=1。
+
+**陷阱三条**：① boot-1 注入静默失败——`read -r ctl val` 双变量接不住**含空格
+的控制名**（"DSP1" 被当控制名）；改 `${line##* }`/`${line% *}` 参数展开。
+② busybox grep 的 BRE `\|` 交替不认——`grep -c "A\|B"` 恒 0 假阴性，单模式
+重查（[[redfin-busybox-awk-segfault]] 又一员）。③ mix() 失败无日志（stderr
+丢 + tail -1 空），排查开机注入要看"缺哪行"而不是"哪行报错"。
+
+**烤盘 #15（同日）**：M43（snd-mixer 枚举打印 + audio-bringup M43 段 + 右功放
+名修正）折入镜像，pre_staged 换机全绿：版本戳 aginxos 511b2b8、开机即
+PCM Source=1 / CAL_R 注入回读原样 / CAL_SET_STATUS=BE(2) 双功放 / DSP Booted=1
+（零手工）。spk-cal 经 state-restore 存活。**陷阱**：2GiB 体灌注 adb 管道
+偶发失速（宿主 cat 已退、设备 dd 卡 unix_stream_read_generic 等读 25 分钟）；
+杀掉重灌 1GiB×2 半段各 ~40-48s 满速——**大灌注分段 + 每段独立超时**是防
+失速正解，整段单命令只会无声卡死。
+
+## M42e — 语音链延迟（2026-09-04，#145）
+
+**症状**：语音回复先出字后等十几秒才有声（voiced --say 实测 28.3s，全在
+ag-tts）；后续用户实测报"第二次隔很久、说的也慢"。
+
+**根因四层，全部设备实测**：
+
+1. **cpufreq 驱动从未加载**（最大头）。`/vendor_a/lib/modules/qcom-cpufreq-hw.ko`
+   在盘上但无人 insmod → 两组核心停在 RPMh 遗留低频，A76/A55 实测只差 1.5×
+   （正常应 3×+）。`insmod` 后 policy0/6/7 出现（max 1.8/2.2/2.4GHz），同句
+   A76 钉核 22.9s→8.7s（2.6×），voiced 未钉 28.3s→11.5s。governor 用
+   schedutil：满速不折损（同 8.7s）、空闲落 300MHz 不烧待机；rcS 早期
+   insmod（开机 32.7s 即"driver up"，bring-up 全链吃满频）。
+2. **模型装载是短句延迟大头**：ag-tts 冷启 ~3.8s、ag-asr ~2s 纯装载（1 字
+   句 9.7s→装载占 9s 的佐证）。`--serve` 常驻模式（stdin 行协议 OK/ERR 行）
+   + voiced daemon 开机 warm spawn 双 server → ASR 温解码 **168ms**、TTS 温
+   合成短句 ~3.6s。一次性 --say 路径共用 resident（进程退出 stdin EOF 自
+   退，代价不变）。
+3. **调度器把推理线程摊上 A55**：pre_exec sched_setaffinity 钉 cpu6/7
+   （未钉 11.5s vs 钉 8.7s）。
+4. **"第二次很慢"的真凶**：daemon 日志 `local tts exit exit status: 2` =
+   wait_limited 格式串——挂的是 **snd-play exit 2（open EBUSY）**不是
+   ag-tts：q6 前端在上一个会话 teardown 尾巴上拒新 open（M43 走 DSP 路径
+   后放音会话更密）。open 失败毫秒级退出 → voiced 整句落 brain 云 TTS
+   （慢+换嗓子=用户听到的"隔很久+说的慢"）。修法：play_stereo_blocking
+   6×250ms 原地重试（timeout 不重试——可能已放半句）。
+
+**语速**：kokoro 原速偏拖，`AG_TTS_SPEED` 默认 1.2（样本 67742→57015，
+音频短 16%，播放时间同步短）。
+
+**boot 收据（烤前 adb 状态，rcS 推上后重启）**：cpufreq 32.7s up、三策略
+schedutil、空闲 300k/806k/940k（待机不烧）、boot.state 全绿 done ok、
+voiced daemon 自带 ag-tts+ag-asr 常驻子进程（pipe_read 待命，RSS 230M/302M）、
+冷启后 --say 7.8s（装载 3.8+合成+放完）满频 2.4GHz。
+
+**陷阱两条**：① 改了 repo 的 rcS 忘了推设备——"开机路径不生效"先查
+`md5sum /etc/init.d/rcS`（烤盘 #15 的 rcS 无 cpufreq 段）。② snd-play 的
+stderr 在 voiced 里被 Stdio::null 吞了，perror 的 EBUSY 根本看不见——
+排放音问题先看 wait_limited 的错误串格式（"exit exit status: N" 是
+wait_limited 包出来的，N=2 即 open 失败）。
+
+## 2026-09-04 — rootfs 重烤 #16：M42e 折叠入盘 + clean-reflash 验收（#147）
+
+折叠内容：rcS cpufreq 段（insmod qcom-cpufreq-hw + schedutil）、voiced
+常驻嘴耳（--serve + 预热 + EBUSY 重试 + A76 钉核）、ag-tts 语速 1.2、
+状态播报瘦身（时间+电池+网通断，IP 不再逐位念）。boot e2ce2f17（=stock，
+#11 起未变）/ rootfs be316d6a（2GiB，数据 634M）。
+
+**manifest 教训**：rootfs 在 manifest 里时 vendor_boot 不是可选——agupd
+硬闸 "the swap trampoline must ship with it"（换 rootfs 的蹦床住在
+vendor_boot 里）。vendor_boot 用 boot/out/vendor_boot-test.img
+（d80b8098，#11 起未变）。另：签名推送要落到 `manifest.json.sig` 这个
+名字（agupd 读 `<manifest>.sig`），推成 `manifest.sig` 会拿旧签名验新
+manifest 报 INVALID。
+
+**换机路径（pre_staged，全绿）**：2GiB 分两段 1GiB 灌（dd seek=2097153 /
+skip=1024 seek=2359297，这次无卡顿）→ agupd apply --no-reboot（boot_b
++ vendor_boot_b sha 过、state tar staged 64G 位、pre-staged 体校验过、
+swap committed）→ reboot2 → 槽 b 活。
+
+**验收**：版本戳 `aginxos c331488 2026-09-04`；boot.state 全绿 done ok
+（wifi Legrand AP / dhcp 192.168.0.166 / internet / time）；cpufreq 三策略
+schedutil 自 boot 生效（空闲 300k/806k→policy6 1.4G 活动频）；voiced
+daemon 500 带常驻 ag-tts 537 + ag-asr 542；spk-cal 707B 经 state-restore
+存活；`voiced --say`（一次性进程，装载 3.8s+9 字合成）10.76s 正常出声。
+provision resync 首启自愈进行中（python3 已装、codex 在拉——/var/bin
+不入 state tar，按设计自愈）。
+
+设备状态：bake #16（c331488）运行中，槽 b。
+
+## 2026-09-04 — M42e 续：vits-melo 小模型 TTS 上机（用户复测"还是很慢"的解）
+
+**根因定量**：bake #16 后常驻链无退化（daemon 子进程 pid 未变=常驻一直
+健康）——用户等的 ~5s 全是 kokoro 合成本身：设备实测暖合成 7 字句
+4.1–4.9s（音频才 1.77s，RTF≈2.5）。四层修法已到 kokoro 地板。
+
+**vits-melo-tts-zh_en**（sherpa tts-models，163MB tarball）上机：
+- 暖合成 7 字句 **0.88s**（0.6s 音频）；25 字长句 **2.7s**（1.7s 音频）——
+  快 5 倍，产品路径 ~5s→**~1.9s** 出声。装载 7.4s（fp32 170MB，常驻摊掉）。
+- **陷阱①**：tarball 里 model.int8.onnx 是 133 字节的 git-lfs 指针（release
+  打包事故，int8 未单独发布）——真身只有 fp32 model.onnx。
+- **陷阱②**：tarball 不带 espeak-ng-data——软链 kokoro 目录的（同一 espeak
+  构建）即可，纯中文走 lexicon 不碰它。
+- **陷阱③**：matcha-icefall-zh-baker tarball 没有 vocoder（hifigan 缺件），
+  此路不通，弃。
+- 规则三 fst（number/date/phone，文件名与 kokoro 的 -zh 变体不同）+
+  rule_fars=new_heteronym.fst（多音字）。sherpa v1.12.15 起 vits 不用 dict_dir。
+- 播放链通用：voiced resample 是任意比线性插值，44.1k→48k 直接过，
+  voiced 零改动。
+
+**切换**：ag-tts 长出 AG_TTS_KIND=kokoro|vits|matcha（默认仍 kokoro），
+产品切换是 /etc/aginx/env 加 AG_TTS_KIND=vits + agctl restart voiced
+（env 随 state tar 存活）。A/B 现场播放（kokoro 先 melo 后），用户拍板
+"切 melo"。设备现状：voiced 常驻嘴=melo。
+
+**缓存清理（顺带）**：删 out/{m13,python,mcfg}（旧里程碑暂存，无脚本引
+用），腾 2.1G；out/m10-backup（986M，设备备份）保留待用户定。
+
+## 2026-09-04 — M42e 补：melo 输出不是中文的根因与修复（更正上文陷阱②）
+
+用户切 melo 后复听："输出的语音不对，说的不像是中文"。**上文陷阱② 的
+"软链 espeak-ng-data 即可"是错的——那个软链正是怪音的来源**，本条更正。
+
+**根因**（sherpa 源码定位，`offline-tts-vits-impl.h`）：
+- 前端选择根本不看 data_dir 走不走 espeak——melo（metadata jieba=1 +
+  is_melo_tts）直接进 `MeloTtsLexicon`，只要 lexicon.txt + tokens.txt，
+  自足，dict_dir 也不读（vits 路径无此消费）。
+- 真正的破坏在别处：`AddBlank`（token 序列隔位插 0：`0 t1 0 t2 0…`）被
+  `data_dir 非空` 这个条件**门住跳过**。melo 是 add_blank=1 的 VITS，喂
+  无插 0 的序列=喂错码 → 输出怪音 + 时长砍半（7 字句 0.65s 的病征）。
+- 配置头注释"If data_dir is given, lexicon is ignored"只描述 piper 路径，
+  按 melo 场景字面理解会引向错误结论——看 impl 实码才定案。
+
+**修复**：ag-tts vits 分支删 `data_dir=`（设备收据：7 字句音频 0.65s→
+**1.21s** 正常时长，n=28672→53248；暖合成 1.8s/7 字、4.6s/16 字，RTF≈1.5；
+上文 0.88s/2.7s 的数是合成半长错序序列时测的，作废）。设备同步：rm 软链
+`/var/models/tts/vits-melo-tts-zh_en/espeak-ng-data`，`voiced --say` 现场
+出正常中文（exit=0）。**铁律：vits/melo 绝不设 data_dir。**
+
+## 2026-09-04 — M42e 收官：破音=机身震动（用户判定）+ 音量键产品面 + 双节点输入收据
+
+**破音诊断链（排除法全过）**：线性 vs FIR 重采样同破（用户 A/B）；snd-play
+vs tinyalsa tinyplay 同破（mic-capture FFT rms 363/366 零 click）；mic 样本
+Mac 上干净→播放端无罪；7.5k 低通版干净、全带宽破；cutoff 阶梯①全带宽②6k
+破、③4.5k④3k 干净→激励能量集中在 4.5k 以上。**最终判定（用户音量键比对
+后拍板）：声音本身没问题，破音听感=高音量下喇叭激励机身震动的共振**——
+VOL 75 整机震（用户物理观察），调低即干净，数字链全部无罪定案。
+
+**落盘保留件**：7.5k 窗 sinc 低通（减激励能量；WebRTC/OPUS 语音模式
+8-12k 带宽同构，行业不裸放全带宽 VITS）；多相 FIR 重采样（44.1k→48k 镜像
+折回 12-15k 是真缺陷）。学习结论（livekit/webrtc/tinyalsa 源码）：
+AudioResampler 底下是 webrtc PushSincResampler——成熟管线不手搓 DSP，
+Rust 侧未来替换候选 rubato；tinyalsa 1.1.1 canonical：playback
+start=buffer/2、stop=buffer_size、pcm_writei EPIPE→prepare→retry（snd-play
+A/B 已排除嫌疑，改造暂缓）。
+
+**音量=0 整机静默事故**：音量下短按=−10，用户连按 60→50→40→30→20→10→
+0→0→0（agsvc 日志实锤），「音量0」播报被自己的 0 音量吞掉=纯语音产品失联。
+修复：`VOL_MIN=20` 地板（0-19 一律抬 20），vol() 链 file>env>缺省 60，
+`/var/lib/voiced/vol` 持久（state tar 内存活）。
+
+**音量上键分家（本日主收据）**：/proc/bus/input/devices KEY 位图逐位解出
+（MSB 字序，与既有收据互证）：**event0 gpio-keys 唯一键=115
+KEY_VOLUMEUP；event1 qpnp_pon=114 VOLUMEDOWN+116 POWER**。voiced 只开
+event1 时音量上永远聋（日志零上升记录实锤，用户问"音量+你没做"）。修复：
+Ptt 双节点 poll（wait() 一次 poll 全部 fd），启动日志打
+`ptt=/dev/input/event1+/dev/input/event0`。验证：sendevent 注入 event0
+code=115（收据 5538 配方带 SYN 帧）→日志「voiced: vol 30」+vol 文件落
+30+现场播报；随后用户实体键上下调比对有效（音量上物理键工作）。90s 全
+节点原始 dd 捕获窗口（ev-event0/1/2.bin）无人在窗内按键，空文件，非收据。
+
+**agctl 陷阱（流程收据）**：非登录 adb shell `PATH=/system/bin:/sbin:/bin`
+不含 agctl，`agctl restart voiced` **rc=127 且被 2>/dev/null 吞成静默空操
+作**——本日多次假重启，靠 pid 不变+/proc 启动时间戳+无新 up 行三重拆穿。
+恢复法：`kill $(pidof voiced)` → agsvc 秒级复活盘上新二进制。待办已闭：
+**agctl 真身=/usr/bin/agctl**（重启后逐目录实测），且本文件 5265 行（bake
+#14 换机收据）早就写过「adb shell PATH 无 /usr/bin，agupd/agctl 都要全路
+径」——已知陷阱被本日重踩，收据要重读不只新写。教训：重启类命令必须回显
+rc，静默即疑。
+
+**收官对账（用户拔线试听后，电源键重启回来）**：vol 文件=40；本靴日志
+完整回放用户调音轨迹——音量上扫到 100 又回落、40↔50 往复、终停 40（尾随
+「你好」验证）；重启后双节点 up 行如常
+（`ptt=/dev/input/event1+/dev/input/event0`），pid 506 agsvc 领养。#145 关。
+
+**延迟收尾（用户判"可以接受"）**：分句流水合成（第一句合成完即放，后续
+句放音中并行合成，snd-play EBUSY 宽限重试接棒）；常驻 --serve 摊装载。
+冷启动首声 8.6s（自有 server 装载），暖产品路径首声≈2s，句间≈无缝。
+
+## 2026-09-04 — M42b 收官：QR 眼分支全流程收据（扫码→对→连上，round-1 0.8s）+ 光学失败形态学全谱
+
+**全流程收据（本日主收据）**：MacBook Retina 屏满屏窗显示 WiFi QR（888px
+bitmap 拉到 1275×770pt 窗，模块实物 ~1.2cm），手机后摄 **~20cm**（A4 短边）
+手持正对。`printf '扫码\n对\n' | voiced --script`，face 落地完整对话：
+「扫码」→「拍照扫码，对准二维码别动。」→「扫到网络 Legrand AP，密码10位，
+连接吗？」→「对」→「连接中。」→「连上了，地址192.168.0.166/24。」——
+**round 1、0.8s 解出**（210660B 档）。QR 可信输入不回读 psk 全文、只报位数
+的设计按协议落地。设备件：/usr/bin/agqr（538488B）+ /usr/bin/voiced（含
+4 轮 scan_qr）+ /usr/bin/ag-qr shim。
+
+**解码器三件套（全部实拍迭代出的，不是拍脑袋）**：
+1. **尺度阶梯非单调**：quircs 对 DCT 缩放档位敏感，同一张实拍 5/8（≤1280
+   请求）解出、全分辨率与 1/8 都解不出——DCT 低通恰好压掉屏拍纹波又保住
+   模块对比度。ladder=[1280(5/8 甜点),1600(3/4),1008(1/2)]，逐档首中即返。
+2. **Bradley 局部二值化兜底**：quircs identify 内部全图 Otsu，暗房拍亮屏
+   时阈值落「房间↔屏幕」之间，比房间亮的 QR 黑模块全判白（收据：满屏清晰
+   QR `no candidate patterns at all`；黑帧档 Otsu=24-26）。Bradley 积分图
+   （偏置 15%，输出双极 0/255）绕开它。**窗口铁律：必须远大于码内最大整块
+   黑区**（finder 中心 3×3 ≈3 模块）——窗口小于黑块时均匀黑区≈窗均值、整块
+   判白（收据：finder 黑环反转成白线框）。半窗 = min(w,h)/4 clamp [40,320]。
+3. **失败分类学（JPEG 尺寸是最快分诊指标）**：屏幕睡/暗→整帧 luma≈16
+   （24-58KB 平滑档）；斜 ~15° 定焦焦平面斜切屏→半码虚（大文件也不解）；
+   近 1:1 像素映射（1406px 满屏贴外接屏）→大幅值低频拍纹波浪盖码；模块
+   ~10px 且纹波同带→极性翻转。**成功配方=高 PPI 屏（Retina 227ppi，纹波
+   频率高、DCT 可压）+ 满屏窗 + ~20cm 近距（模块 ~1.2cm 实物，糊容限大）**。
+
+**scan_qr 战术**：4 轮重试（默认曝光×3 + 慢门 gain8 兜底末位），每轮独立
+留档 /tmp/voiced-qrN.jpg（收据可逐轮复盘），cam-shot 15s 预算。冷启动头
+几次调用有会话级废片（IOMMU/流热身）——多轮调用救，--frames 3 只救帧内
+曝光收敛救不了会话级。慢门+gain8 档实践三连败（暗/糊/噪），只配末位。
+
+**验收件**：fixture=crates/agqr/fixtures/screen-wifi-dummy.jpg（本日实拍，
+**DUMMY payload** `WIFI:T:WPA;S:aginx-fixture;P:1234567890;;`，284450B，
+真凭据码不入库）+ plain-gray.jpg（无码 rc=1 档）；scripts/accept/m42b-qr.sh
+**5/5 绿**（实拍解码/无码 rc=1/读图失败 rc=2/ag-qr shim 转发）。套件不跑
+全局 `ag commands --check`——设备 /var/bin 语音件（ag-tts 等）本就无
+.agmd，四件套化留 bake 后，M42b 只对自引入件负责。
+
+**流程教训**：解不出时先查「屏上到底有没有码」再查解码器——本日四连败
+里有整整一档是 Mac 屏睡了（全黑帧），另一档是窗口开到别的屏；盲拍无人
+取景器，用户持机几何每次都变，**一步一拍一反馈**（拍→看→「近一半」）
+比连发 sweep 收敛快。#139 关；M42c（#140）fresh-boot 全产品路径待 bake
+#17 后收。
+
+## 2026-09-04 — M45 收官：本地 OCR 全流程收据（念一下→盲拍→念出）+ auto 旋转发现 + ORT _Inout_ 陷阱
+
+**主收据（产���链，本日暗房）**：Mac 屏满屏窗显示 4 行中英混排测试文
+（机器视觉测试 / AginxOS 2026 / 念给你听 / TEL 138-0013-8000，DUMMY 文本），
+手机后摄竖握对屏。`/var/tmp/voiced-m45 --inject "念一下"` → cam-shot 盲拍 →
+ag-ocr → **round 1、4 行全读**，face 落地完整对话：「念一下」→「拍照念字，
+对准文字别动。」→ 4 行识别文上屏 → 拼句「机器视觉测试。AginxOS 2026。
+念给你听。TEL 138-0013-8000」**melo TTS 念出**（inject 不静音，真出声；
+最终计时那发 4/4 完美——首字符、大小写、TEL 前缀全对）。
+全程 host 计时 44.4s：相机 ~3s + ag-ocr ~5s（模型加载+auto 两轮 det+4 行
+rec），其余是 melo 逐句合成念一页字——念读产品语义内。设备件：
+/var/bin/ag-ocr（21.4MB bionic-static）+ /var/models/ocr（det 4.8MB + rec
+16.6MB + dict 74KB）+ staged voiced。
+
+**auto 旋转（本日关键技术发现）**：cam-shot 传感器横向安装，**竖握手机拍
+横排文字 = 图里文字转 90°**——产品常态。症状极具迷惑性：det 照样出 4 框
+（竖排连通域），rec 全灭（切出来的是竖条）。解法：`--rot auto`（缺省）
+先 0° 试、kept≥2 行即收，否则 90/270/180 逐个试取 (kept, conf 和) 最大。
+auto 多付一次 det（竖拍场景必然 0° 空跑）是默认代价。暗房实拍收据：
+rot 90、4/4 行 conf 0.88-0.98。
+
+**暗房曝光档**：默认自动曝光暗房拍亮屏 det 0 框 0 收（收据 shot1）；
+`--gain 16 --dgain 2`（M19 已立的高感档）det/rec 双活。冷相机首次调用
+废片（IOMMU/流热身，QR 同收据）——read_text 沿 scan_qr 阶梯：默认曝光×2 +
+gain16 兜底末位，每轮留档 /tmp/voiced-ocrN.jpg。相机热身后默认曝光 round 1
+即中（主收据）。
+
+**数值管线**：host 版（brew ORT 1.29 共享库）与设备版（NDK ORT 1.27.1
+静态链）同图**逐字节同输出**；对拍 verbatim RapidOCR v3.9.2 python oracle
+（/tmp/ocrvenv 跑上游 main.py/utils.py）数值一致——rec resize/CTC/表结构
+（blank@0 + dict 1..N + space@N+1）、det 阈值全对齐。rec.onnx 内嵌
+"character" 元数据与外置 ppocrv5_dict.txt 字节级等价（偏移 16557282 处
+protobuf）。实拍真照片（RapidOCR 自带 en_rec.jpg）36/36 行 ~0.999。
+
+**ORT 陷阱（炸了一整轮的根因，对后人）**：C API `Run` 的 output 槽签名是
+`_Inout_updates_all_` 不是 `_Out_`——非 NULL 会被当成调用者预分配的
+OrtValue 直接原子加引用计数。传未清零栈结构 = refcount 打在垃圾指针上 =
+InferenceSession::Run 内 SIGSEGV（rc=139，无栈）。解法一行：
+`memset(out, 0, sizeof *out)` 后再传。二分定位法：E1（只留 Out 结构间接）
+炸 / E2（只算 rank/n）过——嫌疑即锁定。
+
+**计时分解（设备）**：det 单轮 1127×2000 大图 ~1.3s；auto 两轮 2.7s；rec
+4 行 454ms；进程冷启（两模型加载）~1.5s。sched_setaffinity cpu6/7 + 线程 2
+（voice 同款）。合成小页（480×232）：det 676ms、rec 3 行 66ms。
+
+**验收件**：tools/ocr/fixtures/ 四件——page-synthetic.jpg（合成页，数值
+回归）+ line-en/line-zh.jpg（手工行条，--rec-only 用）+ **cam-screen-dark.jpg
+（真盲拍暗房屏照，auto-rot 光学回归，DUMMY 文本无真凭据）**；
+scripts/accept/m45-ocr.sh **10/10 绿**（合成页 3 行关键字 / 盲拍 rot 90 两
+关键字 / rec-only / 无字 rc=1 / 缺图 rc=2）。fixture 里的裁切首字符
+（「ginxOS」「给你听」）是屏边出画的图内事实，非识别错误。
+
+**形态与遗留**：v0 走 voice 先例 baked /var/bin + /var/models（build-rootfs.sh
+fold 线已加，bake #17 折叠），**不挂 ag 路由 shim**（scratch 树 lint 验不到
+/var/bin 目标，计划已注记）。四件套化（agpkg + 镜像上架）留管线稳定后
+（M46 期或独立票）。#148 主体关。设备终态：未刷机（boot 无变更），
+/var/bin/ag-ocr + /var/models/ocr staged，/var/tmp/m45 scratch 在。
+
+## 2026-09-04 — TTS 拉丁吞字终审：ag-tts 默认嘴 kokoro→melo（0f2f3b7）
+
+**用户耳朵收据**：M45 念读收包 E2E 里「机器视觉测试。AginxOS 2026。念给
+你听。TEL 138-0013-8000」——中文全念了，**AginxOS 和 TEL 无声**。
+
+**根因（ASR 回环对拍定谳）**：ag-tts 默认 `AG_TTS_KIND=kokoro` + kokoro 分支
+`lang="zh"`——zh 前端把拉丁词整词丢弃。同一句混排：kokoro 合成 2.8s，ASR
+听写只出 `2026138`；melo(vits) 合成 3.8s，ASR 听写出英文字母+全部数字
+（`Gn20026开了138的0013八0`——ASR 对合成音本来就糊，判据是 Latin 有无
+出声，非回环保真）。M42e 拍板的 melo 只写在 /etc/aginx/env（AG_TTS_KIND=
+vits），**env 只到 unit**——adb 直呼 voiced/--inject 与 fresh boot 全落回
+kokoro 默认。中文对照组 ASR 也糊（`一器是决策师`），排除「ASR 精度问题」
+的干扰解释。
+
+**修复**：ag-tts.c 默认 KIND 翻 vits（产品嘴成为所有路径缺省，env 不再是
+唯一真相）；voiced audio.rs 的 TTS_MODEL_DIR 就绪检查对齐 vits 目录。
+验证：`env -u AG_TTS_KIND` 裸跑 ag-tts 合成混排 2.95s，ASR 听写
+`GNX外2千026套138`——默认路径 Latin 出声。`voiced --say` 全句真出声
+（扬声器，用户在场听）。设备终态：/var/bin/ag-tts 已换新、voiced 已
+restart，boot 无变更。
+
+## 2026-09-04 — rootfs 重烤 #17：M42b/M45 折叠 + melo 默认嘴入盘（dd1fad6）
+
+折叠内容：agqr（QR 解码）+ voiced 念读接线（OcrDone/长文念头两行）+
+ag-ocr + /var/models/ocr（det/rec/dict）+ **TTS 模型换血 kokoro→vits-melo**
+（fp32 model.onnx 真身 170MB 烤入，133B lfs 指针不烤；kokoro 206MB 出盘
+——默认无人引用，fetch-voice-models.sh 可重取）。boot e2ce2f17（=stock）/
+vendor_boot d80b8098（蹦床版，均未变）。镜像 652M 数据（bake #16 634M：
+-206 kokoro +182 vits +21 ocr +余 binary 增量）。
+
+**manifest 陷阱（新）**：rootfs 条目走 pre_staged 必须带 `"pre_staged": true`
+——缺了会进 stage() 的普通文件路径判（url 指块设备 → "local source
+missing"）；且 url 不能是设备上可 stat 的路径（块设备 stat 出 len=0，撞
+"want non-zero 4K-aligned" 闸），用哑标签（/tmp/agupd/rootfs.img.prestaged）
++ size 字段即可。
+
+**换机路径（pre_staged，第二次全绿）**：2GiB 两段 1GiB 直灌（seek=2097153 /
+skip=1024 seek=2359297）→ agupd apply --no-reboot（boot_a/vb_a sha 过、
+state tar 60,007,424B、pre_staged 体 2GiB 原位哈希过、swap committed、槽 a
+set-active tries=7）→ reboot2 → **2.5 分钟** boot complete（比 #16 的 ~4min
+快——蹦床腿同长，等询间隔短了）。
+
+**验收**：版本戳 `aginxos dd1fad6 2026-09-04`；boot.state 全绿（wifi
+Legrand AP / dhcp 192.168.0.166 / internet 714KB / time）→ done ok →
+pkg ok（provision 自愈：python3/codex 等 /var/bin 十二件全回）；槽 a
+succ=1 tries=7（agboot-ok done-ok 门后自动标）；smoke **11/11**；voiced
+516 + 常驻 ag-tts 549 + ag-asr 554 三进程活；**烤盘 OCR 真路径**（无 env
+默认模型目录）盲拍屏照 fixture：rot 90 自找、4/4 全中（器视觉测试/ginxOS
+2026/给你听/EL138-0013-80000）；**烤盘默认嘴**（无 env）合成混排 2.95s，
+ASR 听写 `GNXY2026，它有138`——拉丁词在盘上也是 melo 默认。
+
+设备状态：bake #17（dd1fad6）运行中，槽 a。M42c（#140）产品收据待用户
+PTT 实测（语音「扫码」→「对」→连上→「状态」+「念一下」耳朵验收）。
+
+## 2026-09-04 — 代码推送手术 #2：M38a–bake#17 十七笔上 origin（3c15f15）
+
+第二次收据剥离推送（9-03 先例复用）：本地 master 与 origin 分叉 27 笔，
+其中 10 笔（M38a–M41c 期）`git cherry` 判定与 origin 补丁等价（前次手术
+哈希漂移）——真正待推 17 笔代码。push-queue 自 origin/master 起 cherry-pick
+十七笔，HARDWARE.md 冲突两处 `--ours` 保本地。三闸：HARDWARE.md 对 origin
+delta=0；push-queue 对 m45-prepush-backup 仅 HARDWARE.md +601 行；docs/
+delta 空（CARRIER/SYSTEM/ARCH 不出本地）。check.sh 全绿后
+`push origin push-queue:master` → **de38796..3c15f15**。
+
+本地 master 重排：backup 分支留全史（m45-prepush-backup=c7b5673），master
+reset 到 3c15f15 + `read-tree --reset` 逐字节复放术前树 → 单笔重放提交
+e570457（22 个收据提交压 1）。`git diff master m45-prepush-backup` 空，
+树验证过。设备无涉（纯 git 手术）。
+
+## 2026-09-04 — TTS 数字链逐位念 + 分句放缓（0679eb1，用户报障）
+
+用户 PTT 实测报障：「138-0013-8000 是电话号码，却当做数字去读」+
+速度已快、分句不必拆太散。回环定位：melo rule_fsts（number.fst 等）
+把 11 位连写读成整数——`13800138000` → ASR 听到「138亿0138000」；
+连字符/空格分段同病（`138 0013 8000` →「八千」）。空格分隔 ASCII 数字
+实测逐位念（`1 3 8 0…` →「13800138000」纯数位无亿万）。
+
+修（voiced audio.rs）：`local_speak` 前展开总位数 ≥5 的数字链
+（组间连字符/点/空格——电话/IP「192.168.0.166」/日期通吃；≤4 位不动，
+数量/年份/小数仍按数读）；`split_clauses` 只在句读切（。！？；，
+去掉逗号切点）、硬切 24→60 字、永不落数字链中间。设备验收：
+新 voiced 推上机（agctl restart），`voiced --say "机器视觉测试。TEL
+138-0013-8000"` rc=0，末句残留 wav ASR=「13800138000」纯数位。
+设备状态：bake #17 + 本修复热更（未重烤，下次 bake 折叠）。
+
+## 2026-09-04 — TTS 语速回调 1.2×→0.9×（用户收据「说话太快」）
+
+数字链/分句修完用户复听：内容对但语速快。根子是 M42e 压延迟时
+ag-tts 默认 speed=1.2×。改默认 0.9×（AG_TTS_SPEED 可覆盖），热更
+/var/bin/ag-tts + agctl restart。同文实测：wav 153644B→204844B
+（=1.2/0.9=1.333× 精确拉长），ASR 内容无损。设备态：bake #17 +
+0679eb1 + 本修复热更（待下次 bake 折叠）。
+
+## 2026-09-04 — 拉式语音 + 对话字体放大（用户产品收据两连）
+
+用户报障：「识别很快、回应也很快，但语音说出来很慢，那还不如不说，
+除非用户说你给我听」+「对话字体要和 wifi 列表一样大，现在太小」。
+
+**拉式语音**：Out 加 Speak 变体。Say=话语只上屏（daemon 不 TTS），
+Speak=点名必出声——「你说给我听/说给我听/再念一遍/重复」复述最近
+一条机器话语（confirm 态除外，那里是密码回读）、「念一下」的 OCR
+读、readback 回读。音量键回执仍出声（旋钮回声非回应）。设备收据：
+`voiced --script` 喂「你好」→屏行即时落、无 TTS；「你说给我听」→
+复述出声。**念给我听不收进点名词表**——那是 OCR 的拍+念（is_ocr），
+同词不同义（单测先拦住）。
+
+**字体**：aterm voice() 对话行 scale 3→4、行距 52→72、列裁 48，
+与 SSID 列表同级；psk 行本来就是 4。双件热更（voiced agctl restart +
+aterm kill 由 handoff 环复活）。设备态：bake #17 + 三连热更（0679eb1
+数字链/948d809 语速/本组），全部待下次 bake 折叠。
+
+## 2026-09-04 — rootfs 重烤 #18：语音四连修固化 + clean-reflash（#157）
+
+折叠内容：0679eb1 数字链逐位念（expand_digit_chains 链内 ≥5 位空格展开
++ 分句只在句读切、MAX 24→60）、948d809 ag-tts 语速 1.2→0.9、b15f773
+拉式语音（Say 上屏不出声 / Speak 点名必 TTS + 帮助语更新）、001fcf5
+aterm 对话行 scale 4 与 SSID 列表同级。boot e2ce2f17 / vendor_boot
+d80b8098 复用（#11 起未变），rootfs 63521cdc（2GiB，数据 651M）。
+
+**换机路径（pre_staged，第三次全绿）**：/tmp/agupd 推四件（boot.img/
+vendor_boot.img/manifest.json/.sig——apply 对目标槽无条件重刷，boot
+文件必须在位）；2GiB 两段 1GiB 管道直灌（`dd bs=1M count=1024 | adb
+shell "dd bs=4096 seek=2097153 of=userdata"`，续段 host skip=1024 +
+seek=2359297，每段 ~30s 无卡顿）；段首/段尾 sha 抽查与镜像对拍相等 →
+agupd apply --no-reboot 全绿（boot_b/vb_b sha 过、state tar 60,015,616B、
+pre-staged ��原位 2GiB 哈希过、swap committed、槽 b set-active）→
+reboot2 → ~3 分钟回来。刷前 /etc 备份 .local/backup-etc-bake18/etc.tar。
+
+**验收**：版本戳 aginxos 761731e 2026-09-04（槽 b）；boot.state 全绿
+（wifi Legrand AP / dhcp 192.168.0.166 / internet / time / done ok / pkg
+ok / py 3.12.14）；agboot-ok 槽 b 全盘 act=1 succ=1 tries=7；smoke 11/11
+（首跑 10/11 是 codex 大包首启在拉的时序，拉完复跑即绿）；voiced 473 +
+常驻 ag-tts/ag-asr 三进程在位，up 行 local=true brain=true（env 经
+state-restore 存活）。
+
+**烤后语音复核（ASR 回环）**：
+- 数字链：「电话138-0013-8000」→「演化13800138000」——11 位逐位完整、
+  无亿/万标记（修前同句回环「138亿0138000」）；「验证码 8000」→按数读
+  （短链设计，ASR 反写 800）；「圆周率是3.14」→原样保真。
+- 语速：同句 wav 204,844B，与 0.9× 热更收据字节精确相等（1.2× 时
+  153,644B）。
+- 拉式：「你好」→ /tmp/voiced-tts.wav 不存在（零 TTS 调用）；补
+  「你说给我听」→ wav 357,420B（Speak 出声）。
+- 观察项（非故障）：0.9× 语速下 sense-voice 对 8 字短句有降质
+  （「机器视觉测试」回环「开我」）——嘴的输出正确，是耳朵对慢语速的
+  识别损失；产品路径 PTT 采集的是人声不受影响。
+
+设备状态：bake #18（761731e）运行中，槽 b。
