@@ -6203,3 +6203,24 @@ server spawn 路由器、输出回喂出答）→ 住（跨轮记性）→ 切 �
 
 设备状态：不变——bake #18（761731e）运行中，槽 b。新仓线与设备线
 并行，互不影响。
+
+## 2026-09-05 — N2① 平台心脏上机并行试跑（新仓 aginxos-next，46c6ef0）
+
+新仓三件首次上真机，与老 carrier 线并行：musl 静态（cargo-zigbuild，
+aginx 490K / server 3.0M / runtime 3.0M）push 到隔离树 /home/.aginx-n
+（不进 PATH——老 relay 的 /var/bin/aginx 名字未让，显式路径调用；不碰
+~/.aginx；不注册单元——那是 N3 agpkg 的事）。socket /tmp/aginx-n.sock。
+
+**验收**（新仓 scripts/accept/n2.sh，16/16 绿，首跑 14/16 的两个 FAIL
+是 host 侧 BSD grep 不认 `|` 分枝的断言 bug，设备行为全对；改 -Eq 复跑
+全绿）：母体直答（真 brain.aginx.net，key 从 /etc/aginx/env 单行取只进
+env）→ create 小满/阿澈 → 点名+真工具（brain 自选 aginx-dev-echo、
+server spawn 路由器、输出回喂）→ 住跨轮记性 → 切 → 退房词回母体 →
+小满账 6 帧收口 → 杀进程冷重启：光标回 me + 小满从 sessions/main.jsonl
+重放恢复。收场 server 已杀、socket 已删、无残留进程；老线六服务
+（aginx/carrier/aginxbrowser/agsecretd/net-watch/voiced）全程 ready。
+
+观察：设备上一轮真 brain 对话体感与 host 同速（UDS+spawn 链无感）。
+
+设备状态：不变——bake #18（761731e）运行中，槽 b；/home/.aginx-n 留
+作下轮试跑基线（套件开跑会清）。
