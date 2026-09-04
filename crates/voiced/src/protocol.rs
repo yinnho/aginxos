@@ -39,6 +39,9 @@ pub enum Act {
     Ocr,
     /// 状态查询（时间/电池/IP）——daemon 读系统后经 inject_say 出声
     Status,
+    /// 自由文本喂母体/新前台（N2②：aginx agent send）。封闭词表全部
+    /// miss 时走这里；前台不可达由 daemon 落回离线地板话。
+    Chat(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +86,9 @@ pub struct Vm {
     list: Vec<String>,
     /// 已选中的列表项（1-based；0 = 未选）
     sel: usize,
+    /// 自由文本改投新前台（N2②）。false = 老行为（没听懂地板）。
+    /// new() 恒 false——上千行既有测试不动，开前台一律 with_front()。
+    front: bool,
 }
 
 impl Vm {
@@ -92,6 +98,15 @@ impl Vm {
             lines: Vec::new(),
             list: Vec::new(),
             sel: 0,
+            front: false,
+        }
+    }
+
+    /// 开前台的 Vm：step_idle 的自由文本分支改投 Act::Chat。
+    pub fn with_front() -> Vm {
+        Vm {
+            front: true,
+            ..Vm::new()
         }
     }
 
@@ -327,7 +342,15 @@ impl Vm {
                 "我能连无线、扫码、念字。回应都在屏幕上，要听我说，说你说给我听。",
             );
         } else {
-            self.say(outs, "没听懂。说完整的：连接无线网络，或扫码，或念一下。");
+            if self.front {
+                // N2②：封闭词表 miss = 自由文本 → 母体（新前台）。封闭
+                // 词表本身仍本地优先（WiFi/扫码/念读是离线地板，不进
+                // brain 往返）；前台不可达由 daemon 收兜底话，这里不降级。
+                self.say(outs, "问母体，稍等。");
+                outs.push(Out::Act(Act::Chat(text.to_string())));
+            } else {
+                self.say(outs, "没听懂。说完整的：连接无线网络，或扫码，或念一下。");
+            }
         }
         outs.push(Out::Show);
     }
@@ -1209,5 +1232,59 @@ mod tests {
         assert_eq!(vm.state_name(), "idle");
         let o = vm.step(Ev::OcrDone(Err("ag-ocr rc=2".into())));
         assert_eq!(says(&o), vec!["没拍到文字，正对着它再说念一下。"]);
+    }
+
+    // ---------------- N2②：前台模式（自由文本 → Act::Chat） ----------------
+
+    #[test]
+    fn front_off_free_text_falls_to_didnotunderstand() {
+        // 老行为分毫不动：不开前台，自由文本还是没听懂地板
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "今天北京天气怎么样");
+        assert_eq!(says(&o), vec!["没听懂。说完整的：连接无线网络，或扫码，或念一下。"]);
+        assert!(o.iter().all(|x| !matches!(x, Out::Act(Act::Chat(_)))));
+    }
+
+    #[test]
+    fn front_on_free_text_routes_to_chat() {
+        let mut vm = Vm::with_front();
+        let o = heard(&mut vm, "今天北京天气怎么样");
+        assert_eq!(says(&o), vec!["问母体，稍等。"]);
+        let chat = o.iter().find_map(|x| match x {
+            Out::Act(Act::Chat(t)) => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(chat, Some("今天北京天气怎么样".to_string()));
+        assert_eq!(vm.state_name(), "idle"); // 不占对话状态
+    }
+
+    #[test]
+    fn front_on_closed_vocab_stays_local() {
+        // 离线地板不进 brain 往返：WiFi/状态/问好全本地
+        let mut vm = Vm::with_front();
+        let o = heard(&mut vm, "连接无线网络");
+        assert!(matches!(o.iter().find(|x| matches!(x, Out::Act(_))), Some(Out::Act(Act::Scan))));
+        assert_eq!(says(&o), vec!["扫描网络。"]);
+
+        let o = heard(&mut vm, "你好");
+        assert_eq!(says(&o), vec!["我在。说连接无线网络，或说扫码、念一下。"]);
+
+        let o = heard(&mut vm, "现在几点了");
+        assert!(matches!(
+            o.iter().find(|x| matches!(x, Out::Act(_))),
+            Some(Out::Act(Act::Status))
+        ));
+    }
+
+    #[test]
+    fn front_on_cancel_and_speak_still_work() {
+        // 取消/点名出声与前台无关：优先级在自由文本之前
+        let mut vm = Vm::with_front();
+        let o = heard(&mut vm, "取消");
+        assert_eq!(says(&o), vec!["已取消。"]);
+
+        let _ = heard(&mut vm, "今天北京天气怎么样"); // 问母体（daemon 出去）
+        let o = heard(&mut vm, "你说给我听");
+        assert_eq!(speaks(&o).len(), 1); // 复述最后一句机器行
     }
 }

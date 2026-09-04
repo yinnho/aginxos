@@ -7,6 +7,11 @@
 //! 词表的确定性状态机（protocol.rs），没有 LLM——WiFi 必须在 LLM 可用
 //! 之前连得上。
 //!
+//! **前台模式（N2②）**：env `VOICED_FRONT=<aginx 路由器路径>` 时自由文本
+//! （封闭词表 miss）改投新前台——`aginx agent send`（母体/化身光标，
+//! AGINX_SOCK 决定找哪台 server）。封闭词表仍本地优先（离线地板），
+//! 前台不可达落回地板话。不设此 env = 老行为分毫不动。
+//!
 //! 调试面（收据阶梯，从嘴/耳单器官到全环）：
 //!   voiced --say "文本"          只测嘴（TTS→扬声器）
 //!   voiced --hear <wav文件>      只测耳（WAV→ASR→打印文本）
@@ -28,6 +33,26 @@ use std::time::{Duration, Instant};
 
 const TIMEOUT_SECS: u64 = 45; // 提示后无语音的退出时限
 const JOIN_BUDGET_SECS: u32 = 90;
+/// 母体一轮（真 brain，含工具往返）的等待预算——超了杀掉落地板话。
+const FRONT_BUDGET_SECS: u32 = 90;
+
+/// 前台模式开关：VOICED_FRONT=新前台路由器路径（aginx）→ 开。
+/// 只认这个 env，不猜 PATH——试跑期路由器在隔离树里，路径是显式合同。
+fn front_bin() -> Option<String> {
+    match std::env::var("VOICED_FRONT") {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => None,
+    }
+}
+
+/// Vm 构造口：前台模式开 with_front，否则老 Vm（行为分毫不动）。
+fn make_vm() -> Vm {
+    if front_bin().is_some() {
+        Vm::with_front()
+    } else {
+        Vm::new()
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -46,7 +71,7 @@ fn main() {
         }
         Some("--inject") => {
             let text = args.get(2).expect("usage: voiced --inject <text>").clone();
-            let mut vm = Vm::new();
+            let mut vm = make_vm();
             face::write(&vm, false, false);
             let outs = vm.step(Ev::Heard(text));
             run_outs(&mut vm, outs, None);
@@ -56,7 +81,7 @@ fn main() {
             // 一次一进程，扫码→确认这种多步流跑不完整）。run_outs 在步间阻塞
             // ——相机/TTS 落完才读下一行，喂两行也能按序走完。
             let brain = audio::Brain::from_env();
-            let mut vm = Vm::new();
+            let mut vm = make_vm();
             face::write(&vm, false, false);
             let mut line = String::new();
             loop {
@@ -85,7 +110,7 @@ fn main() {
 
 fn daemon() {
     let brain = audio::Brain::from_env();
-    let mut vm = Vm::new();
+    let mut vm = make_vm();
     let mut ptt = ptt::Ptt::open();
     if ptt.is_none() {
         eprintln!("voiced: no {} — PTT dead, face only", ptt::PTT_DEV);
@@ -285,6 +310,19 @@ fn run_outs(vm: &mut Vm, outs: Vec<Out>, brain: Option<&audio::Brain>) {
                         say(&s, brain);
                     }
                 }
+                Act::Chat(text) => {
+                    face::write(vm, false, true);
+                    let reply = match chat_front(&text) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("voiced: front {e}");
+                            "现在连不上母体。固定说法还在：连接无线网络，或扫码，或念一下。"
+                                .to_string()
+                        }
+                    };
+                    // 拉式：回复上脸不出声，点名（你说给我听）才 Speak
+                    let _ = vm.inject_say(&reply);
+                }
             },
         }
     }
@@ -296,6 +334,35 @@ fn run_outs(vm: &mut Vm, outs: Vec<Out>, brain: Option<&audio::Brain>) {
 }
 
 // ---------------- 执行件 ----------------
+
+/// 自由文本 → 母体/新前台（N2②）。spawn VOICED_FRONT 的路由器
+/// （`aginx agent send`——不带名字=住当前光标），成功 stdout 就是回复
+/// 文本；挂死有预算（wait_limited kill）。AGINX_SOCK 由环境继承。
+fn chat_front(text: &str) -> Result<String, String> {
+    let bin = front_bin().ok_or_else(|| "VOICED_FRONT not set".to_string())?;
+    let mut child = Command::new(&bin)
+        .args(["agent", "send", text])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn {bin}: {e}"))?;
+    audio::wait_limited(&mut child, FRONT_BUDGET_SECS)
+        .map_err(|e| format!("front {e}"))?;
+    let out = child.wait().map_err(|e| e.to_string())?;
+    let mut stdout = String::new();
+    if let Some(mut r) = child.stdout.take() {
+        use std::io::Read;
+        let _ = r.read_to_string(&mut stdout);
+    }
+    let reply = stdout.trim().to_string();
+    if !out.success() {
+        return Err(format!("exit {}", out.code().unwrap_or(-1)));
+    }
+    if reply.is_empty() {
+        return Err("empty reply".into());
+    }
+    Ok(reply)
+}
 
 /// nlscan wlan0 → 去重（保信号最强）、滤 hidden、按信号排序，cap 10（序数上限）。
 fn scan_ssids() -> Result<Vec<String>, String> {
