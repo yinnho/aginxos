@@ -34,9 +34,10 @@ int main(int argc, char **argv) {
     if (!dir || !*dir) dir = defdir;
     const char *sid_s = getenv("AG_TTS_SID");
     int sid = sid_s && *sid_s ? atoi(sid_s) : 8;
-    // 语音 UI 默认比 kokoro 原速利落一档（1.2×）；AG_TTS_SPEED 可覆盖。
+    // 语速 0.9（用户收据 2026-09-04：1.2× 太快）——M42e 压延迟时提到 1.2×，
+    // melo 常驻后延迟已不是瓶颈，听感优先；AG_TTS_SPEED 可覆盖。
     const char *speed_s = getenv("AG_TTS_SPEED");
-    float speed = speed_s && *speed_s ? strtof(speed_s, NULL) : 1.2f;
+    float speed = speed_s && *speed_s ? strtof(speed_s, NULL) : 0.9f;
     const char *out = serve
         ? (argc > 2 ? argv[2] : "/tmp/ag-tts-serve.wav")
         : (argc > 2 ? argv[2] : "/tmp/ag-tts-out.wav");
