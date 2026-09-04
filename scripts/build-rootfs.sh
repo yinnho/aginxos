@@ -42,6 +42,17 @@ MKE2FS="$(command -v mke2fs || true)"
 test -z "${MKE2FS}" && MKE2FS=/opt/homebrew/bin/mke2fs
 test -x "${MKE2FS}" || { echo "mke2fs not found (android-platform-tools provides it)" >&2; exit 1; }
 
+# OCR stack (M45) — PP-OCRv5 mobile det+rec on the raw ORT C API, bionic
+# static. Same bootstrap rationale as voice: 念读 is an eye path that must
+# work offline; the ~21MB models ride the baked image (not provision, not
+# the agupd state tar — voice-models precedent).
+OCR="${ROOT}/out/ocr"
+test -x "${OCR}/bin/ag-ocr" \
+  || { echo "missing out/ocr/bin/ag-ocr — run scripts/build-ocr.sh" >&2; exit 1; }
+test -s "${OCR}/models/det.onnx" && test -s "${OCR}/models/rec.onnx" \
+  && test -s "${OCR}/models/dict.txt" \
+  || { echo "missing ocr models — run scripts/fetch-ocr-models.sh" >&2; exit 1; }
+
 rm -rf "${TREE}"
 mkdir -p "${TREE}"
 
@@ -257,6 +268,13 @@ cp "${TARGET}/agqr" "${TREE}/usr/bin/agqr"
 mkdir -p "${TREE}/var/bin"
 cp "${VOICE}/bin/ag-asr" "${VOICE}/bin/ag-tts" "${TREE}/var/bin/"
 chmod 755 "${TREE}/var/bin/ag-asr" "${TREE}/var/bin/ag-tts"
+# OCR (M45) — bionic-static CLI voiced shells out to
+# (path hardcoded in crates/voiced/src/main.rs: /var/bin/ag-ocr).
+cp "${OCR}/bin/ag-ocr" "${TREE}/var/bin/ag-ocr"
+chmod 755 "${TREE}/var/bin/ag-ocr"
+mkdir -p "${TREE}/var/models/ocr"
+cp "${OCR}/models/det.onnx" "${OCR}/models/rec.onnx" \
+   "${OCR}/models/dict.txt" "${TREE}/var/models/ocr/"
 # Voice models (M42d) — sense-voice int8 ASR + kokoro int8 TTS (~440MB).
 # NOT in the agupd state tar: they ride every baked image instead, so a
 # clean reflash AND a system update both carry them without a 440MB tar
