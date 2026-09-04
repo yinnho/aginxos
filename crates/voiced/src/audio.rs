@@ -15,6 +15,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -24,8 +25,49 @@ pub const SND_CAP: &str = "/bin/snd-cap";
 pub const SND_PLAY: &str = "/bin/snd-play";
 pub const RATE: u32 = 48_000; // M18 听 recipe 的已证形状（MM1 mono 48k）
 pub const CHANS: u32 = 1;
-pub const VOL: &str = "75"; // M18 收据：60 清晰、80 更响；75 折中
 pub const CAP_MAX_SECS: u32 = 30;
+
+// ---- 音量（M42e 产品面：短按音量±键调，长按音量下=PTT）----
+// VOL 75 的观察收据：机身震 + 4.5-6k 破音——功放过推。改 60 起步，用户
+// 键控微调。优先级：/var/lib/voiced/vol（键调持久，state tar 内存活）>
+// AG_VOICE_VOL env > 缺省 60。AtomicU8=0 表示未初始化（真值经 clamp_vol 恒 ≥20）。
+static VOL: AtomicU8 = AtomicU8::new(0);
+const VOL_FILE: &str = "/var/lib/voiced/vol";
+/// 地板 20：2026-09-03 设备收据——连续短按音量下到 0 后整机静默，连「音量0」
+/// 播报都被自己的 0 音量吞掉。纯语音产品里 vol=0 等于设备失联，0-19 一律抬 20。
+const VOL_MIN: u8 = 20;
+
+fn clamp_vol(v: i32) -> u8 {
+    v.clamp(VOL_MIN as i32, 100) as u8
+}
+
+pub fn vol() -> u8 {
+    let v = VOL.load(Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let v = std::fs::read_to_string(VOL_FILE)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .or_else(|| {
+            std::env::var("AG_VOICE_VOL")
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+        })
+        .map(clamp_vol)
+        .unwrap_or(60);
+    VOL.store(v, Ordering::Relaxed);
+    v
+}
+
+/// ±delta 钳 20-100，写 VOL_FILE 持久，返回新值。
+pub fn adjust_vol(delta: i32) -> u8 {
+    let v = clamp_vol(vol() as i32 + delta);
+    VOL.store(v, Ordering::Relaxed);
+    let _ = std::fs::create_dir_all("/var/lib/voiced");
+    let _ = std::fs::write(VOL_FILE, v.to_string());
+    v
+}
 
 fn agent() -> ureq::Agent {
     let config = ureq::Agent::config_builder()
@@ -54,7 +96,11 @@ impl Brain {
         let key = std::env::var("AGINXBRAIN_API_KEY").ok()?;
         let base = std::env::var("AGINXBRAIN_URL")
             .unwrap_or_else(|_| "https://brain.aginx.net".to_string());
-        Some(Brain { base, key, agent: agent() })
+        Some(Brain {
+            base,
+            key,
+            agent: agent(),
+        })
     }
 
     /// WAV 字节 → 文本
@@ -88,11 +134,15 @@ impl Brain {
             .send(&body.to_string())
             .map_err(|e| format!("asr post: {e}"))?;
         let status = resp.status().as_u16();
-        let txt = resp.into_body().read_to_string().map_err(|e| format!("asr body: {e}"))?;
+        let txt = resp
+            .into_body()
+            .read_to_string()
+            .map_err(|e| format!("asr body: {e}"))?;
         if status != 200 {
             return Err(format!("asr http {status}: {}", &txt[..txt.len().min(200)]));
         }
-        let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| format!("asr json: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&txt).map_err(|e| format!("asr json: {e}"))?;
         v.pointer("/choices/0/message/content")
             .and_then(|c| c.as_str())
             .map(String::from)
@@ -115,11 +165,15 @@ impl Brain {
             .send(&body.to_string())
             .map_err(|e| format!("tts post: {e}"))?;
         let status = resp.status().as_u16();
-        let txt = resp.into_body().read_to_string().map_err(|e| format!("tts body: {e}"))?;
+        let txt = resp
+            .into_body()
+            .read_to_string()
+            .map_err(|e| format!("tts body: {e}"))?;
         if status != 200 {
             return Err(format!("tts http {status}: {}", &txt[..txt.len().min(200)]));
         }
-        let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| format!("tts json: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&txt).map_err(|e| format!("tts json: {e}"))?;
         let path = v
             .pointer("/output/audio")
             .and_then(|a| a.as_str())
@@ -168,28 +222,49 @@ impl Brain {
 }
 
 /// 放 /tmp/voiced-tts.raw（48k L=R stereo），阻塞到放完。
-///
-/// snd-play 的 open 会在上一个会话 teardown 的尾巴上吃 EBUSY（M42e 设备
-/// 收据：一次 exit 2 → 整句落 brain 云 TTS，用户听到慢的云嗓）。open 失败
-/// 是毫秒级退出——原地小睡重试；timeout（可能已放出半句）不重试。
 fn play_stereo_blocking(samples: usize) -> Result<(), String> {
-    let budget = samples / RATE as usize + 5;
+    let budget = (samples / RATE as usize + 5) as u32;
+    match play_stereo_spawn()? {
+        None => Ok(()), // 短音频在宽限窗内已放完
+        Some(mut child) => wait_limited(&mut child, budget),
+    }
+}
+
+/// 起 snd-play 放 /tmp/voiced-tts.raw，不阻塞：open EBUSY（上一会话
+/// teardown 的尾巴，M42e 设备收据）是毫秒级退出——原地小睡重试；GRACE
+/// 后仍在跑即接管成功返回 child。分句下限 4 字 ≈0.5s 音频，宽限内
+/// clean 退出=真放完了（返回 None）。
+fn play_stereo_spawn() -> Result<Option<Child>, String> {
+    const GRACE_MS: u64 = 400;
     let mut last_err = String::new();
     for _ in 0..6 {
+        let vol_s = vol().to_string();
         let mut child = Command::new(SND_PLAY)
-            .args([PCM_PLAY, "/tmp/voiced-tts.raw", &RATE.to_string(), "2", VOL])
+            .args([
+                PCM_PLAY,
+                "/tmp/voiced-tts.raw",
+                &RATE.to_string(),
+                "2",
+                &vol_s,
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("snd-play spawn: {e}"))?;
-        match wait_limited(&mut child, budget as u32) {
-            Ok(()) => return Ok(()),
-            Err(e) if e == "timeout" => return Err(e),
-            Err(e) => {
-                last_err = e;
-                std::thread::sleep(Duration::from_millis(250));
+        let deadline = std::time::Instant::now() + Duration::from_millis(GRACE_MS);
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) if st.success() => return Ok(None),
+                Ok(Some(st)) => {
+                    last_err = format!("exit {st}");
+                    break; // EBUSY 等 → 小睡重试
+                }
+                Ok(None) if std::time::Instant::now() >= deadline => return Ok(Some(child)),
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => return Err(format!("wait: {e}")),
             }
         }
+        std::thread::sleep(Duration::from_millis(250));
     }
     Err(format!("snd-play: {last_err}"))
 }
@@ -252,7 +327,8 @@ pub fn wav_data_span(wav: &[u8]) -> Result<(usize, usize), String> {
     let mut off = 12;
     while off + 8 <= wav.len() {
         let id = &wav[off..off + 4];
-        let sz = u32::from_le_bytes([wav[off + 4], wav[off + 5], wav[off + 6], wav[off + 7]]) as usize;
+        let sz =
+            u32::from_le_bytes([wav[off + 4], wav[off + 5], wav[off + 6], wav[off + 7]]) as usize;
         let body = off + 8;
         if body + sz > wav.len() {
             // brain 的 TTS 是流式合成：未知长度打成 0x7fffffff 哨兵
@@ -338,7 +414,11 @@ impl VoiceServer {
         let mut child = cmd.spawn().map_err(|e| format!("spawn {bin}: {e}"))?;
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let reader = BufReader::new(child.stdout.take().ok_or("no stdout")?);
-        Ok(VoiceServer { child, stdin, reader })
+        Ok(VoiceServer {
+            child,
+            stdin,
+            reader,
+        })
     }
 
     /// 一行请求一行应答；poll 等应答行可读（挂死的子进程不能拖死 daemon
@@ -348,7 +428,11 @@ impl VoiceServer {
         use std::os::fd::AsRawFd;
         writeln!(self.stdin, "{req}").map_err(|e| format!("write: {e}"))?;
         self.stdin.flush().map_err(|e| format!("flush: {e}"))?;
-        let mut pfd = libc::pollfd { fd: self.reader.get_ref().as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: self.reader.get_ref().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let rc = unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as i32) };
         if rc < 0 {
             return Err(format!("poll: {}", std::io::Error::last_os_error()));
@@ -357,7 +441,10 @@ impl VoiceServer {
             return Err("timeout".into());
         }
         let mut line = String::new();
-        let n = self.reader.read_line(&mut line).map_err(|e| format!("read: {e}"))?;
+        let n = self
+            .reader
+            .read_line(&mut line)
+            .map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             return Err("eof".into()); // server 死了
         }
@@ -462,33 +549,96 @@ pub fn local_asr(wav: &[u8]) -> Result<String, String> {
     Ok(text)
 }
 
-/// 文本 → 扬声器：ag-tts 出 WAV（kokoro 24k mono，常驻优先）→ 升采样 48k
-/// → L=R 立体声 → snd-play。播放链 48k stereo 是 MM1 已证形状；线性插值
-/// 升采样语音足够。
+/// 文本 → 扬声器：分句流水（M42e 续：整段合成完才放是长句延迟的大头）。
+/// 按停顿标点切句，第一句合成完立即起放音，后续句在放音中由常驻 server
+/// 并行合成——server 是独立进程，snd-play 放音不占它。TTS wav → FIR 升采
+/// 样 48k → L=R 立体声 → snd-play。常驻不可用/中途挂 → 整段一次性兜底。
 pub fn local_speak(text: &str) -> Result<(), String> {
-    if resident_tts(text).is_err() {
-        // 常驻不可用（起不来/挂死）——一次性老路径兜底
-        eprintln!("voiced: tts serve failed — one-shot");
-        let mut cmd = Command::new(AG_TTS);
-        cmd.args([text, TTS_WAV]);
-        pin_big_cores(&mut cmd);
-        let out = cmd.output().map_err(|e| format!("ag-tts spawn: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "ag-tts {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
+    if speak_streamed(&split_clauses(text)).is_ok() {
+        return Ok(());
+    }
+    eprintln!("voiced: tts serve failed — one-shot");
+    let mut cmd = Command::new(AG_TTS);
+    cmd.args([text, TTS_WAV]);
+    pin_big_cores(&mut cmd);
+    let out = cmd.output().map_err(|e| format!("ag-tts spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ag-tts {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     let wav = fs::read(TTS_WAV).map_err(|e| format!("tts read: {e}"))?;
-    let (off, len) = wav_data_span(&wav)?;
-    let rate = wav_rate(&wav)?;
+    let samples = stage_wav(&wav)?;
+    play_stereo_blocking(samples)
+}
+
+/// 分句：按中英停顿标点切（。！？；，、及 ASCII 对应），句 ≥4 字（太短
+/// 并前句——放音 <0.5s 会踩接棒宽限期），无标点长段每 24 字硬切。
+fn split_clauses(text: &str) -> Vec<String> {
+    const MIN: usize = 4;
+    const MAX: usize = 24;
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        cur.push(ch);
+        let stop = matches!(
+            ch,
+            '。' | '！' | '？' | '；' | '，' | '、' | '.' | '!' | '?' | ';' | ','
+        );
+        let n = cur.chars().count();
+        if (stop && n >= MIN) || n >= MAX {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        if cur.chars().count() < MIN {
+            match out.last_mut() {
+                Some(l) => l.push_str(&cur),
+                None => out.push(cur),
+            }
+        } else {
+            out.push(cur);
+        }
+    }
+    if out.is_empty() {
+        out.push(text.to_string());
+    }
+    out
+}
+
+/// 逐句流水：合成一句 → 转 raw 落盘 → 等上一句放完 → 接棒放本句。
+fn speak_streamed(clauses: &[String]) -> Result<(), String> {
+    let mut playing: Option<(Child, u32)> = None;
+    for c in clauses {
+        resident_tts(c)?;
+        let wav = fs::read(TTS_WAV).map_err(|e| format!("tts read: {e}"))?;
+        let samples = stage_wav(&wav)?;
+        if let Some((mut prev, budget)) = playing.take() {
+            wait_limited(&mut prev, budget).map_err(|e| format!("prev snd-play: {e}"))?;
+        }
+        if let Some(child) = play_stereo_spawn()? {
+            playing = Some((child, (samples / RATE as usize + 5) as u32));
+        }
+    }
+    if let Some((mut last, budget)) = playing.take() {
+        wait_limited(&mut last, budget).map_err(|e| format!("snd-play: {e}"))?;
+    }
+    Ok(())
+}
+
+/// wav（TTS 产物）→ FIR 升采样 48k → 7.5k 低通 → L=R 立体声写
+/// /tmp/voiced-tts.raw，返回样本数（放音等待预算用）。
+fn stage_wav(wav: &[u8]) -> Result<usize, String> {
+    let (off, len) = wav_data_span(wav)?;
+    let rate = wav_rate(wav)?;
     let up = if rate != RATE {
         resample(&wav[off..off + len], rate, RATE)?
     } else {
         wav[off..off + len].to_vec()
     };
+    let up = lowpass(&up, RATE, 7_500.0);
     let samples = up.len() / 2;
     let mut stereo = Vec::with_capacity(up.len() * 2);
     for s in up.chunks_exact(2) {
@@ -496,7 +646,7 @@ pub fn local_speak(text: &str) -> Result<(), String> {
         stereo.extend_from_slice(s); // L = R
     }
     fs::write("/tmp/voiced-tts.raw", &stereo).map_err(|e| format!("tts tmp: {e}"))?;
-    play_stereo_blocking(samples)
+    Ok(samples)
 }
 
 /// 从 RIFF 头取采样率（fmt 块 body+4）。
@@ -530,6 +680,10 @@ pub fn wav_rate(wav: &[u8]) -> Result<u32, String> {
 }
 
 /// S16 mono 线性插值重采样。
+/// 窗 sinc 多相 FIR 重采样。M42e 设备收据：线性插值在 44.1k→48k 把
+/// 8-11k 齿音镜像折回 12-15k，用户耳朵听出破音；FIR 版同句 A/B 干净
+/// （kokoro 24k 时镜像落点不同没暴露）。相数 p=升采样因子、每相 L 抽头、
+/// blackman 窗、截止=低侧奈奎斯特——语音带 ≤11.5k，镜像全落阻带。
 pub fn resample(raw: &[u8], from: u32, to: u32) -> Result<Vec<u8>, String> {
     if from == to {
         return Ok(raw.to_vec());
@@ -542,17 +696,127 @@ pub fn resample(raw: &[u8], from: u32, to: u32) -> Result<Vec<u8>, String> {
     if n == 0 {
         return Err("empty pcm".into());
     }
+    let g = gcd(from, to);
+    let p = (to / g) as usize; // 升采样因子 = 相数
+    let q = (from / g) as usize; // 降采样步长（升采样域）
+    const L: usize = 16; // 每相抽头
+                         // 原型低通 h[j], j<p*L：第一零点在 ±D（D=max(p,q)）的 sinc——通带边
+                         // 恰在低侧奈奎斯特；blackman 窗压旁瓣。x∈[-N/2,N/2] 中心对称。
+    let n_taps = p * L;
+    // 整样本中心（N 偶数 → N/2）：窗对称使各相 DC 和≈1（半样本中心实测
+    // 逐相纹波 ±10%，DC 都会泄漏）。
+    let center = (n_taps / 2) as f64;
+    let d = p.max(q) as f64;
+    let mut proto = vec![0f32; n_taps];
+    for (j, h) in proto.iter_mut().enumerate() {
+        let x = j as f64 - center;
+        let s = if x == 0.0 {
+            1.0 / d
+        } else {
+            (std::f64::consts::PI * x / d).sin() / (std::f64::consts::PI * x)
+        };
+        // blackman：w[0]=w[N-1]=0、中心=1（首版符号写反成倒窗，逐相 DC
+        // 纹波 ±10% 的真凶，python 逐行对拍收据）
+        let w = blackman(j, n_taps);
+        *h = (s * w) as f32;
+    }
+    // 全局增益补偿：零填塞占空 1/p → 通带增益要 ×p。注意不能逐相归一——
+    // 各相和≈1 但带窗纹波，强行拉平会把远心相放大成强杂散（数值对拍收据）。
+    let sum: f32 = proto.iter().sum();
+    let scale = if sum != 0.0 { p as f32 / sum } else { 1.0 };
+    let mut phases = vec![vec![0f32; L]; p];
+    for ph in 0..p {
+        for k in 0..L {
+            phases[ph][k] = proto[ph + k * p] * scale;
+        }
+    }
     let out_n = n * to as usize / from as usize;
     let mut out = Vec::with_capacity(out_n * 2);
-    for i in 0..out_n {
-        let pos = i as f64 * (from as f64 / to as f64);
-        let i0 = (pos.floor() as usize).min(n - 1);
-        let i1 = (i0 + 1).min(n - 1);
-        let frac = pos - i0 as f64;
-        let v = s16(i0) * (1.0 - frac as f32) + s16(i1) * frac as f32;
-        out.extend_from_slice(&(v as i16).to_le_bytes());
+    for i_out in 0..out_n {
+        // 升采样域位置 m = i_out*q + center（补偿群延迟）→ 相 ph、输入锚 i
+        let m = i_out * q + center as usize;
+        let ph = m % p;
+        let i = m / p;
+        let taps = &phases[ph];
+        let mut acc = 0f32;
+        for (k, t) in taps.iter().enumerate() {
+            let idx = i as isize - k as isize;
+            let idx = if idx < 0 {
+                0
+            } else if idx as usize >= n {
+                n - 1
+            } else {
+                idx as usize
+            };
+            acc += t * s16(idx);
+        }
+        let v = acc.clamp(-32768.0, 32767.0) as i16;
+        out.extend_from_slice(&v.to_le_bytes());
     }
     Ok(out)
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// blackman：w[0]=w[N-1]=0、中心=1。首版 resample 符号写反成倒窗（逐相 DC
+/// 纹波 ±10% 的真凶，python 逐行对拍收据），抽出来两处共用别再写错。
+fn blackman(j: usize, n_taps: usize) -> f64 {
+    let p = std::f64::consts::PI;
+    0.42 - 0.5 * (2.0 * p * j as f64 / (n_taps - 1) as f64).cos()
+        + 0.08 * (4.0 * p * j as f64 / (n_taps - 1) as f64).cos()
+}
+
+/// 48k 域窗 sinc 低通。M42e 设备收据：melo（44.1k 全带宽）经功放破音，
+/// 7.5k 低通版用户判干净——VITS 高频毛刺是真凶；重采样（线性/FIR 同破）、
+/// 播放器（tinyalsa tinyplay 对照同破）、麦克风链（Mac 上干净）全排除。
+/// 行业同构：WebRTC/LiveKit 语音走 OPUS 语音模式本就 8-12k 带宽，没人
+/// 裸放全带宽 VITS。193 抽头（过渡带 ~1k）、DC 全局归一（resample 同理，
+/// 不逐窗归一）、边缘钳位。
+fn lowpass(raw: &[u8], rate: u32, cutoff: f64) -> Vec<u8> {
+    let n = raw.len() / 2;
+    if n == 0 || cutoff >= rate as f64 / 2.0 {
+        return raw.to_vec();
+    }
+    const N_TAPS: usize = 193;
+    let center = (N_TAPS / 2) as f64;
+    let fc = cutoff / rate as f64; // 周期/样本
+    let mut h = vec![0f32; N_TAPS];
+    for (j, t) in h.iter_mut().enumerate() {
+        let x = j as f64 - center;
+        let s = if x == 0.0 {
+            2.0 * fc
+        } else {
+            (2.0 * std::f64::consts::PI * fc * x).sin() / (std::f64::consts::PI * x)
+        };
+        *t = (s * blackman(j, N_TAPS)) as f32;
+    }
+    let sum: f32 = h.iter().sum();
+    let h: Vec<f32> = h.iter().map(|t| t / sum).collect();
+    let s16 = |i: usize| i16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]) as f32;
+    let mut out = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let mut acc = 0f32;
+        for (k, t) in h.iter().enumerate() {
+            let idx = i as isize - center as isize + k as isize;
+            let idx = if idx < 0 {
+                0
+            } else if idx as usize >= n {
+                n - 1
+            } else {
+                idx as usize
+            };
+            acc += t * s16(idx);
+        }
+        let v = acc.clamp(-32768.0, 32767.0) as i16;
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
 }
 
 // ---------------- base64（标准字母表，含 padding；手写避免加依赖） ----------------
@@ -562,12 +826,24 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 pub fn b64_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(B64[(n >> 18) as usize & 63] as char);
         out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -652,13 +928,100 @@ mod tests {
     fn resample_identity_and_upsample() {
         let raw = vec![1u8, 2, 3, 4, 5, 6, 7, 8]; // 4 样本
         assert_eq!(resample(&raw, 48_000, 48_000).unwrap(), raw);
-        // 24k→48k：时长不变 → 样本数翻倍；首样本保持
+        // 24k→48k：时长不变 → 样本数翻倍
         let up = resample(&raw, 24_000, 48_000).unwrap();
         assert_eq!(up.len(), raw.len() * 2);
-        let first = i16::from_le_bytes([raw[0], raw[1]]);
-        assert_eq!(i16::from_le_bytes([up[0], up[1]]), first);
         // 单样本输入不越界
         assert_eq!(resample(&[9, 9], 24_000, 48_000).unwrap().len(), 4);
         assert!(resample(&raw, 0, 48_000).is_err());
+    }
+
+    #[test]
+    fn resample_fir_dc_invariant() {
+        // DC 过任意比率仍是同值 DC（每相归一到单位增益）——线性插值时代
+        // 的首样本断言不适用于 FIR，DC 不变性是重采样器的底线性质。
+        let n = 400;
+        let raw: Vec<u8> = (0..n).flat_map(|_| 1000i16.to_le_bytes()).collect();
+        for (from, to) in [(44_100u32, 48_000u32), (24_000, 48_000), (48_000, 16_000)] {
+            let out = resample(&raw, from, to).unwrap();
+            let s: Vec<i16> = out
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            assert_eq!(s.len(), n * to as usize / from as usize);
+            // 端部是滤波器暂态（历史钳位），只断言稳态段
+            let edge = 64;
+            let mid = &s[edge..s.len() - edge];
+            assert!(
+                mid.iter().all(|&v| (v - 1000).abs() <= 2),
+                "{from}->{to} dc leaked: {:?}…{:?}",
+                &s[..8.min(s.len())],
+                &s[s.len() - 8.min(s.len())..]
+            );
+        }
+    }
+
+    #[test]
+    fn lowpass_kills_hf_passes_speech_band() {
+        // 12k 正弦（M42e 破音判别：melo 高频毛刺 >7.5k）应被压到噪声级；
+        // 440Hz 语音带原样通过。稳态段断言，端部 96 样本是滤波暂态。
+        let rate = 48_000u32;
+        let sine = |f: f64, n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|i| {
+                    let v = (8000.0
+                        * (2.0 * std::f64::consts::PI * f * i as f64 / rate as f64).sin())
+                        as i16;
+                    v.to_le_bytes().to_vec()
+                })
+                .flatten()
+                .collect::<Vec<u8>>()
+        };
+        let out = lowpass(&sine(12_000.0, 1000), rate, 7_500.0);
+        let s: Vec<i16> = out
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let hf_peak = s[200..800].iter().map(|v| v.abs()).max().unwrap();
+        assert!(hf_peak < 80, "12k leaked through: {hf_peak}");
+        let out = lowpass(&sine(440.0, 1000), rate, 7_500.0);
+        let s: Vec<i16> = out
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let sp_peak = s[200..800].iter().map(|v| v.abs()).max().unwrap();
+        assert!((sp_peak - 8000).abs() < 200, "440 attenuated: {sp_peak}");
+        // 长度不变（原地替换滤波，不动帧结构）
+        assert_eq!(out.len(), 2000);
+    }
+
+    #[test]
+    fn vol_clamped_to_audible_floor() {
+        // 地板 20：键调/文件都不能把纯语音产品调成哑巴（2026-09-03 收据）
+        assert_eq!(clamp_vol(0), 20);
+        assert_eq!(clamp_vol(-30), 20);
+        assert_eq!(clamp_vol(19), 20);
+        assert_eq!(clamp_vol(20), 20);
+        assert_eq!(clamp_vol(60), 60);
+        assert_eq!(clamp_vol(100), 100);
+        assert_eq!(clamp_vol(150), 100);
+    }
+
+    #[test]
+    fn split_clauses_punctuation_and_limits() {
+        // 标点切句；尾句 3 字 <4 并前句
+        assert_eq!(
+            split_clauses("已连接无线网络。现在可以开始，对话。"),
+            vec!["已连接无线网络。", "现在可以开始，对话。"]
+        );
+        let cs = split_clauses("无线网络已经连接成功，现在可以。");
+        assert_eq!(cs, vec!["无线网络已经连接成功，", "现在可以。"]);
+        // 无标点长段 24 字硬切，内容不丢
+        let long = "一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十";
+        let cs = split_clauses(long);
+        assert!(cs.iter().all(|c| c.chars().count() <= 24));
+        assert_eq!(cs.concat(), long);
+        // 空文本给单句（调用方兜底）
+        assert_eq!(split_clauses(""), vec![""]);
     }
 }

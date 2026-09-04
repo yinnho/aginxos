@@ -49,7 +49,9 @@ int main(int argc, char **argv) {
 
     SherpaOnnxOfflineTtsConfig config;
     memset(&config, 0, sizeof config);
-    config.model.num_threads = 2;
+    // A76 钉核下默认 2 线程=2 核；AG_TTS_THREADS 可加宽（M42e 速度实验）。
+    const char *thr_s = getenv("AG_TTS_THREADS");
+    config.model.num_threads = thr_s && *thr_s ? atoi(thr_s) : 2;
     if (!strcmp(kind, "vits")) {
         // melo: tarball 里的 model.int8.onnx 是 133B 的 git-lfs 指针（release
         // 打包事故），真身只有 fp32 model.onnx（170MB）——vits 本来就小，

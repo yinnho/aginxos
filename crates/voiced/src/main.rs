@@ -16,8 +16,8 @@
 
 mod audio;
 mod face;
-mod ptt;
 mod protocol;
+mod ptt;
 
 use protocol::{Act, Ev, Out, Vm};
 use std::process::Command;
@@ -68,7 +68,9 @@ fn daemon() {
         "voiced: up (local={}, brain={}, ptt={})",
         audio::local_voice_ready(),
         brain.is_some(),
-        ptt.is_some()
+        ptt.as_ref()
+            .map(|p| p.devs())
+            .unwrap_or_else(|| "none".into())
     );
     // M42e: 预载常驻嘴耳模型（spawn 即返回，���载在子进程里）——第一次
     // 说话不再等 ~4s/侧 的装载。
@@ -78,63 +80,81 @@ fn daemon() {
 
     let mut capturing: Option<std::process::Child> = None;
     let mut deadline: Option<Instant> = None;
+    // 音量下键按下时刻：短按(<300ms)=音量−10、长按=PTT（M42e 产品面）
+    let mut ptt_down: Option<Instant> = None;
 
-    let mut pollfds = [libc::pollfd { fd: -1, events: libc::POLLIN, revents: 0 }];
     loop {
         // ---- PTT ----
         if let Some(p) = ptt.as_mut() {
-            pollfds[0].fd = p.fd();
-            let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 1, 200) };
-            if n > 0 && pollfds[0].revents & libc::POLLIN != 0 {
-                for ev in p.poll() {
-                    match ev {
-                        ptt::PttEv::Down => {
-                            if capturing.is_none() {
-                                match audio::capture_start() {
-                                    Ok(c) => {
-                                        capturing = Some(c);
-                                        deadline = None; // 采集中不计时
-                                        face::write(&vm, true, false);
-                                    }
-                                    Err(e) => eprintln!("voiced: cap start {e}"),
+            for ev in p.wait(200) {
+                match ev {
+                    ptt::PttEv::Down => {
+                        ptt_down = Some(Instant::now());
+                        if capturing.is_none() {
+                            match audio::capture_start() {
+                                Ok(c) => {
+                                    capturing = Some(c);
+                                    deadline = None; // 采集中不计时
+                                    face::write(&vm, true, false);
                                 }
+                                Err(e) => eprintln!("voiced: cap start {e}"),
                             }
                         }
-                        ptt::PttEv::Up => {
+                    }
+                    ptt::PttEv::Up => {
+                        let short_tap = ptt_down
+                            .take()
+                            .is_some_and(|d| d.elapsed() < Duration::from_millis(300));
+                        if short_tap {
+                            // 短按=音量−：采集立即弃（无 600ms 词尾冲刷）
                             if let Some(mut c) = capturing.take() {
-                                // 词尾冲刷：立即 kill 会截掉最后几百毫秒（snd-cap
-                                // 缓冲 + 松手瞬间）。2026-09-04 收据：「连接无线
-                                // 网络」只剩 0.96s，「络」被截，ASR 三连空串。
-                                std::thread::sleep(Duration::from_millis(600));
                                 let _ = c.kill();
                                 let _ = c.wait();
-                                if let Some(wav) = audio::capture_take() {
-                                    face::write(&vm, false, true);
-                                    match hear(&wav, brain.as_ref()) {
-                                        Ok(text) => {
-                                            eprintln!("voiced: heard {text:?}");
-                                            let outs = vm.step(Ev::Heard(text));
-                                            run_outs(&mut vm, outs, brain.as_ref());
-                                        }
-                                        Err(e) => {
-                                            eprintln!("voiced: asr {e}");
-                                            let outs = vm.step(Ev::Heard("没听懂".into()));
-                                            // asr 失败提示本身也要能说——但 asr
-                                            // 挂了多半网络不通，TTS 也挂；只刷屏
-                                            for o in outs {
-                                                if o == Out::Show {
-                                                    face::write(&vm, false, false);
-                                                }
+                            }
+                            face::write(&vm, false, false);
+                            let v = audio::adjust_vol(-10);
+                            eprintln!("voiced: vol {v}");
+                            say(&format!("音量{v}"), brain.as_ref());
+                            continue;
+                        }
+                        if let Some(mut c) = capturing.take() {
+                            // 词尾冲刷：立即 kill 会截掉最后几百毫秒（snd-cap
+                            // 缓冲 + 松手瞬间）。2026-09-04 收据：「连接无线
+                            // 网络」只剩 0.96s，「络」被截，ASR 三连空串。
+                            std::thread::sleep(Duration::from_millis(600));
+                            let _ = c.kill();
+                            let _ = c.wait();
+                            if let Some(wav) = audio::capture_take() {
+                                face::write(&vm, false, true);
+                                match hear(&wav, brain.as_ref()) {
+                                    Ok(text) => {
+                                        eprintln!("voiced: heard {text:?}");
+                                        let outs = vm.step(Ev::Heard(text));
+                                        run_outs(&mut vm, outs, brain.as_ref());
+                                    }
+                                    Err(e) => {
+                                        eprintln!("voiced: asr {e}");
+                                        let outs = vm.step(Ev::Heard("没听懂".into()));
+                                        // asr 失败提示本身也要能说——但 asr
+                                        // 挂了多半网络不通，TTS 也挂；只刷屏
+                                        for o in outs {
+                                            if o == Out::Show {
+                                                face::write(&vm, false, false);
                                             }
                                         }
                                     }
-                                } else {
-                                    // 误触（<0.1s）
-                                    face::write(&vm, false, false);
                                 }
+                            } else {
+                                // 误触（<0.1s）
                                 face::write(&vm, false, false);
                             }
+                            face::write(&vm, false, false);
                         }
+                    }
+                    ptt::PttEv::VolUp => {
+                        let v = audio::adjust_vol(10);
+                        eprintln!("voiced: vol {v}");
+                        say(&format!("音量{v}"), brain.as_ref());
                     }
                 }
             }
@@ -144,7 +164,8 @@ fn daemon() {
 
         // ---- 超时 ----
         if capturing.is_none() && !matches!(vm.state_name(), "idle") {
-            let dl = *deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(TIMEOUT_SECS));
+            let dl =
+                *deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(TIMEOUT_SECS));
             if Instant::now() >= dl {
                 deadline = None;
                 let outs = vm.step(Ev::Timeout);
@@ -246,12 +267,20 @@ fn scan_ssids() -> Result<Vec<String>, String> {
         let line = line.trim_end();
         let toks: Vec<&str> = line.split_whitespace().collect();
         // mac, ch=, dbm 数值, "dBm", ssid...（ssid 可含空格，join 回去）
-        let dbm = match toks.get(2).and_then(|d| d.trim_end_matches("dBm").parse::<f32>().ok()) {
+        let dbm = match toks
+            .get(2)
+            .and_then(|d| d.trim_end_matches("dBm").parse::<f32>().ok())
+        {
             Some(v) => v,
             None => continue,
         };
         let ssid_start = if toks.get(3) == Some(&"dBm") { 4 } else { 3 };
-        let ssid_esc: String = toks.iter().skip(ssid_start).copied().collect::<Vec<_>>().join(" ");
+        let ssid_esc: String = toks
+            .iter()
+            .skip(ssid_start)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
         if ssid_esc.is_empty() || ssid_esc.contains("<hidden>") {
             continue;
         }
@@ -303,7 +332,10 @@ fn join_wifi(ssid: &str, psk: &str) -> Result<String, String> {
     audio::wait_limited(&mut child, JOIN_BUDGET_SECS).map_err(|e| format!("wifi-join {e}"))?;
     // dhcp 在 wifi-join 里；地址落不落直接看
     for _ in 0..10 {
-        if let Ok(out) = Command::new("ip").args(["-4", "addr", "show", "wlan0"]).output() {
+        if let Ok(out) = Command::new("ip")
+            .args(["-4", "addr", "show", "wlan0"])
+            .output()
+        {
             let txt = String::from_utf8_lossy(&out.stdout);
             for line in txt.lines() {
                 let line = line.trim();
@@ -323,7 +355,9 @@ fn join_wifi(ssid: &str, psk: &str) -> Result<String, String> {
 
 /// 状态一句话：时间 + 电池 + 网络。
 fn status_text() -> String {
-    let time = Command::new("date").arg("+%H点%M分").output()
+    let time = Command::new("date")
+        .arg("+%H点%M分")
+        .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| {
@@ -336,13 +370,12 @@ fn status_text() -> String {
         .and_then(|s| s.trim().parse::<u8>().ok())
         .unwrap_or(0);
     // 只报连没连——IP 逐位念出来又长又难听（数字展开还多 10s 合成+播放）
-    let net = Command::new("ip").args(["-4", "addr", "show", "wlan0"]).output()
+    let net = Command::new("ip")
+        .args(["-4", "addr", "show", "wlan0"])
+        .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|t| {
-            t.lines()
-                .any(|l| l.trim().starts_with("inet "))
-        })
+        .map(|t| t.lines().any(|l| l.trim().starts_with("inet ")))
         .unwrap_or(false);
     let net = if net { "网已连" } else { "没联网" };
     format!("{time}，电池{bat}%，{net}。")

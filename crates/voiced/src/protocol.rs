@@ -51,9 +51,15 @@ enum St {
     /// 列表已展示，等序数
     WifiList,
     /// 等密码拼读，逐段累积
-    WifiPwd { ssid: String, psk: String },
+    WifiPwd {
+        ssid: String,
+        psk: String,
+    },
     /// 密码已回读，等确认
-    WifiConfirm { ssid: String, psk: String },
+    WifiConfirm {
+        ssid: String,
+        psk: String,
+    },
 }
 
 pub struct Vm {
@@ -68,7 +74,12 @@ pub struct Vm {
 
 impl Vm {
     pub fn new() -> Vm {
-        Vm { st: St::Idle, lines: Vec::new(), list: Vec::new(), sel: 0 }
+        Vm {
+            st: St::Idle,
+            lines: Vec::new(),
+            list: Vec::new(),
+            sel: 0,
+        }
     }
 
     pub fn state_name(&self) -> &'static str {
@@ -148,9 +159,7 @@ impl Vm {
                     St::Idle => self.step_idle(&text, &mut outs),
                     St::WifiList => self.step_list(&text, &mut outs),
                     St::WifiPwd { ssid, psk } => self.step_pwd(&text, ssid, psk, &mut outs),
-                    St::WifiConfirm { ssid, psk } => {
-                        self.step_confirm(&text, ssid, psk, &mut outs)
-                    }
+                    St::WifiConfirm { ssid, psk } => self.step_confirm(&text, ssid, psk, &mut outs),
                 }
             }
             Ev::ScanDone(list) => {
@@ -208,8 +217,16 @@ impl Vm {
             if n >= 1 && n as usize <= self.list.len() {
                 let ssid = self.list[(n - 1) as usize].clone();
                 self.sel = n as usize;
-                self.st = St::WifiPwd { ssid: ssid.clone(), psk: String::new() };
-                self.say(outs, &format!("第{n}个，{ssid}。说密码，字母说大写A小写b，数字说数字三。说完说完了。"));
+                self.st = St::WifiPwd {
+                    ssid: ssid.clone(),
+                    psk: String::new(),
+                };
+                self.say(
+                    outs,
+                    &format!(
+                        "第{n}个，{ssid}。说密码，字母说大写A小写b，数字说数字三。说完说完了。"
+                    ),
+                );
             } else {
                 self.st = St::WifiList;
                 self.say(outs, &format!("只有{}个，重新说。", self.list.len()));
@@ -242,7 +259,10 @@ impl Vm {
             self.st = St::WifiPwd { ssid, psk };
         } else if is_restart(text) {
             self.say(outs, "重新说密码。");
-            self.st = St::WifiPwd { ssid, psk: String::new() };
+            self.st = St::WifiPwd {
+                ssid,
+                psk: String::new(),
+            };
         } else {
             let chars = parse_spelling(text);
             if chars.is_empty() {
@@ -260,7 +280,10 @@ impl Vm {
 
     fn step_confirm(&mut self, text: &str, ssid: String, psk: String, outs: &mut Vec<Out>) {
         if is_deny(text) {
-            self.st = St::WifiPwd { ssid, psk: String::new() };
+            self.st = St::WifiPwd {
+                ssid,
+                psk: String::new(),
+            };
             self.say(outs, "重新说密码。");
         } else if is_confirm(text) {
             self.st = St::Idle;
@@ -298,10 +321,55 @@ pub fn norm(s: &str) -> String {
         }
         if matches!(
             ch,
-            '。' | '，' | '、' | '！' | '？' | '：' | '；' | '…' | '—' | '·' | '“' | '”' | '‘'
-                | '’' | '（' | '）' | '《' | '》' | ',' | '.' | '!' | '?' | ':' | ';' | '-'
-                | '_' | '\'' | '"' | '(' | ')' | '<' | '>' | '+' | '=' | '*' | '&' | '#'
-                | '@' | '$' | '%' | '|' | '\\' | '/' | '[' | ']' | '{' | '}' | '^' | '~' | '`'
+            '。' | '，'
+                | '、'
+                | '！'
+                | '？'
+                | '：'
+                | '；'
+                | '…'
+                | '—'
+                | '·'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+                | '（'
+                | '）'
+                | '《'
+                | '》'
+                | ','
+                | '.'
+                | '!'
+                | '?'
+                | ':'
+                | ';'
+                | '-'
+                | '_'
+                | '\''
+                | '"'
+                | '('
+                | ')'
+                | '<'
+                | '>'
+                | '+'
+                | '='
+                | '*'
+                | '&'
+                | '#'
+                | '@'
+                | '$'
+                | '%'
+                | '|'
+                | '\\'
+                | '/'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '^'
+                | '~'
+                | '`'
         ) {
             continue;
         }
@@ -319,8 +387,19 @@ fn contains_any(lower: &str, words: &[&str]) -> bool {
 fn is_wifi(t: &str) -> bool {
     let l = t.to_lowercase();
     // 裸"网"不收（"网站""网游"全误触）；wi+fi 拆开是 ASR 常态
-    contains_any(&l, &["无线", "网络", "连网", "上网", "wifi", "wi-fi", "wi fi", "连一下"])
-        || (l.contains("wi") && l.contains("fi"))
+    contains_any(
+        &l,
+        &[
+            "无线",
+            "网络",
+            "连网",
+            "上网",
+            "wifi",
+            "wi-fi",
+            "wi fi",
+            "连一下",
+        ],
+    ) || (l.contains("wi") && l.contains("fi"))
 }
 
 fn is_status(t: &str) -> bool {
@@ -340,16 +419,45 @@ fn is_cancel(t: &str) -> bool {
 }
 
 fn is_confirm(t: &str) -> bool {
-    contains_any(t, &["对", "是的", "确认", "没错", "好的", "好", "是", "正确", "可以"])
+    contains_any(
+        t,
+        &[
+            "对", "是的", "确认", "没错", "好的", "好", "是", "正确", "可以",
+        ],
+    )
 }
 
 fn is_deny(t: &str) -> bool {
     // 否定必须先于肯定判（"不对" 含 "对"）
-    contains_any(t, &["不对", "不是", "错了", "错误", "否", "不行", "不可以", "换一个"])
+    contains_any(
+        t,
+        &[
+            "不对",
+            "不是",
+            "错了",
+            "错误",
+            "否",
+            "不行",
+            "不可以",
+            "换一个",
+        ],
+    )
 }
 
 fn is_done(t: &str) -> bool {
-    contains_any(t, &["完了", "说完了", "好了", "结束", "没有了", "没了", "搞定", "完毕"])
+    contains_any(
+        t,
+        &[
+            "完了",
+            "说完了",
+            "好了",
+            "结束",
+            "没有了",
+            "没了",
+            "搞定",
+            "完毕",
+        ],
+    )
 }
 
 fn is_backspace(t: &str) -> bool {
@@ -450,7 +558,11 @@ pub fn parse_spelling(t: &str) -> Vec<char> {
             if rest.starts_with(word) {
                 if let Some(&c) = chars.get(i + word.chars().count()) {
                     if c.is_ascii_alphabetic() {
-                        out.push(if upper { c.to_ascii_uppercase() } else { c.to_ascii_lowercase() });
+                        out.push(if upper {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c.to_ascii_lowercase()
+                        });
                         i += word.chars().count() + 1;
                         continue 'outer;
                     }
@@ -526,7 +638,10 @@ mod tests {
 
     #[test]
     fn norm_strips_punct_and_width() {
-        assert_eq!(norm("连接无线。第三个密码，大写A小写B数字3。"), "连接无线第三个密码大写A小写B数字3");
+        assert_eq!(
+            norm("连接无线。第三个密码，大写A小写B数字3。"),
+            "连接无线第三个密码大写A小写B数字3"
+        );
         assert_eq!(norm("  WiFi 　测试 ！"), "WiFi测试");
         assert_eq!(norm("Ａｂ３"), "Ab3");
     }
@@ -588,17 +703,23 @@ mod tests {
         assert_eq!(vm.list(), &["Legrand AP".to_string(), "2501".to_string()]);
         // 3. 序数选择
         let o = heard(&mut vm, "第二个");
-        assert_eq!(says(&o), vec!["第2个，2501。说密码，字母说大写A小写b，数字说数字三。说完说完了。"]);
+        assert_eq!(
+            says(&o),
+            vec!["第2个，2501。说密码，字母说大写A小写b，数字说数字三。说完说完了。"]
+        );
         // 4. 密码拼读（ASR 原文带标点）
         let o = heard(&mut vm, "大写A小写B数字3");
         assert_eq!(says(&o)[0], "收到，大写A，小写b，数字3。继续，或说完了。");
         assert_eq!(vm.psk(), "Ab3"); // 小写B：大小写来自说的前缀
-        // 5. 完成 → 回读
+                                     // 5. 完成 → 回读
         let o = heard(&mut vm, "完了");
         assert_eq!(says(&o), vec!["密码是大写A，小写b，数字3，对吗？"]);
         // 6. 确认 → 执行
         let o = heard(&mut vm, "对");
-        assert!(o.contains(&Out::Act(Act::Join { ssid: "2501".into(), psk: "Ab3".into() })));
+        assert!(o.contains(&Out::Act(Act::Join {
+            ssid: "2501".into(),
+            psk: "Ab3".into()
+        })));
         // 7. 结果
         let o = vm.step(Ev::JoinDone(Ok("192.168.0.166".into())));
         assert_eq!(says(&o), vec!["连上了，地址192.168.0.166。"]);
@@ -681,10 +802,7 @@ mod tests {
         // capture_take 已拦，走到这的都是 ≥0.1s 的真尝试，必须开口。
         let mut vm = Vm::new();
         let o = heard(&mut vm, "。！？ ");
-        assert_eq!(
-            says(&o),
-            vec!["没听清。请按住键，说完整的：连接无线网络。"]
-        );
+        assert_eq!(says(&o), vec!["没听清。请按住键，说完整的：连接无线网络。"]);
     }
 
     #[test]
@@ -702,10 +820,16 @@ mod tests {
     #[test]
     fn asr_real_world_samples() {
         // 2026-09-04 实测 brain ASR 中文样本的归一化路径
-        assert_eq!(norm("连接无线。第三个密码，大写A小写B数字3。"), "连接无线第三个密码大写A小写B数字3");
+        assert_eq!(
+            norm("连接无线。第三个密码，大写A小写B数字3。"),
+            "连接无线第三个密码大写A小写B数字3"
+        );
         // 序数识别在真实 ASR 里常出 "第3个"（阿拉伯数字）
         assert_eq!(match_ordinal(&norm("第3个")), Some(3));
         // 密码段识别常夹标点
-        assert_eq!(parse_spelling(&norm("密码，大写A小写B数字3。")), vec!['A', 'b', '3']);
+        assert_eq!(
+            parse_spelling(&norm("密码，大写A小写B数字3。")),
+            vec!['A', 'b', '3']
+        );
     }
 }
