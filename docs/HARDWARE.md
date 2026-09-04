@@ -6176,3 +6176,30 @@ state-restore 存活）。
   识别损失；产品路径 PTT 采集的是人声不受影响。
 
 设备状态：bake #18（761731e）运行中，槽 b。
+
+## 2026-09-05 — N1 平台心脏 host 闭环（新仓 aginxos-next，2433795）
+
+不涉硬件，记里程碑账。按 2026-09-05 拍板：宪法（D4–D13）落地走全新
+仓库 ~/Documents/aginxos-next，老仓顶到 N4 整机切换。
+
+**N1 八步全绿**：①仓成立（workspace/AGENTS/ARCH(D13)/check.sh）②agi
+fast-agi 帧crate（stdio JSONL：request/steer/tool_call/tool_result/
+artifact/done）③agio 信封搬入 ④router 搬入改名（唯一裸命令 aginx、
+唯一前缀 aginx-、AGINX_CMD_PATH、文件即路由）⑤runtime（carrier
+agent_loop+llm_driver 设计搬入 onto fast-agi：冷启动重放会话账、循环
+检测、工具=spawn `aginx <工具>`）⑥server（前台登记进/住/切/退+退房词、
+光标纯内存开机=me、UDS 一问一答、先记账再 spawn、工具派发走路由器、
+runtime 断流补 synthetic done）⑦真 brain host 收据 ⑧本条。
+
+**⑦ 收据（真 brain.aginx.net，AGINX_HOME=~/.aginx-n）**：母体 me 直答
+→ `aginx agent create 小满/阿澈` → 点名+真工具（brain 自选 dev-echo、
+server spawn 路由器、输出回喂出答）→ 住（跨轮记性）→ 切 → 退房词回
+母体 → 杀进程冷重启：光标回 me（D10 语义）+ 小满从 sessions/main.jsonl
+重放恢复记忆（D5 冷启动即恢复）。账本每轮收口，工具轮完整入账。
+
+**真收据带出两修**：spawn 失败补 synthetic done（否则孤儿 request 撞
+重放）；function.arguments wire 收敛 object（brain 路由 code 模型时
+裸数组 400）。测试 71 绿 + check.sh 绿。
+
+设备状态：不变——bake #18（761731e）运行中，槽 b。新仓线与设备线
+并行，互不影响。
