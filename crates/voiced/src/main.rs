@@ -31,14 +31,14 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("--say") => {
             let text = args.get(2).expect("usage: voiced --say <text>");
-            let brain = audio::Brain::from_env().expect("AGINXBRAIN_API_KEY not set");
-            brain.speak(text).expect("speak failed");
+            let brain = audio::Brain::from_env();
+            say(text, brain.as_ref());
         }
         Some("--hear") => {
             let path = args.get(2).expect("usage: voiced --hear <wav>");
-            let brain = audio::Brain::from_env().expect("AGINXBRAIN_API_KEY not set");
+            let brain = audio::Brain::from_env();
             let wav = std::fs::read(path).expect("read wav");
-            let text = brain.asr(&wav).expect("asr failed");
+            let text = hear(&wav, brain.as_ref()).expect("asr failed");
             println!("{text}");
         }
         Some("--inject") => {
@@ -64,7 +64,12 @@ fn daemon() {
         eprintln!("voiced: no {} — PTT dead, face only", ptt::PTT_DEV);
     }
     face::write(&vm, false, false);
-    eprintln!("voiced: up (brain={}, ptt={})", brain.is_some(), ptt.is_some());
+    eprintln!(
+        "voiced: up (local={}, brain={}, ptt={})",
+        audio::local_voice_ready(),
+        brain.is_some(),
+        ptt.is_some()
+    );
 
     let mut capturing: Option<std::process::Child> = None;
     let mut deadline: Option<Instant> = None;
@@ -98,31 +103,29 @@ fn daemon() {
                                 std::thread::sleep(Duration::from_millis(600));
                                 let _ = c.kill();
                                 let _ = c.wait();
-                                if let Some(brain) = brain.as_ref() {
-                                    if let Some(wav) = audio::capture_take() {
-                                        face::write(&vm, false, true);
-                                        match brain.asr(&wav) {
-                                            Ok(text) => {
-                                                eprintln!("voiced: heard {text:?}");
-                                                let outs = vm.step(Ev::Heard(text));
-                                                run_outs(&mut vm, outs, Some(brain));
-                                            }
-                                            Err(e) => {
-                                                eprintln!("voiced: asr {e}");
-                                                let outs = vm.step(Ev::Heard("没听懂".into()));
-                                                // asr 失败提示本身也要能说——但 asr
-                                                // 挂了多半网络不通，TTS 也挂；只刷屏
-                                                for o in outs {
-                                                    if o == Out::Show {
-                                                        face::write(&vm, false, false);
-                                                    }
+                                if let Some(wav) = audio::capture_take() {
+                                    face::write(&vm, false, true);
+                                    match hear(&wav, brain.as_ref()) {
+                                        Ok(text) => {
+                                            eprintln!("voiced: heard {text:?}");
+                                            let outs = vm.step(Ev::Heard(text));
+                                            run_outs(&mut vm, outs, brain.as_ref());
+                                        }
+                                        Err(e) => {
+                                            eprintln!("voiced: asr {e}");
+                                            let outs = vm.step(Ev::Heard("没听懂".into()));
+                                            // asr 失败提示本身也要能说——但 asr
+                                            // 挂了多半网络不通，TTS 也挂；只刷屏
+                                            for o in outs {
+                                                if o == Out::Show {
+                                                    face::write(&vm, false, false);
                                                 }
                                             }
                                         }
-                                    } else {
-                                        // 误触（<0.1s）
-                                        face::write(&vm, false, false);
                                     }
+                                } else {
+                                    // 误触（<0.1s）
+                                    face::write(&vm, false, false);
                                 }
                                 face::write(&vm, false, false);
                             }
@@ -148,6 +151,38 @@ fn daemon() {
     }
 }
 
+/// 嘴：本地 ag-tts 优先（M42d，离线即产品），失败/缺件落 brain TTS。
+fn say(text: &str, brain: Option<&audio::Brain>) {
+    if audio::local_voice_ready() {
+        match audio::local_speak(text) {
+            Ok(()) => return,
+            Err(e) => eprintln!("voiced: local tts {e}"),
+        }
+    }
+    if let Some(b) = brain {
+        if let Err(e) = b.speak(text) {
+            eprintln!("voiced: tts {e}");
+        }
+    } else {
+        eprintln!("voiced: (mute) {text}");
+    }
+}
+
+/// 耳：本地 ag-asr 优先，失败/缺件落 brain ASR（brain 对本机采集链幻听，
+/// 见 audio.rs 法医收据——本地在位时实际不会走到云）。
+fn hear(wav: &[u8], brain: Option<&audio::Brain>) -> Result<String, String> {
+    if audio::local_voice_ready() {
+        match audio::local_asr(wav) {
+            Ok(t) => return Ok(t),
+            Err(e) => eprintln!("voiced: local asr {e}"),
+        }
+    }
+    match brain {
+        Some(b) => b.asr(wav),
+        None => Err("no asr backend".into()),
+    }
+}
+
 /// 落地状态机输出：Say→TTS+屏，Act→执行并把结果喂回状态机。
 fn run_outs(vm: &mut Vm, outs: Vec<Out>, brain: Option<&audio::Brain>) {
     let mut followups: Vec<Ev> = Vec::new();
@@ -155,13 +190,7 @@ fn run_outs(vm: &mut Vm, outs: Vec<Out>, brain: Option<&audio::Brain>) {
         match o {
             Out::Say(s) => {
                 face::write(vm, false, true);
-                if let Some(b) = brain {
-                    if let Err(e) = b.speak(&s) {
-                        eprintln!("voiced: tts {e}");
-                    }
-                } else {
-                    eprintln!("voiced: (mute) {s}");
-                }
+                say(&s, brain);
             }
             Out::Show => {}
             Out::Act(a) => match a {
@@ -180,13 +209,9 @@ fn run_outs(vm: &mut Vm, outs: Vec<Out>, brain: Option<&audio::Brain>) {
                     followups.push(Ev::JoinDone(join_wifi(&ssid, &psk)));
                 }
                 Act::Status => {
-                    if let Some(b) = brain {
-                        let o = vm.inject_say(&status_text());
-                        if let Out::Say(s) = o {
-                            if let Err(e) = b.speak(&s) {
-                                eprintln!("voiced: tts {e}");
-                            }
-                        }
+                    let o = vm.inject_say(&status_text());
+                    if let Out::Say(s) = o {
+                        say(&s, brain);
                     }
                 }
             },

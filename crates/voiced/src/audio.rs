@@ -251,6 +251,137 @@ pub fn wav_data_span(wav: &[u8]) -> Result<(usize, usize), String> {
     Err("no data chunk".into())
 }
 
+// ---------------- 本地后端（M42d：ag-asr/ag-tts bionic-static 子进程）----------------
+
+pub const AG_ASR: &str = "/var/bin/ag-asr";
+pub const AG_TTS: &str = "/var/bin/ag-tts";
+pub const ASR_MODEL_DIR: &str = "/var/models/asr";
+pub const TTS_MODEL_DIR: &str = "/var/models/tts/kokoro-int8-multi-lang-v1_1";
+
+/// 本地嘴耳是否在位（binary + 模型目录）。真调用失败仍返回 Err 由调用方落云。
+pub fn local_voice_ready() -> bool {
+    std::path::Path::new(AG_TTS).exists()
+        && std::path::Path::new(TTS_MODEL_DIR).exists()
+        && std::path::Path::new(AG_ASR).exists()
+        && std::path::Path::new(ASR_MODEL_DIR).exists()
+}
+
+/// WAV 字节 → 文本（sense-voice 子进程；模型加载在子进程内，失败即整程退出）。
+pub fn local_asr(wav: &[u8]) -> Result<String, String> {
+    fs::write("/tmp/voiced-hear.wav", wav).map_err(|e| format!("hear tmp: {e}"))?;
+    let out = Command::new(AG_ASR)
+        .arg("/tmp/voiced-hear.wav")
+        .output()
+        .map_err(|e| format!("ag-asr spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ag-asr {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return Err("ag-asr empty".into());
+    }
+    Ok(text)
+}
+
+/// 文本 → 扬声器：ag-tts 出 WAV（kokoro 24k mono）→ 升采样 48k → L=R 立体声
+/// → snd-play。播放链 48k stereo 是 MM1 已证形状；线性插值升采样语音足够。
+pub fn local_speak(text: &str) -> Result<(), String> {
+    let out = Command::new(AG_TTS)
+        .args([text, "/tmp/voiced-tts.wav"])
+        .output()
+        .map_err(|e| format!("ag-tts spawn: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ag-tts {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let wav = fs::read("/tmp/voiced-tts.wav").map_err(|e| format!("tts read: {e}"))?;
+    let (off, len) = wav_data_span(&wav)?;
+    let rate = wav_rate(&wav)?;
+    let up = if rate != RATE {
+        resample(&wav[off..off + len], rate, RATE)?
+    } else {
+        wav[off..off + len].to_vec()
+    };
+    let samples = up.len() / 2;
+    let mut stereo = Vec::with_capacity(up.len() * 2);
+    for s in up.chunks_exact(2) {
+        stereo.extend_from_slice(s);
+        stereo.extend_from_slice(s); // L = R
+    }
+    fs::write("/tmp/voiced-tts.raw", &stereo).map_err(|e| format!("tts tmp: {e}"))?;
+    let budget = samples / RATE as usize + 5;
+    let mut child = Command::new(SND_PLAY)
+        .args([PCM_PLAY, "/tmp/voiced-tts.raw", &RATE.to_string(), "2", VOL])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("snd-play spawn: {e}"))?;
+    wait_limited(&mut child, budget as u32)
+}
+
+/// 从 RIFF 头取采样率（fmt 块 body+4）。
+pub fn wav_rate(wav: &[u8]) -> Result<u32, String> {
+    if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return Err("not riff".into());
+    }
+    let mut off = 12;
+    while off + 8 <= wav.len() {
+        let id = &wav[off..off + 4];
+        let sz =
+            u32::from_le_bytes([wav[off + 4], wav[off + 5], wav[off + 6], wav[off + 7]]) as usize;
+        let body = off + 8;
+        if id == b"fmt " {
+            if body + 8 > wav.len() {
+                return Err("fmt truncated".into());
+            }
+            return Ok(u32::from_le_bytes([
+                wav[body + 4],
+                wav[body + 5],
+                wav[body + 6],
+                wav[body + 7],
+            ]));
+        }
+        if body + sz > wav.len() {
+            return Err("riff chunk overruns".into());
+        }
+        off = body + sz + (sz % 2);
+    }
+    Err("no fmt chunk".into())
+}
+
+/// S16 mono 线性插值重采样。
+pub fn resample(raw: &[u8], from: u32, to: u32) -> Result<Vec<u8>, String> {
+    if from == to {
+        return Ok(raw.to_vec());
+    }
+    if from == 0 {
+        return Err("rate 0".into());
+    }
+    let s16 = |i: usize| i16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]) as f32;
+    let n = raw.len() / 2;
+    if n == 0 {
+        return Err("empty pcm".into());
+    }
+    let out_n = n * to as usize / from as usize;
+    let mut out = Vec::with_capacity(out_n * 2);
+    for i in 0..out_n {
+        let pos = i as f64 * (from as f64 / to as f64);
+        let i0 = (pos.floor() as usize).min(n - 1);
+        let i1 = (i0 + 1).min(n - 1);
+        let frac = pos - i0 as f64;
+        let v = s16(i0) * (1.0 - frac as f32) + s16(i1) * frac as f32;
+        out.extend_from_slice(&(v as i16).to_le_bytes());
+    }
+    Ok(out)
+}
+
 // ---------------- base64（标准字母表，含 padding；手写避免加依赖） ----------------
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -334,5 +465,27 @@ mod tests {
         w.extend_from_slice(b"xy");
         let (off, len) = wav_data_span(&w).unwrap();
         assert_eq!(&w[off..off + len], b"xy");
+    }
+
+    #[test]
+    fn wav_rate_reads_fmt() {
+        let raw = vec![0u8; 100];
+        assert_eq!(wav_rate(&wav_wrap(&raw, 24_000, 1)).unwrap(), 24_000);
+        assert_eq!(wav_rate(&wav_wrap(&raw, RATE, 1)).unwrap(), RATE);
+        assert!(wav_rate(b"not a wav").is_err());
+    }
+
+    #[test]
+    fn resample_identity_and_upsample() {
+        let raw = vec![1u8, 2, 3, 4, 5, 6, 7, 8]; // 4 样本
+        assert_eq!(resample(&raw, 48_000, 48_000).unwrap(), raw);
+        // 24k→48k：时长不变 → 样本数翻倍；首样本保持
+        let up = resample(&raw, 24_000, 48_000).unwrap();
+        assert_eq!(up.len(), raw.len() * 2);
+        let first = i16::from_le_bytes([raw[0], raw[1]]);
+        assert_eq!(i16::from_le_bytes([up[0], up[1]]), first);
+        // 单样本输入不越界
+        assert_eq!(resample(&[9, 9], 24_000, 48_000).unwrap().len(), 4);
+        assert!(resample(&raw, 0, 48_000).is_err());
     }
 }
