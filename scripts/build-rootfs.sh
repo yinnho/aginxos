@@ -257,7 +257,7 @@ chmod 755 "${TREE}/var/bin/ag-asr" "${TREE}/var/bin/ag-tts"
 # NOT in the agupd state tar: they ride every baked image instead, so a
 # clean reflash AND a system update both carry them without a 440MB tar
 # staging pass per update.
-mkdir -p "${TREE}/var/models"
+mkdir -p "${TREE}/var/models/tts"
 cp -R "${VOICE}/models/asr" "${TREE}/var/models/asr"
 cp -R "${VOICE}/models/tts/kokoro-int8-multi-lang-v1_1" \
   "${TREE}/var/models/tts/kokoro-int8-multi-lang-v1_1"
