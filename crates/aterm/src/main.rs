@@ -651,13 +651,15 @@ impl<'a> Render<'a> {
             draw_centered(pix, self.pitch, self.w, self.h, self.font, (self.h as i32 - 8 * 4) / 2, "按住音量下键说：连接无线网络", 4, GREEN);
         }
         let mut y = g.toolbar_h as i32 + 170;
-        // dialog transcript: last 6 lines, user white / agent green
+        // dialog transcript: last 6 lines, user white / agent green — same
+        // scale as the SSID list below (user receipt 2026-09-04: 对话行太小，
+        // 要和扫码出来的 wifi 名称一样大)
         for (is_user, line) in d.lines.iter().rev().take(6).rev() {
             let (c, pfx) = if *is_user { (WHITE, ">") } else { (GREEN, "") };
             let mut s = format!("{pfx}{line}");
-            clip_cols(&mut s, 52);
-            draw_text(pix, self.pitch, self.w, self.h, self.font, g.m as i32, y, &s, 3, c);
-            y += 52;
+            clip_cols(&mut s, 48);
+            draw_text(pix, self.pitch, self.w, self.h, self.font, g.m as i32, y, &s, 4, c);
+            y += 72;
         }
         // SSID list: numbered rows, selection white (voice says 第几个)
         if !d.list.is_empty() {
