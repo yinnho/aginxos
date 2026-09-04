@@ -4,10 +4,12 @@
 //                                  out.wav 后 stdout 回一行 "OK <rate> <n>"
 //                                  / "ERR <why>"；EOF 退出。模型只加载一次
 //                                  ——装载 ~3.8s 是短句延迟的大头（M42e 收据）。
-// 模型 /var/models/tts/ 下三种，AG_TTS_KIND 选（默认 kokoro，M42e 收据：
-// kokoro 暖合成 7 字句 4.1–4.9s、RTF≈2.5 是延迟地板 → 小模型线）：
-//   kokoro  kokoro-int8-multi-lang-v1_1（质量好，慢；AG_TTS_SID 默认 8=中文女声）
-//   vits    vits-melo-tts-zh_en（快，中英混）
+// 模型 /var/models/tts/ 下三种，AG_TTS_KIND 选（默认 vits，M42e 拍板 melo
+// 为产品嘴——快 5 倍且中英混排全念；kokoro 的 zh 前端整词吞 Latin 是实测
+// 收据：念「AginxOS 2026 TEL 138」只剩数字出声，2026-09-04）：
+//   vits    vits-melo-tts-zh_en（快，中英混——默认）
+//   kokoro  kokoro-int8-multi-lang-v1_1（质量好，慢，zh 前端吞 Latin 词；
+//           AG_TTS_SID 默认 8=中文女声）
 //   matcha  matcha-icefall-zh-baker（快，纯中文）
 //   AG_TTS_DIR 仍可整目录覆盖（此时 KIND 由 env 定，路径按 kind 缺省拼）。
 #include <stdio.h>
@@ -22,7 +24,9 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *kind_s = getenv("AG_TTS_KIND");
-    const char *kind = kind_s && *kind_s ? kind_s : "kokoro";
+    // 默认 vits（melo）：/etc/aginx/env 只到 unit，adb 直呼和 fresh boot
+    // 没有 env——默认必须就是产品嘴，否则混排文本的 Latin 词被 kokoro 吞。
+    const char *kind = kind_s && *kind_s ? kind_s : "vits";
     const char *defdir = !strcmp(kind, "vits") ? "/var/models/tts/vits-melo-tts-zh_en"
                       : !strcmp(kind, "matcha") ? "/var/models/tts/matcha-icefall-zh-baker"
                       : "/var/models/tts/kokoro-int8-multi-lang-v1_1";
