@@ -27,7 +27,7 @@ cd "${ROOT}"
 
 MODE="${1:-all}"
 
-HOST_CRATES=(ag agio agpkg agdone agdl agsign aterm voiced wifi-wizard aginxos-probe aginxos-agent)
+HOST_CRATES=(ag agio agpkg agdone agdl agsign aterm voiced agqr wifi-wizard aginxos-probe aginxos-agent)
 
 # ---- 1. host tests ---------------------------------------------------------
 if [ "${MODE}" != "lint" ]; then

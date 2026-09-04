@@ -1,0 +1,7 @@
+#!/bin/sh
+# ag:summary=decode QR codes from a camera JPEG; WIFI: payloads feed voiced's join flow (M42b)
+# ag:args=<jpeg>
+# ag:examples=/usr/bin/agqr /tmp/voiced-qr.jpg
+# ag:group=cam
+# ag:exec=agqr
+exec /usr/bin/agqr "$@"

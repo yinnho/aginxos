@@ -248,6 +248,10 @@ cp "${TARGET}/aterm" "${TREE}/usr/bin/aterm"
 # protocol (no LLM needed to get on Wi-Fi), PTT on volume-down, brain
 # ASR/TTS, and the sole writer of /run/voice/face which aterm renders.
 cp "${TARGET}/voiced" "${TREE}/usr/bin/voiced"
+# agqr (M42b) — QR decode from a camera JPEG (quircs + agimg); voiced's
+# 眼分支 spawns it as /usr/bin/agqr after cam-shot shoots a gray JPEG.
+test -x "${TARGET}/agqr" || { echo "missing agqr — run scripts/build-phone.sh musl first" >&2; exit 1; }
+cp "${TARGET}/agqr" "${TREE}/usr/bin/agqr"
 # Voice stack binaries (M42d) — bionic-static CLIs voiced shells out to
 # (paths hardcoded in crates/voiced/src/audio.rs: /var/bin/ag-{asr,tts}).
 mkdir -p "${TREE}/var/bin"
@@ -326,6 +330,7 @@ chmod 755 "${TREE}/etc/init.d/rcS" "${TREE}/etc/init.d/adbd" \
   "${TREE}/etc/init.d/state-restore" \
   "${TREE}/usr/bin/agpkg" "${TREE}/usr/bin/agdone" "${TREE}/usr/bin/agdl" "${TREE}/usr/bin/aterm" \
   "${TREE}/usr/bin/voiced" \
+  "${TREE}/usr/bin/agqr" \
   "${TREE}/usr/bin/wifi-wizard" "${TREE}/usr/bin/agsvc" \
   "${TREE}/usr/bin/agctl" "${TREE}/usr/bin/agboot-ok" \
   "${TREE}/usr/bin/agupd" \

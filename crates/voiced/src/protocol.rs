@@ -19,6 +19,8 @@ pub enum Ev {
     ScanDone(Vec<String>),
     /// Act::Join 完成：Ok(ip) / Err(原因)
     JoinDone(Result<String, String>),
+    /// Act::QrScan 完成：Ok(每码一条 payload) / Err(拍照/解码失败原因)
+    QrDone(Result<Vec<String>, String>),
     /// 提示后超时无语音（daemon 计时喂入）
     Timeout,
 }
@@ -29,6 +31,8 @@ pub enum Act {
     Scan,
     /// 加入网络（wifi-join wlan0 ssid psk）
     Join { ssid: String, psk: String },
+    /// 拍照解 QR（cam-shot 盲拍 + agqr，M42b 眼分支）
+    QrScan,
     /// 状态查询（时间/电池/IP）——daemon 读系统后经 inject_say 出声
     Status,
 }
@@ -183,6 +187,58 @@ impl Vm {
                 }
                 outs.push(Out::Show);
             }
+            Ev::QrDone(r) => {
+                // 第一个可解析的 WIFI: 码直入 confirm。QR 是可信输入（码是
+                // 别人机器生成的，不是耳朵听来的）——不回读 PSK 全文，只报
+                // 位数；全文在屏上（psk() 本来就展示）。
+                let wifi = match &r {
+                    Ok(payloads) => payloads
+                        .iter()
+                        .find_map(|p| agqr::parse_wifi_payload(p)),
+                    Err(_) => None,
+                };
+                match wifi {
+                    Some(w) => {
+                        let ask = if w.psk.is_empty() {
+                            format!("扫到网络{}，开放网络，连接吗？", w.ssid)
+                        } else {
+                            format!(
+                                "扫到网络{}，密码{}位，连接吗？",
+                                w.ssid,
+                                w.psk.chars().count()
+                            )
+                        };
+                        self.st = St::WifiConfirm {
+                            ssid: w.ssid,
+                            psk: w.psk,
+                        };
+                        self.say(&mut outs, &ask);
+                    }
+                    None => {
+                        self.st = St::Idle;
+                        match r {
+                            Ok(payloads) => match payloads.into_iter().next() {
+                                // 非密码类码（URL/文本）：念前 40 字，全文进
+                                // 对话行（屏可看全）
+                                Some(p) => {
+                                    let head: String = p.chars().take(40).collect();
+                                    // 截断以 … 收尾，未截断以句号收尾
+                                    let tail = if p.chars().count() > 40 {
+                                        "…".to_string()
+                                    } else {
+                                        "。".to_string()
+                                    };
+                                    self.heard_line(&p);
+                                    self.say(&mut outs, &format!("扫到，{head}{tail}"));
+                                }
+                                None => self.say(&mut outs, "没拍到二维码，正对着它再说扫码。"),
+                            },
+                            Err(_) => self.say(&mut outs, "没拍到二维码，正对着它再说扫码。"),
+                        }
+                    }
+                }
+                outs.push(Out::Show);
+            }
             Ev::Timeout => {
                 if !matches!(self.st, St::Idle) {
                     self.st = St::Idle;
@@ -196,18 +252,23 @@ impl Vm {
     }
 
     fn step_idle(&mut self, text: &str, outs: &mut Vec<Out>) {
-        if is_wifi(text) {
+        if is_scan(text) {
+            // is_scan 判在 is_wifi 之前：「扫码连无线」含「无线」，但主动词
+            // 是相机——口语里说要扫码，给相机。
+            self.say(outs, "拍照扫码，对准二维码别动。");
+            outs.push(Out::Act(Act::QrScan));
+        } else if is_wifi(text) {
             self.say(outs, "扫描网络。");
             outs.push(Out::Act(Act::Scan));
         } else if is_status(text) {
             self.say(outs, "看一下。");
             outs.push(Out::Act(Act::Status));
         } else if is_hello(text) {
-            self.say(outs, "我在。说连接无线网络，或说现在什么状态。");
+            self.say(outs, "我在。说连接无线网络，或说扫码。");
         } else if is_help(text) {
-            self.say(outs, "我能连无线。按住音量下键，说连接无线网络。");
+            self.say(outs, "我能连无线、扫码。按住音量下键，说连接无线网络，或说扫码。");
         } else {
-            self.say(outs, "没听懂。说完整的：连接无线网络。");
+            self.say(outs, "没听懂。说完整的：连接无线网络，或扫码。");
         }
         outs.push(Out::Show);
     }
@@ -231,6 +292,11 @@ impl Vm {
                 self.st = St::WifiList;
                 self.say(outs, &format!("只有{}个，重新说。", self.list.len()));
             }
+        } else if is_scan(text) {
+            // 列表态说扫码：弃列表转相机（QrDone 会重置状态）
+            self.st = St::Idle;
+            self.say(outs, "拍照扫码，对准二维码别动。");
+            outs.push(Out::Act(Act::QrScan));
         } else if is_wifi(text) || is_rescan(text) {
             self.st = St::WifiList;
             self.say(outs, "重新扫描。");
@@ -474,6 +540,12 @@ fn is_rescan(t: &str) -> bool {
 
 fn is_readback(t: &str) -> bool {
     contains_any(t, &["再说一遍", "重复", "念一遍", "再念"])
+}
+
+fn is_scan(t: &str) -> bool {
+    // 相机主动词。与 is_rescan（刷新/重新扫/再扫）不撞：那些词不含
+    // 「扫码」「扫一下」——「再扫一下」会进相机，语义上也没错（用户想再拍）。
+    contains_any(t, &["扫码", "二维码", "扫一扫", "扫一下", "扫个码"])
 }
 
 // ---------------- 序数 ----------------
@@ -793,7 +865,7 @@ mod tests {
     fn gibberish_gets_fixed_reply() {
         let mut vm = Vm::new();
         let o = heard(&mut vm, "今天天气哈哈哈");
-        assert_eq!(says(&o), vec!["没听懂。说完整的：连接无线网络。"]);
+        assert_eq!(says(&o), vec!["没听懂。说完整的：连接无线网络，或扫码。"]);
     }
 
     #[test]
@@ -831,5 +903,104 @@ mod tests {
             parse_spelling(&norm("密码，大写A小写B数字3。")),
             vec!['A', 'b', '3']
         );
+    }
+
+    // ---------------- M42b QR ----------------
+
+    #[test]
+    fn scan_fires_qr_before_wifi() {
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "扫码");
+        assert!(o.contains(&Out::Act(Act::QrScan)));
+        // 「扫码连无线」主动词是相机——is_scan 前置于 is_wifi
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "扫码连无线");
+        assert!(o.contains(&Out::Act(Act::QrScan)));
+        assert!(!o.contains(&Out::Act(Act::Scan)));
+        // 纯 wifi 词仍走网络扫描，不碰相机
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "连接无线网络");
+        assert!(o.contains(&Out::Act(Act::Scan)));
+        assert!(!o.contains(&Out::Act(Act::QrScan)));
+    }
+
+    #[test]
+    fn scan_from_list_and_rescan_unaffected() {
+        // 列表态说扫码：弃列表转相机
+        let mut vm = Vm::new();
+        vm.step(Ev::Heard("无线".into()));
+        vm.step(Ev::ScanDone(vec!["A".into()]));
+        let o = heard(&mut vm, "扫一下");
+        assert!(o.contains(&Out::Act(Act::QrScan)));
+        // 列表态重扫词仍是 wifi 扫描
+        let mut vm = Vm::new();
+        vm.step(Ev::Heard("无线".into()));
+        vm.step(Ev::ScanDone(vec!["A".into()]));
+        let o = heard(&mut vm, "刷新");
+        assert!(o.contains(&Out::Act(Act::Scan)));
+        assert!(!o.contains(&Out::Act(Act::QrScan)));
+    }
+
+    #[test]
+    fn qr_wifi_flow_to_join() {
+        let mut vm = Vm::new();
+        // 多码：跳过非 WIFI 码取第一个 WIFI
+        let o = vm.step(Ev::QrDone(Ok(vec![
+            "https://aginx.net".into(),
+            "WIFI:T:WPA;S:home-ap;P:secret8;;".into(),
+        ])));
+        assert_eq!(says(&o), vec!["扫到网络home-ap，密码7位，连接吗？"]);
+        assert_eq!(vm.state_name(), "confirm");
+        assert_eq!(vm.psk(), "secret8"); // 屏显全文（语音只报位数）
+        let o = heard(&mut vm, "对");
+        assert!(o.contains(&Out::Act(Act::Join {
+            ssid: "home-ap".into(),
+            psk: "secret8".into()
+        })));
+        let o = vm.step(Ev::JoinDone(Ok("10.0.0.5".into())));
+        assert_eq!(says(&o), vec!["连上了，地址10.0.0.5。"]);
+        assert_eq!(vm.state_name(), "idle");
+    }
+
+    #[test]
+    fn qr_open_net_and_deny_to_spell() {
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::QrDone(Ok(vec!["WIFI:S:opennet;;".into()])));
+        assert_eq!(says(&o), vec!["扫到网络opennet，开放网络，连接吗？"]);
+        // deny 后 QR 给的 ssid 还在：退到口头拼密码（WPA 网络里开放码可能是
+        // 码旧了/家里加过密码）
+        let o = heard(&mut vm, "不对");
+        assert_eq!(says(&o), vec!["重新说密码。"]);
+        assert_eq!(vm.state_name(), "pwd");
+        heard(&mut vm, "大写X数字9");
+        assert_eq!(vm.psk(), "X9");
+    }
+
+    #[test]
+    fn qr_text_truncated_and_empty_and_err() {
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::QrDone(Ok(vec!["https://aginx.net/pkg".into()])));
+        assert_eq!(says(&o), vec!["扫到，https://aginx.net/pkg。"]);
+        assert_eq!(vm.state_name(), "idle");
+        // 长文本截到 40 字 + 省略号
+        let long = "a".repeat(50);
+        let o = vm.step(Ev::QrDone(Ok(vec![long])));
+        assert_eq!(says(&o), vec![format!("扫到，{}…", "a".repeat(40))]);
+        // 拍了但没码 / 相机失败：同一句引导（原因进 daemon 日志）
+        let o = vm.step(Ev::QrDone(Ok(vec![])));
+        assert_eq!(says(&o), vec!["没拍到二维码，正对着它再说扫码。"]);
+        let o = vm.step(Ev::QrDone(Err("cam-shot rc=1".into())));
+        assert_eq!(says(&o), vec!["没拍到二维码，正对着它再说扫码。"]);
+        assert_eq!(vm.state_name(), "idle");
+    }
+
+    #[test]
+    fn qr_cancel_during_confirm() {
+        // confirm 是既有面：扫码进 confirm 后取消照常退 idle
+        let mut vm = Vm::new();
+        vm.step(Ev::QrDone(Ok(vec!["WIFI:S:x;P:y;;".into()])));
+        let o = heard(&mut vm, "算了");
+        assert_eq!(says(&o), vec!["已取消。"]);
+        assert_eq!(vm.state_name(), "idle");
     }
 }

@@ -48,6 +48,30 @@ fn main() {
             let outs = vm.step(Ev::Heard(text));
             run_outs(&mut vm, outs, None);
         }
+        Some("--script") => {
+            // 收据阶梯：stdin 每行一条 Heard，同一个 Vm 跨步保持（--inject
+            // 一次一进程，扫码→确认这种多步流跑不完整）。run_outs 在步间阻塞
+            // ——相机/TTS 落完才读下一行，喂两行也能按序走完。
+            let brain = audio::Brain::from_env();
+            let mut vm = Vm::new();
+            face::write(&vm, false, false);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let t = line.trim_end_matches('\n');
+                        if t.is_empty() {
+                            continue;
+                        }
+                        eprintln!("voiced: script {t:?}");
+                        let outs = vm.step(Ev::Heard(t.to_string()));
+                        run_outs(&mut vm, outs, brain.as_ref());
+                    }
+                }
+            }
+        }
         Some("--face") => match face::read() {
             Some(s) => println!("{s}"),
             None => println!("(no face)"),
@@ -234,6 +258,14 @@ fn run_outs(vm: &mut Vm, outs: Vec<Out>, brain: Option<&audio::Brain>) {
                     face::write(vm, false, true);
                     followups.push(Ev::JoinDone(join_wifi(&ssid, &psk)));
                 }
+                Act::QrScan => {
+                    face::write(vm, false, true);
+                    let r = scan_qr();
+                    if let Err(e) = &r {
+                        eprintln!("voiced: qr {e}");
+                    }
+                    followups.push(Ev::QrDone(r));
+                }
                 Act::Status => {
                     let o = vm.inject_say(&status_text());
                     if let Out::Say(s) = o {
@@ -319,6 +351,69 @@ fn unescape_hex(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 拍照解 QR（M42b 眼分支）。尝试阶梯：默认曝光 ×3 → 慢模式+增益兜底。
+///
+/// 2026-09-04 设备收据定形：冷启动后头几次 cam-shot 调用整段是废片
+/// （IOMMU/流会话热身——sweep 10 连拍第 3 发才中），同一轮内 --frames 3
+/// 只是帧内曝光收敛，救不了会话级废片，所以要**多次调用**而不是多帧；
+/// 慢门+gain8 档三连败（暗/糊），只配末位。每轮独立留档（voiced-qrN.jpg），
+/// 收据可逐轮复盘。cam-shot 挂死有预算（wait_limited kill）。
+const QR_BUDGET_SECS: u32 = 15;
+
+fn scan_qr() -> Result<Vec<String>, String> {
+    let mut last_err = String::new();
+    // (轮次从 1 计) — 第 4 轮才是慢门兜底
+    for round in 1..=4u32 {
+        let t0 = Instant::now();
+        let qr_jpg = format!("/tmp/voiced-qr{round}.jpg");
+        let mut cmd = Command::new("/bin/cam-shot");
+        cmd.args(["--stream", "--rear", "--frames", "3", "--jpeg-gray"])
+            .arg("--jpeg-out")
+            .arg(&qr_jpg)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if round == 4 {
+            // 末位兜底：imx363 慢模式 #2610（fll 2488 更长积分）+ 模拟增益
+            // ——黑底白码贴纸、夜间的最后一搏
+            cmd.args(["--slowrear", "--gain", "8"]);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("cam-shot spawn: {e}"))?;
+        if let Err(e) = audio::wait_limited(&mut child, QR_BUDGET_SECS) {
+            last_err = format!("cam-shot {e}");
+            continue; // 挂死被 kill——按失败重试
+        }
+        if !child.wait().map(|s| s.success()).unwrap_or(false) {
+            // 冷加载 IOMMU 间歇性失败是已知收据（M19c/M19b），直接重试
+            last_err = "cam-shot rc!=0".into();
+            continue;
+        }
+        // 解码（agqr 进程，payload 一行一个）。output() 不带超时——解码
+        // 是 <300ms 量级的纯计算，等待预算都在拍照那侧
+        let dec = Command::new("/usr/bin/agqr").arg(&qr_jpg).output();
+        match dec {
+            Ok(out) if out.status.success() => {
+                let payloads = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                if !payloads.is_empty() {
+                    eprintln!(
+                        "voiced: qr round {round}, {:.1}s",
+                        t0.elapsed().as_secs_f32()
+                    );
+                    return Ok(payloads);
+                }
+                last_err = "没找到二维码".into();
+            }
+            Ok(_) => last_err = "agqr rc!=0".into(), // exit 1 = 没码，也重试
+            Err(e) => last_err = format!("agqr spawn: {e}"),
+        }
+    }
+    Err(last_err)
 }
 
 /// wifi-join wlan0 ssid psk，然后读 wlan0 的 IPv4。

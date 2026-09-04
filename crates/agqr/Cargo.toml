@@ -1,0 +1,24 @@
+[package]
+name = "agqr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "QR decode from a camera JPEG (M42b) — pure-Rust quircs + agimg"
+
+[features]
+# 三档特性面：
+# - default-features=false（voiced 用）：只剩 WIFI: 载荷解析，纯字符串零依赖；
+# - decode：quircs QR 解码（CLI 最低面）；
+# - jpeg（default）：decode + agimg（vendored libjpeg-turbo，C 构建重），
+#   decode_jpeg/CLI 完整路径都在这档。
+default = ["jpeg"]
+decode = ["dep:quircs"]
+jpeg = ["decode", "dep:agimg"]
+
+[dependencies]
+# quircs：纯 Rust quirc 移植（自带 num-traits/num-derive/thiserror，均纯 Rust）
+quircs = { version = "0.10", optional = true }
+agimg = { path = "../agimg", optional = true }
+
+[dev-dependencies]
+qrcodegen = "1"
