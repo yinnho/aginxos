@@ -1,8 +1,11 @@
 //! voiced — 语音对话守护（M42a，产品定义 2026-09-04：手机即智能体）。
 //!
-//! 产品面唯一的输入是语音（PTT=按住音量下键）和眼（M42b），输出是嘴
-//! （TTS）和脸（/run/voice/face → aterm 渲染）。协议是封闭词表的确定性
-//! 状态机（protocol.rs），没有 LLM——WiFi 必须在 LLM 可用之前连得上。
+//! 产品面唯一的输入是语音（PTT=按住音量下键）和眼（M42b），输出是脸
+//! （/run/voice/face → aterm 渲染）和嘴（TTS）。**拉式语音**（2026-09-04
+//! 用户收据：识别和回应都是毫秒级，唯独嘴是慢车道）——回应默认只上脸，
+//! 用户点名（「你说给我听」「念一下」「再念一遍」）才出声。协议是封闭
+//! 词表的确定性状态机（protocol.rs），没有 LLM——WiFi 必须在 LLM 可用
+//! 之前连得上。
 //!
 //! 调试面（收据阶梯，从嘴/耳单器官到全环）：
 //!   voiced --say "文本"          只测嘴（TTS→扬声器）
@@ -233,12 +236,14 @@ fn hear(wav: &[u8], brain: Option<&audio::Brain>) -> Result<String, String> {
     }
 }
 
-/// 落地状态机输出：Say→TTS+屏，Act→执行并把结果喂回状态机。
+/// 落地状态机输出。拉式语音：Say 只上脸（行已在 vm.lines 里，末尾统一
+/// face::write），Speak 才走 TTS；Act → 执行并把结果喂回状态机。
 fn run_outs(vm: &mut Vm, outs: Vec<Out>, brain: Option<&audio::Brain>) {
     let mut followups: Vec<Ev> = Vec::new();
     for o in outs {
         match o {
-            Out::Say(s) => {
+            Out::Say(_) => {}
+            Out::Speak(s) => {
                 face::write(vm, false, true);
                 say(&s, brain);
             }

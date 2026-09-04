@@ -43,8 +43,13 @@ pub enum Act {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Out {
-    /// 说出这句话（TTS + 屏上一行）
+    /// 机器话语：上屏（对话行）。拉式语音（2026-09-04 用户收据：识别和
+    /// 回应都快、唯独嘴慢）——daemon 对 Say 默认不出声，回应即时上脸；
+    /// 想听再说「你说给我听」。
     Say(String),
+    /// 点名要听：上屏（若文本还不在屏上，调用方先推行）+ 必 TTS。
+    /// 「念一下」的 OCR 读、「再念一遍」的回读、「你说给我听」的复述。
+    Speak(String),
     /// 只刷屏不出声（状态变了但不需要说）
     Show,
     /// 执行动作
@@ -130,6 +135,12 @@ impl Vm {
         self.trim_lines();
         outs.push(Out::Say(s.to_string()));
     }
+    /// 点名要听的话语：推对话行 + 必出声。
+    fn say_loud(&mut self, outs: &mut Vec<Out>, s: &str) {
+        self.lines.push((false, s.to_string()));
+        self.trim_lines();
+        outs.push(Out::Speak(s.to_string()));
+    }
     fn heard_line(&mut self, s: &str) {
         self.lines.push((true, s.to_string()));
         self.trim_lines();
@@ -160,6 +171,16 @@ impl Vm {
                     self.st = St::Idle;
                     self.sel = 0;
                     self.say(&mut outs, "已取消。");
+                    outs.push(Out::Show);
+                    return outs;
+                }
+                // 点名要听（拉式语音）：复述最近一条机器话语。confirm 态
+                // 不拦——那里的「再念一遍」是密码回读（同词状态义不同）。
+                if !matches!(self.st, St::WifiConfirm { .. }) && is_speak_request(&text) {
+                    match self.lines.iter().rev().find(|(u, _)| !u) {
+                        Some((_, s)) => outs.push(Out::Speak(s.clone())),
+                        None => self.say_loud(&mut outs, "我还没说过话。"),
+                    }
                     outs.push(Out::Show);
                     return outs;
                 }
@@ -254,12 +275,14 @@ impl Vm {
                             self.lines.push((false, l.clone()));
                         }
                         self.trim_lines();
+                        // 念一下本身就是要听（拉式语音的点名面）：全文已在
+                        // 屏上，Speak 只出声不再推行。
                         let joined = lines.join("。");
                         if joined.chars().count() > 120 {
                             let head = lines.iter().take(2).cloned().collect::<Vec<_>>().join("。");
-                            self.say(&mut outs, &format!("{head}。全文在屏幕上。"));
+                            outs.push(Out::Speak(format!("{head}。全文在屏幕上。")));
                         } else {
-                            self.say(&mut outs, &joined);
+                            outs.push(Out::Speak(joined));
                         }
                     }
                     Ok(_) | Err(_) => {
@@ -301,7 +324,7 @@ impl Vm {
         } else if is_help(text) {
             self.say(
                 outs,
-                "我能连无线、扫码、念字。按住音量下键，说连接无线网络，或说扫码、念一下。",
+                "我能连无线、扫码、念字。回应都在屏幕上，要听我说，说你说给我听。",
             );
         } else {
             self.say(outs, "没听懂。说完整的：连接无线网络，或扫码，或念一下。");
@@ -400,7 +423,8 @@ impl Vm {
         } else if is_readback(text) {
             let readback = spell_readback(&psk);
             self.st = St::WifiConfirm { ssid, psk };
-            self.say(outs, &format!("密码是{readback}，对吗？"));
+            // 回读是点名要听：出声
+            self.say_loud(outs, &format!("密码是{readback}，对吗？"));
         } else {
             self.st = St::WifiConfirm { ssid, psk };
             self.say(outs, "说对，或说不对。");
@@ -583,6 +607,23 @@ fn is_readback(t: &str) -> bool {
     contains_any(t, &["再说一遍", "重复", "念一遍", "再念"])
 }
 
+/// 点名要听（拉式语音的总开关词）。超集于 is_readback——confirm 态之外的
+/// 任何状态说这些词，都复述最近一条机器话语。「念给我听」不收：那是
+/// OCR 的拍+念（is_ocr），同词不同义。
+fn is_speak_request(t: &str) -> bool {
+    contains_any(
+        t,
+        &[
+            "你说给我听",
+            "说给我听",
+            "再说一遍",
+            "再念一遍",
+            "念一遍",
+            "重复",
+        ],
+    )
+}
+
 fn is_scan(t: &str) -> bool {
     // 相机主动词。与 is_rescan（刷新/重新扫/再扫）不撞：那些词不含
     // 「扫码」「扫一下」——「再扫一下」会进相机，语义上也没错（用户想再拍）。
@@ -753,6 +794,14 @@ mod tests {
         outs.iter()
             .filter_map(|o| match o {
                 Out::Say(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    fn speaks(outs: &[Out]) -> Vec<String> {
+        outs.iter()
+            .filter_map(|o| match o {
+                Out::Speak(s) => Some(s.clone()),
                 _ => None,
             })
             .collect()
@@ -936,7 +985,45 @@ mod tests {
         heard(&mut vm, "大写A");
         heard(&mut vm, "完了");
         let o = heard(&mut vm, "再说一遍");
-        assert_eq!(says(&o), vec!["密码是大写A，对吗？"]);
+        // confirm 态的念一遍 = 密码回读（点名，出声）
+        assert_eq!(speaks(&o), vec!["密码是大写A，对吗？"]);
+    }
+
+    // ---------------- 拉式语音（2026-09-04） ----------------
+
+    #[test]
+    fn speak_request_replays_last_agent_line() {
+        let mut vm = Vm::new();
+        // 没说过话：点名 → 出声告知（而不是无声）
+        let o = heard(&mut vm, "你说给我听");
+        assert_eq!(speaks(&o), vec!["我还没说过话。"]);
+        // 有过话语：复述最近一条机器行，不改状态
+        let o = heard(&mut vm, "你好");
+        assert_eq!(says(&o), vec!["我在。说连接无线网络，或说扫码、念一下。"]);
+        let o = heard(&mut vm, "说给我听");
+        assert_eq!(speaks(&o), vec!["我在。说连接无线网络，或说扫码、念一下。"]);
+        assert_eq!(vm.state_name(), "idle");
+        // 列表态也不拦（复述，列表保持）
+        vm.step(Ev::Heard("无线".into()));
+        vm.step(Ev::ScanDone(vec!["A".into()]));
+        let o = heard(&mut vm, "再念一遍");
+        assert_eq!(speaks(&o), vec!["找到1个网络，屏幕上选，说选第几个。"]);
+        assert_eq!(vm.state_name(), "list");
+        assert_eq!(vm.list(), &["A".to_string()]);
+    }
+
+    #[test]
+    fn chatter_is_quiet_by_default() {
+        // 拉式语音：常规回应是 Say（daemon 只上脸），不是 Speak
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "无线");
+        assert!(!o.iter().any(|o| matches!(o, Out::Speak(_))));
+        let o = vm.step(Ev::JoinDone(Ok("192.168.0.166".into())));
+        assert_eq!(says(&o), vec!["连上了，地址192.168.0.166。"]);
+        assert!(o.iter().all(|o| !matches!(o, Out::Speak(_))));
+        // 状态查询（inject_say）也是 Say——屏显，想听跟一句你说给我听
+        let o = heard(&mut vm, "状态");
+        assert!(matches!(o[0], Out::Say(_)));
     }
 
     #[test]
@@ -1089,24 +1176,29 @@ mod tests {
             "机器视觉测试".into(),
             "TEL 138-0013-8000".into(),
         ])));
-        // 短文：行拼成一句整念（daemon split_clauses 分句）
-        assert_eq!(says(&o), vec!["机器视觉测试。TEL 138-0013-8000"]);
+        // 短文：行拼成一句整念（daemon split_clauses 分句）——拉式语音下
+        // 念一下仍是点名面：Speak
+        assert_eq!(
+            speaks(&o),
+            vec!["机器视觉测试。TEL 138-0013-8000"]
+        );
         assert_eq!(vm.state_name(), "idle");
-        // 全文上屏：每行一条对话行
+        // 全文上屏：每行一条对话行（Speak 不再重复推行）
         let shown: Vec<&str> = vm.lines().iter().map(|(_, s)| s.as_str()).collect();
         assert!(shown.contains(&"机器视觉测试"));
         assert!(shown.contains(&"TEL 138-0013-8000"));
+        assert_eq!(vm.lines().len(), 2);
 
         // 长文（>120 字）：只念前两行 + 指屏
         let mut vm = Vm::new();
         let lines: Vec<String> = (0..5).map(|i| format!("第{i}行{}", "字".repeat(30))).collect();
         let o = vm.step(Ev::OcrDone(Ok(lines.clone())));
         assert_eq!(
-            says(&o),
+            speaks(&o),
             vec![format!("{}。{}。全文在屏幕上。", lines[0], lines[1])]
         );
-        // 屏上五行全文 + 一行语音转述（say 也进对话行）
-        assert_eq!(vm.lines().len(), 6);
+        // 屏上五行全文（语音转述不再占对话行）
+        assert_eq!(vm.lines().len(), 5);
     }
 
     #[test]
