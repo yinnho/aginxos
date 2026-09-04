@@ -266,6 +266,14 @@ fn run_outs(vm: &mut Vm, outs: Vec<Out>, brain: Option<&audio::Brain>) {
                     }
                     followups.push(Ev::QrDone(r));
                 }
+                Act::Ocr => {
+                    face::write(vm, false, true);
+                    let r = read_text();
+                    if let Err(e) = &r {
+                        eprintln!("voiced: ocr {e}");
+                    }
+                    followups.push(Ev::OcrDone(r));
+                }
                 Act::Status => {
                     let o = vm.inject_say(&status_text());
                     if let Out::Say(s) = o {
@@ -411,6 +419,77 @@ fn scan_qr() -> Result<Vec<String>, String> {
             }
             Ok(_) => last_err = "agqr rc!=0".into(), // exit 1 = 没码，也重试
             Err(e) => last_err = format!("agqr spawn: {e}"),
+        }
+    }
+    Err(last_err)
+}
+
+/// 拍照念字（M45 眼分支）。同 QR 的冷启动废片收据：默认曝光两轮，末轮
+/// gain 提亮（暗房实测定形：默认曝光 det 颗粒无收，gain16+dgain2 出 4 框）。
+/// ag-ocr 自带 auto 旋转——竖握手机拍横排文字是产品常态（传感器横向安装）。
+/// 识别 ~3-6s（auto 两轮 det + rec），预算在拍照和识别两侧都给足。
+const OCR_BUDGET_SECS: u32 = 20;
+
+fn read_text() -> Result<Vec<String>, String> {
+    use std::io::Read;
+    let mut last_err = String::new();
+    for round in 1..=3u32 {
+        let jpg = format!("/tmp/voiced-ocr{round}.jpg");
+        let mut cmd = Command::new("/bin/cam-shot");
+        cmd.args(["--stream", "--rear", "--frames", "3", "--jpeg"])
+            .arg("--jpeg-out")
+            .arg(&jpg)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if round == 3 {
+            // 末位兜底：满增益提亮（M45 暗房收据，det 0 框→4 框的档位）
+            cmd.args(["--gain", "16", "--dgain", "2"]);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("cam-shot spawn: {e}"))?;
+        if let Err(e) = audio::wait_limited(&mut child, OCR_BUDGET_SECS) {
+            last_err = format!("cam-shot {e}");
+            continue; // 挂死被 kill——按失败重试
+        }
+        if !child.wait().map(|s| s.success()).unwrap_or(false) {
+            last_err = "cam-shot rc!=0".into();
+            continue;
+        }
+        // ag-ocr：stdout 每行 "text\tconf"，exit 0=有字 / 1=没字 / 2=错误。
+        // 识别要秒级（agqr 的 <300ms 先例不适用），piped + wait_limited 给预算。
+        let mut child = match Command::new("/var/bin/ag-ocr")
+            .arg(&jpg)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return Err(format!("ag-ocr spawn: {e}")), // 装机缺失不重试
+        };
+        let mut buf = String::new();
+        if let Some(mut so) = child.stdout.take() {
+            let _ = so.read_to_string(&mut buf); // 输出 <64KB 管道缓冲，不会死锁
+        }
+        if let Err(e) = audio::wait_limited(&mut child, OCR_BUDGET_SECS) {
+            last_err = format!("ag-ocr {e}");
+            continue;
+        }
+        match child.wait().map(|s| s.code()).unwrap_or(None) {
+            Some(0) => {
+                let lines: Vec<String> = buf
+                    .lines()
+                    .map(|l| l.split('\t').next().unwrap_or("").to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if !lines.is_empty() {
+                    eprintln!("voiced: ocr round {round}, {} 行", lines.len());
+                    return Ok(lines);
+                }
+                last_err = "没识别到文字".into();
+            }
+            Some(1) => last_err = "没识别到文字".into(),
+            _ => last_err = "ag-ocr rc=2".into(),
         }
     }
     Err(last_err)

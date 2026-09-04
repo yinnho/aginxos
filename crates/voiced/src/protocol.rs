@@ -21,6 +21,8 @@ pub enum Ev {
     JoinDone(Result<String, String>),
     /// Act::QrScan 完成：Ok(每码一条 payload) / Err(拍照/解码失败原因)
     QrDone(Result<Vec<String>, String>),
+    /// Act::Ocr 完成：Ok(每行一条文本) / Err(拍照/识别失败原因)
+    OcrDone(Result<Vec<String>, String>),
     /// 提示后超时无语音（daemon 计时喂入）
     Timeout,
 }
@@ -33,6 +35,8 @@ pub enum Act {
     Join { ssid: String, psk: String },
     /// 拍照解 QR（cam-shot 盲拍 + agqr，M42b 眼分支）
     QrScan,
+    /// 拍照念字（cam-shot 盲拍 + ag-ocr，M45 眼分支）
+    Ocr,
     /// 状态查询（时间/电池/IP）——daemon 读系统后经 inject_say 出声
     Status,
 }
@@ -239,6 +243,31 @@ impl Vm {
                 }
                 outs.push(Out::Show);
             }
+            Ev::OcrDone(r) => {
+                // M45 眼分支：识别行全文上屏（每行一条对话行，滚动窗取尾），
+                // 语音走 Say。短文整篇念（daemon 侧 split_clauses 分句流水）；
+                // 长文（>120 字）只念前两行——耳朵听不下整页，眼睛看屏。
+                self.st = St::Idle;
+                match r {
+                    Ok(lines) if !lines.is_empty() => {
+                        for l in &lines {
+                            self.lines.push((false, l.clone()));
+                        }
+                        self.trim_lines();
+                        let joined = lines.join("。");
+                        if joined.chars().count() > 120 {
+                            let head = lines.iter().take(2).cloned().collect::<Vec<_>>().join("。");
+                            self.say(&mut outs, &format!("{head}。全文在屏幕上。"));
+                        } else {
+                            self.say(&mut outs, &joined);
+                        }
+                    }
+                    Ok(_) | Err(_) => {
+                        self.say(&mut outs, "没拍到文字，正对着它再说念一下。");
+                    }
+                }
+                outs.push(Out::Show);
+            }
             Ev::Timeout => {
                 if !matches!(self.st, St::Idle) {
                     self.st = St::Idle;
@@ -257,6 +286,10 @@ impl Vm {
             // 是相机——口语里说要扫码，给相机。
             self.say(outs, "拍照扫码，对准二维码别动。");
             outs.push(Out::Act(Act::QrScan));
+        } else if is_ocr(text) {
+            // 念读也判在 is_wifi 前（「念一���」类词不含网络词，纯判序保守）
+            self.say(outs, "拍照念字，对准文字别动。");
+            outs.push(Out::Act(Act::Ocr));
         } else if is_wifi(text) {
             self.say(outs, "扫描网络。");
             outs.push(Out::Act(Act::Scan));
@@ -264,11 +297,14 @@ impl Vm {
             self.say(outs, "看一下。");
             outs.push(Out::Act(Act::Status));
         } else if is_hello(text) {
-            self.say(outs, "我在。说连接无线网络，或说扫码。");
+            self.say(outs, "我在。说连接无线网络，或说扫码、念一下。");
         } else if is_help(text) {
-            self.say(outs, "我能连无线、扫码。按住音量下键，说连接无线网络，或说扫码。");
+            self.say(
+                outs,
+                "我能连无线、扫码、念字。按住音量下键，说连接无线网络，或说扫码、念一下。",
+            );
         } else {
-            self.say(outs, "没听懂。说完整的：连接无线网络，或扫码。");
+            self.say(outs, "没听懂。说完整的：连接无线网络，或扫码，或念一下。");
         }
         outs.push(Out::Show);
     }
@@ -297,6 +333,11 @@ impl Vm {
             self.st = St::Idle;
             self.say(outs, "拍照扫码，对准二维码别动。");
             outs.push(Out::Act(Act::QrScan));
+        } else if is_ocr(text) {
+            // 列表态说念读：弃列表转相机（OcrDone 会重置状态）
+            self.st = St::Idle;
+            self.say(outs, "拍照念字，对准文字别动。");
+            outs.push(Out::Act(Act::Ocr));
         } else if is_wifi(text) || is_rescan(text) {
             self.st = St::WifiList;
             self.say(outs, "重新扫描。");
@@ -546,6 +587,15 @@ fn is_scan(t: &str) -> bool {
     // 相机主动词。与 is_rescan（刷新/重新扫/再扫）不撞：那些词不含
     // 「扫码」「扫一下」——「再扫一下」会进相机，语义上也没错（用户想再拍）。
     contains_any(t, &["扫码", "二维码", "扫一扫", "扫一下", "扫个码"])
+}
+
+fn is_ocr(t: &str) -> bool {
+    // M45 念读主动词。与 is_readback（念一遍/再说一遍——confirm 态专用）
+    // 不撞：「念一下」≠「念一遍」。裸「念」「读」不收（「念念不忘」误触）。
+    contains_any(
+        t,
+        &["念一下", "读一下", "念文字", "读文字", "念给我听", "这是什么字"],
+    )
 }
 
 // ---------------- 序数 ----------------
@@ -865,7 +915,7 @@ mod tests {
     fn gibberish_gets_fixed_reply() {
         let mut vm = Vm::new();
         let o = heard(&mut vm, "今天天气哈哈哈");
-        assert_eq!(says(&o), vec!["没听懂。说完整的：连接无线网络，或扫码。"]);
+        assert_eq!(says(&o), vec!["没听懂。说完整的：连接无线网络，或扫码，或念一下。"]);
     }
 
     #[test]
@@ -1002,5 +1052,70 @@ mod tests {
         let o = heard(&mut vm, "算了");
         assert_eq!(says(&o), vec!["已取消。"]);
         assert_eq!(vm.state_name(), "idle");
+    }
+
+    // ---------------- M45 OCR ----------------
+
+    #[test]
+    fn ocr_fires_from_idle_and_not_scan() {
+        for w in ["念一下", "读一下", "念文字", "读文字", "念给我听", "这是什么字"] {
+            let mut vm = Vm::new();
+            let o = heard(&mut vm, w);
+            assert!(o.contains(&Out::Act(Act::Ocr)), "「{w}」应触发 OCR");
+            assert!(!o.contains(&Out::Act(Act::QrScan)), "「{w}」不应触发扫码");
+            assert!(!o.contains(&Out::Act(Act::Scan)), "「{w}」不应触发 wifi 扫描");
+        }
+        // 反向：扫码词不进 OCR
+        let mut vm = Vm::new();
+        let o = heard(&mut vm, "扫码");
+        assert!(o.contains(&Out::Act(Act::QrScan)));
+        assert!(!o.contains(&Out::Act(Act::Ocr)));
+    }
+
+    #[test]
+    fn ocr_from_list_state_drops_list() {
+        let mut vm = Vm::new();
+        vm.step(Ev::Heard("无线".into()));
+        vm.step(Ev::ScanDone(vec!["A".into()]));
+        let o = heard(&mut vm, "念一下");
+        assert!(o.contains(&Out::Act(Act::Ocr)));
+        assert_eq!(vm.state_name(), "idle"); // OcrDone 会重置，先退出列表态
+    }
+
+    #[test]
+    fn ocr_done_short_reads_all_long_reads_head() {
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::OcrDone(Ok(vec![
+            "机器视觉测试".into(),
+            "TEL 138-0013-8000".into(),
+        ])));
+        // 短文：行拼成一句整念（daemon split_clauses 分句）
+        assert_eq!(says(&o), vec!["机器视觉测试。TEL 138-0013-8000"]);
+        assert_eq!(vm.state_name(), "idle");
+        // 全文上屏：每行一条对话行
+        let shown: Vec<&str> = vm.lines().iter().map(|(_, s)| s.as_str()).collect();
+        assert!(shown.contains(&"机器视觉测试"));
+        assert!(shown.contains(&"TEL 138-0013-8000"));
+
+        // 长文（>120 字）：只念前两行 + 指屏
+        let mut vm = Vm::new();
+        let lines: Vec<String> = (0..5).map(|i| format!("第{i}行{}", "字".repeat(30))).collect();
+        let o = vm.step(Ev::OcrDone(Ok(lines.clone())));
+        assert_eq!(
+            says(&o),
+            vec![format!("{}。{}。全文在屏幕上。", lines[0], lines[1])]
+        );
+        // 屏上五行全文 + 一行语音转述（say 也进对话行）
+        assert_eq!(vm.lines().len(), 6);
+    }
+
+    #[test]
+    fn ocr_done_empty_and_err_prompt_retry() {
+        let mut vm = Vm::new();
+        let o = vm.step(Ev::OcrDone(Ok(vec![])));
+        assert_eq!(says(&o), vec!["没拍到文字，正对着它再说念一下。"]);
+        assert_eq!(vm.state_name(), "idle");
+        let o = vm.step(Ev::OcrDone(Err("ag-ocr rc=2".into())));
+        assert_eq!(says(&o), vec!["没拍到文字，正对着它再说念一下。"]);
     }
 }
