@@ -28,7 +28,7 @@ struct ctl_info272 {          /* kernel's snd_ctl_elem_info, 272 B */
   int owner;
   union {
     struct { long min, max, step; } integer;
-    struct { unsigned int items, item; const char *names; } enumerated;
+    struct { unsigned int items, item; char name[64]; } enumerated;
     unsigned char reserved[128];
   } value;
   union { unsigned long long min64, max64; unsigned char r1[64]; } value64;
@@ -90,7 +90,22 @@ int main(int argc, char **argv)
         if (ioctl(fd, CTL_WRITE, &ev) < 0) { perror("write"); return 1; }
       }
       memset(&ev, 0, sizeof(ev)); ev.id.numid = n;
-      if (ioctl(fd, CTL_READ, &ev) == 0) show(&ei, &ev);
+      if (ioctl(fd, CTL_READ, &ev) == 0) {
+        show(&ei, &ev);
+        /* enum query (M43): kernel fills value.enumerated.name for each
+           requested item — one info ioctl per index. Only for named
+           queries; full-list mode would drown in items. */
+        if (ei.type == 3 && ei.value.enumerated.items <= 256) {
+          struct ctl_info272 qi;
+          for (i = 0; i < ei.value.enumerated.items; i++) {
+            memset(&qi, 0, sizeof(qi));
+            qi.id.numid = n;
+            qi.value.enumerated.item = i;
+            if (ioctl(fd, CTL_INFO, &qi) == 0)
+              printf("  %u: %s\n", i, qi.value.enumerated.name);
+          }
+        }
+      }
     }
   }
   if (name && !found) { fprintf(stderr, "no element '%s'\n", name); return 1; }

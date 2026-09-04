@@ -143,13 +143,49 @@ mix "PRI_TDM_TX_0 Channels" 1
 mix "QUIN_TDM_RX_0 Channels" 2
 mix "QUIN_TDM_RX_0 Audio Mixer MultiMedia1" "1 1"
 mix "Main AMP Enable Switch" 1
-mix "R AMP Enable" 1
+mix "R Main AMP Enable Switch" 1
 mix "AMP PCM Gain" 17
 mix "R AMP PCM Gain" 17
 mix "Digital PCM Volume" 817
 mix "R Digital PCM Volume" 817
 mix "MultiMedia1 Mixer PRI_TDM_TX_0" "1 1"
 mix "PRI_TDM_TX_0 Audio Mixer MultiMedia1" "1 1"
+# --- amp DSP engagement (M43, 2026-09-04) ------------------------------------
+# The M18 recipe left the cs35l41 smart-amp half-configured — protection
+# firmware staged but OUT of the signal path: PCM Source=0 is the ASP bypass
+# (DSP Booted never latched, DRE off, and "R AMP Enable" above was a stale
+# control name so the right amp never enabled — speaker mono + raw). The
+# fix is the vendor crus_sp_cal_mixer_paths.xml dance, device-proven
+# 2026-09-04 (see HARDWARE.md M43):
+#   DRE+VBSTMON on → inject stored speaker calibration into the Protection
+#   algorithm (cd controls, BE u32 in value[0]) → PCM Source=DSP (enum
+#   {0:ASP,1:DSP}) → DSP boots on the next clock. Calibration was measured
+#   once by the full Calibration-firmware dance and lives in
+#   /etc/aginx/spk-cal (state-tarred; absent file ⇒ blind protection, same
+#   as pre-M43). CAL_SET_STATUS latches BE(2) after the first playback.
+mix "DRE DRE Switch" 1
+mix "R DRE DRE Switch" 1
+mix "VBSTMON Output Switch" 1
+mix "R VBSTMON Output Switch" 1
+# Stage the protection firmware explicitly — on a cold card the cd controls
+# (DSP1 Protection cd CAL_*) do not exist until the wmfw registers its
+# coefficients; preload makes that deterministic (~1s per amp, sleep covers).
+mix "DSP1 Preload Switch" 1
+mix "R DSP1 Preload Switch" 1
+sleep 2
+if [ -s /etc/aginx/spk-cal ]; then
+  # lines are "<ctl name> <BE value>" — ctl names CONTAIN spaces, so split
+  # on the last field with parameter expansion (read's two-var form would
+  # hand the whole tail to $val — the boot-1 trap that left CAL_R=0).
+  while read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    val=${line##* }
+    ctl=${line% *}
+    mix "$ctl" "$val"
+  done < /etc/aginx/spk-cal
+fi
+mix "PCM Source" 1
+mix "R PCM Source" 1
 # Boot the rt5514 DSP first (fw load, a few seconds), then the mic route —
 # see the comment block above for why the order matters.
 mix "DSP ADC" 1
