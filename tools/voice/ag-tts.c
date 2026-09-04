@@ -53,17 +53,16 @@ int main(int argc, char **argv) {
     if (!strcmp(kind, "vits")) {
         // melo: tarball 里的 model.int8.onnx 是 133B 的 git-lfs 指针（release
         // 打包事故），真身只有 fp32 model.onnx（170MB）——vits 本来就小，
-        // fp32 也远快于 kokoro。sherpa v1.12.15 起 lexicon 自足不用 dict_dir。
-        // espeak-ng-data 不在 tarball 里——部署时软链到 kokoro 目录的（同一
-        // espeak 构建），纯中文走 lexicon 不碰它。规则用 melo 自带三 fst +
-        // new_heteronym.fst（多音字，rule_fars）。
+        // fp32 也远快于 kokoro。前端 MeloTtsLexicon 只要 lexicon+tokens 自足
+        // （vits 不读 dict_dir）。陷阱（M42e 设备收据）：vits 绝不能设
+        // data_dir——impl 里 AddBlank 隔位插 0 被 data_dir 非空门住跳过，
+        // 序列错乱出怪音。规则用 melo 自带三 fst + new_heteronym.fst。
         snprintf(model, sizeof model, "%s/model.onnx", dir);
         snprintf(fsts, sizeof fsts, "%s/number.fst,%s/date.fst,%s/phone.fst", dir, dir, dir);
         snprintf(fars, sizeof fars, "%s/new_heteronym.fst", dir);
         config.model.vits.model = model;
         config.model.vits.lexicon = lex;
         config.model.vits.tokens = tokens;
-        config.model.vits.data_dir = espeak;
         config.model.vits.noise_scale = 0.667f;
         config.model.vits.noise_scale_w = 0.8f;
         config.model.vits.length_scale = 1.0f;
