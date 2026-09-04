@@ -25,7 +25,19 @@ test -x "${RAMDISK}/system/bin/adbd" || { echo "missing ${RAMDISK} — run boot/
 test -x "${RECIPE}/busybox" || { echo "missing ${RECIPE}/busybox" >&2; exit 1; }
 test -x "${TARGET}/aginxos-init" || { echo "missing musl binaries — run scripts/build-phone.sh musl first" >&2; exit 1; }
 test -x "${TARGET}/aterm" || { echo "missing aterm — run scripts/build-phone.sh musl first" >&2; exit 1; }
-test -x "${TARGET}/ag" || { echo "missing ag router — run scripts/build-phone.sh musl first" >&2; exit 1; }
+test -x "${TARGET}/voiced" || { echo "missing voiced — run scripts/build-phone.sh musl first" >&2; exit 1; }
+# Voice stack (M42d) — local-first ASR/TTS CLIs + the two models. Voice is
+# the bootstrap human interface (the WiFi-join flow speaks before any
+# network exists), so the models ride the baked image rather than
+# provision — re-download would be chicken-and-egg with voice setup.
+# /var/bin overlaps the provision overlay, but provision only fills
+# manifest items (ag-asr/ag-tts are not in it) and never wipes extras.
+VOICE="${ROOT}/out/voice"
+test -x "${VOICE}/bin/ag-asr" && test -x "${VOICE}/bin/ag-tts" \
+  || { echo "missing out/voice/bin/ag-{asr,tts} — run scripts/build-voice.sh" >&2; exit 1; }
+test -s "${VOICE}/models/asr/model.int8.onnx" \
+  && test -s "${VOICE}/models/tts/kokoro-int8-multi-lang-v1_1/model.int8.onnx" \
+  || { echo "missing voice models — run scripts/fetch-voice-models.sh" >&2; exit 1; }
 MKE2FS="$(command -v mke2fs || true)"
 test -z "${MKE2FS}" && MKE2FS=/opt/homebrew/bin/mke2fs
 test -x "${MKE2FS}" || { echo "mke2fs not found (android-platform-tools provides it)" >&2; exit 1; }
@@ -236,6 +248,19 @@ cp "${TARGET}/aterm" "${TREE}/usr/bin/aterm"
 # protocol (no LLM needed to get on Wi-Fi), PTT on volume-down, brain
 # ASR/TTS, and the sole writer of /run/voice/face which aterm renders.
 cp "${TARGET}/voiced" "${TREE}/usr/bin/voiced"
+# Voice stack binaries (M42d) — bionic-static CLIs voiced shells out to
+# (paths hardcoded in crates/voiced/src/audio.rs: /var/bin/ag-{asr,tts}).
+mkdir -p "${TREE}/var/bin"
+cp "${VOICE}/bin/ag-asr" "${VOICE}/bin/ag-tts" "${TREE}/var/bin/"
+chmod 755 "${TREE}/var/bin/ag-asr" "${TREE}/var/bin/ag-tts"
+# Voice models (M42d) — sense-voice int8 ASR + kokoro int8 TTS (~440MB).
+# NOT in the agupd state tar: they ride every baked image instead, so a
+# clean reflash AND a system update both carry them without a 440MB tar
+# staging pass per update.
+mkdir -p "${TREE}/var/models"
+cp -R "${VOICE}/models/asr" "${TREE}/var/models/asr"
+cp -R "${VOICE}/models/tts/kokoro-int8-multi-lang-v1_1" \
+  "${TREE}/var/models/tts/kokoro-int8-multi-lang-v1_1"
 # CJK font subset (M38a) — aterm cjk.rs rasterizes through ab_glyph;
 # GB2312 full + ASCII + punct rows, ~1.5MB (scripts/subset-cjk-font.sh).
 cp -R "${RECIPE}/usr/share/fonts" "${TREE}/usr/share/fonts"
