@@ -11,6 +11,15 @@ XBL (signed, SoC) → AginxOS bootloader → Linux kernel → AginxOS userspace 
 
 First target: **Google Pixel 5** (`redfin`, Snapdragon 765G) — unlocked, dedicated experiment unit (wipe OK; keep factory image for recovery).
 
+> **ARCHIVED — first-generation line, frozen 2026-09-05.**
+> The N4 cutover is complete: [`aginxos-next`](../aginxos-next) owns the
+> bake chain and the device. This repo stays on disk as the **asset
+> library** — vendor ramdisk unpack, `rootfs/src/*.c`, voice/OCR stacks
+> and models, radio blobs, signing keys, busybox, and every first-gen
+> device receipt (`docs/HARDWARE.md`, local-only). The new repo's
+> `scripts/build-rootfs.sh` reads these read-only via `OLD=`. Do not
+> build on this code; do not expect device receipts here after N4.
+
 ## Route A
 
 We do **not** rewrite Wi‑Fi firmware or the 5G baseband in Rust.  
