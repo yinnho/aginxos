@@ -1,9 +1,12 @@
 # AginxOS
 
-[![GitHub](https://img.shields.io/badge/GitHub-yinnho%2Faginxos-black)](https://github.com/yinnho/aginxos)
+[![userspace: Rust](https://img.shields.io/badge/userspace-Rust-dea584?logo=rust)](https://www.rust-lang.org)
+[![binaries: musl static](https://img.shields.io/badge/binaries-musl%20static-8b949e?logo=linux)](https://musl.libc.org)
+[![device: Pixel 5](https://img.shields.io/badge/device-Pixel%205%20%C2%B7%20redfin-34d399)](https://github.com/yinnho/aginxos-next)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 **AginxOS** is the **phone host OS**: Linux kernel (drivers) + Rust userspace (the system).  
-Aginx agents and apps run on top of it.
+Aginx agents and apps run on top of it. 给 Agent 的操作系统 —— 人只发指令，机器干活。
 
 ```text
 XBL (signed, SoC) → AginxOS bootloader → Linux kernel → AginxOS userspace → Aginx / apps
