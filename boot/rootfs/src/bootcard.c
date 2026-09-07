@@ -1,31 +1,36 @@
-/* bootcard.c — AginxOS boot status card (M5).
+/* bootcard.c — AginxOS boot screen, Matrix edition (M5 card → 开机体验④).
  *
- * The on-screen proof that the whole bring-up chain came up: a branded card
- * on the panel listing every stage (kernel, rootfs, display, touch, battery,
- * modem, wlan driver, Wi-Fi association, DHCP, internet) with live status.
- * The bring-up scripts append one-line events to /run/boot.state:
+ * While the bring-up chain reports into /run/boot.state:
  *
  *     <key> <ok|fail|run> [detail ...]
  *
- * and this daemon re-renders the frame whenever the file changes. It is the
- * ONLY thing that ever holds DRM master once it starts (it replaces the M3
- * green splash: touch-bringup no longer paints, it reports into the state
- * file instead). Exiting would drop master and dsi_backlight's dpms hooks
- * would blank the panel, so on device it never exits.
+ * the panel plays Matrix code-rain (green glyph trails falling in
+ * columns), with the latest event echoed in a dim footer line. When
+ * "done ok" lands and every stage is OK, the rain cuts to black and a
+ * green terminal typewrites: "Wake up..." → "The Matrix has you..." →
+ * the AginxOS wordmark — complete ~4 s in, because aginx-term-handoff
+ * kills this process ~5-7 s after the done line (2 s poll + sleep 5) and
+ * hands the panel to aginx-term (voice face). A failed boot keeps
+ * raining under a red "BOOT STOPPED" verdict.
+ *
+ * It is the ONLY thing that ever holds DRM master once it starts; exiting
+ * would drop master and dsi_backlight's dpms hooks would blank the panel,
+ * so on device it never exits on its own.
  *
  * DRM path is the splash2 skeleton (probe connector -> mode[0] -> encoder ->
  * possible_crtcs -> dumb fb -> SETCRTC) with its msm_drm 4.19 quirks intact:
  * zero count_fbs/encoders on the second GETRESOURCES, skip connectors
  * without a bound encoder or modes, prefer DSI (type 16).
  *
- * Host verification: `bootcard --ppm out.ppm [statefile]` renders one frame
- * into a P6 PPM instead of touching DRM — the layout is checked off-device
- * (there is no screencap path on the target yet).
+ * Host verification: `bootcard --ppm out.ppm [statefile] [frame]` renders
+ * one frame into a P6 PPM instead of touching DRM — rain at frame 3 by
+ * default, or the END sequence (frame 30 = fully typed) when the state
+ * file shows done ok. Unseeded rand() keeps host frames deterministic.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
-#include <math.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -123,14 +128,13 @@ static uint32_t *pix;      /* XRGB8888 */
 static uint32_t pitch_px;  /* pixels per line */
 static uint32_t fb_w, fb_h;
 
-#define C_BG      0x000A0E1Au   /* near-black navy */
-#define C_PANEL   0x00131A2Bu   /* row separator / faint lines */
+#define C_BG      0x00020503u   /* near-black, faint green cast (Matrix) */
 #define C_WHITE   0x00F5F7FAu
-#define C_GRAY    0x008B93A7u
-#define C_DIM     0x002A3348u   /* pending glyph ring */
-#define C_ACCENT  0x0034D399u   /* emerald — logo + running arc */
-#define C_OK      0x0022C55Eu
+#define C_ACCENT  0x0034D399u   /* emerald — "OS" in the wordmark */
+#define C_GREEN   0x0000FF41u   /* Matrix green — typewriter lines */
 #define C_FAIL    0x00EF4444u
+#define C_RAINHEAD 0x00C8FFC8u  /* rain head: near-white green */
+#define C_RAINDIM  0x00005A20u  /* footer status line */
 
 /* ---------------- 5x8 string-art font ----------------
  * Each glyph is 8 rows of 5 chars ('#'=on, anything else=off), parsed once
@@ -244,65 +248,6 @@ static void fill_rect(int x, int y, int w, int h, uint32_t c) {
     for (int i = 0; i < w; i++) r[i] = c;
   }
 }
-static uint32_t isqrt32(uint32_t v) {
-  if (!v) return 0;
-  uint32_t r = v;
-  for (;;) {
-    uint32_t t = (r + v / r) / 2;
-    if (t >= r) break;
-    r = t;
-  }
-  if (r > v / r) r--;
-  return r;
-}
-static void fill_circle(int cx, int cy, int r, uint32_t c) {
-  for (int dy = -r; dy <= r; dy++) {
-    int dx = isqrt32((uint32_t)(r * r - dy * dy));
-    fill_rect(cx - dx, cy + dy, 2 * dx + 1, 1, c);
-  }
-}
-/* thick ring: outer R, thickness t */
-static void ring(int cx, int cy, int R, int t, uint32_t c) {
-  int Ri = R - t;
-  for (int dy = -R; dy <= R; dy++) {
-    int do_ = isqrt32((uint32_t)(R * R - dy * dy));
-    int di = (Ri > 0 && dy >= -Ri && dy <= Ri)
-                 ? isqrt32((uint32_t)(Ri * Ri - dy * dy)) : -1;
-    if (di < do_) fill_rect(cx - do_, cy + dy, do_ - di, 1, c);
-    if (di < do_) fill_rect(cx + di + 1, cy + dy, do_ - di, 1, c);
-  }
-}
-/* arc segment, angles in radians (y grows down: -pi/2 is up) */
-static void arc(int cx, int cy, int R, int t, double a0, double a1, uint32_t c) {
-  int n = (int)((a1 - a0) * R) + 2;
-  for (int i = 0; i <= n; i++) {
-    double a = a0 + (a1 - a0) * i / n;
-    int x = (int)(cx + R * cos(a) + 0.5);
-    int y = (int)(cy + R * sin(a) + 0.5);
-    fill_rect(x - t / 2, y - t / 2, t, t, c);
-  }
-}
-static void fill_rrect(int x, int y, int w, int h, int r, uint32_t c) {
-  for (int dy = 0; dy < h; dy++) {
-    int inset = 0;
-    if (dy < r) inset = r - isqrt32((uint32_t)(r * r - (r - dy) * (r - dy)));
-    else if (dy > h - 1 - r)
-      inset = r - isqrt32((uint32_t)(r * r - (dy - (h - 1 - r)) * (dy - (h - 1 - r))));
-    fill_rect(x + inset, y + dy, w - 2 * inset, 1, c);
-  }
-}
-static void line_thick(int x0, int y0, int x1, int y1, int t, uint32_t c) {
-  int dx = abs(x1 - x0), dy = abs(y1 - y0);
-  int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx - dy;
-  for (;;) {
-    fill_rect(x0 - t / 2, y0 - t / 2, t, t, c);
-    if (x0 == x1 && y0 == y1) break;
-    int e2 = 2 * err;
-    if (e2 > -dy) { err -= dy; x0 += sx; }
-    if (e2 < dx) { err += dx; y0 += sy; }
-  }
-}
-
 static int text_w(const char *s, int scale) {
   return ((int)strlen(s) * 6 - 1) * scale;
 }
@@ -315,6 +260,14 @@ static int draw_text(int x, int y, const char *s, int scale, uint32_t c) {
           fill_rect(x + col * scale, y + r * scale, scale, scale, c);
   }
   return x;
+}
+
+static void draw_glyph(int x, int y, char c, int scale, uint32_t col) {
+  unsigned char *g = fontbits[(unsigned char)c & 127];
+  for (int r = 0; r < 8; r++)
+    for (int k = 0; k < 5; k++)
+      if (g[r] & (0x10 >> k))
+        fill_rect(x + k * scale, y + r * scale, scale, scale, col);
 }
 
 /* ---------------- boot state ---------------- */
@@ -331,6 +284,7 @@ enum { ST_PEND = 0, ST_RUN, ST_OK, ST_FAIL };
 static int st_status[NKEYS];
 static char st_detail[NKEYS][80];
 static int done_ok, done_seen;
+static char latest_ev[48];   /* rain footer: "key val" of the newest event */
 
 struct snapshot { int status[NKEYS]; char detail[NKEYS][80]; int d[2]; };
 static int read_state(const char *path) {
@@ -356,6 +310,7 @@ static int read_state(const char *path) {
       }
       for (int i = 0; i < NKEYS; i++)
         if (!strcmp(key, KEYS[i])) {
+          snprintf(latest_ev, sizeof latest_ev, "%s %s", key, val);
           st_status[i] = !strcmp(val, "ok") ? ST_OK
                        : !strcmp(val, "fail") ? ST_FAIL
                        : !strcmp(val, "run") ? ST_RUN : ST_PEND;
@@ -374,112 +329,177 @@ static int read_state(const char *path) {
   return memcmp(&before, &after, sizeof before) != 0;
 }
 
-/* ---------------- render ---------------- */
-static void status_glyph(int cx, int cy, int st, uint64_t frame) {
-  int R = 26;
-  switch (st) {
-  case ST_OK:
-    fill_circle(cx, cy, R, C_OK);
-    line_thick(cx - 12, cy + 1, cx - 3, cy + 11, 7, C_WHITE);
-    line_thick(cx - 3, cy + 11, cx + 14, cy - 10, 7, C_WHITE);
-    break;
-  case ST_FAIL:
-    fill_circle(cx, cy, R, C_FAIL);
-    line_thick(cx - 10, cy - 10, cx + 10, cy + 10, 7, C_WHITE);
-    line_thick(cx + 10, cy - 10, cx - 10, cy + 10, 7, C_WHITE);
-    break;
-  case ST_RUN:
-    ring(cx, cy, R, 6, C_DIM);
-    arc(cx, cy, R - 3, 7, (frame % 12) * (M_PI / 6),
-        (frame % 12) * (M_PI / 6) + 1.4, C_ACCENT);
-    break;
-  default:
-    ring(cx, cy, R, 6, C_DIM);
+/* ---------------- Matrix rain + typewriter END ----------------
+ * 开机体验④. END budget: aginx-term-handoff kills us ~5-7 s after
+ * "done ok" lands (2 s poll + fixed sleep 5); the sequence below
+ * completes at ~4 s so the wordmark holds before the voice face
+ * takes the panel. Ticks are the main loop's ~90 ms frames.
+ */
+#define CELL      24   /* rain glyph advance: 6 px * scale 4 */
+#define GLYPH_H   32   /* rain glyph height: 8 px * scale 4 */
+#define TRAIL     28   /* cells per column trail (~40% of panel, film streak) */
+#define RAIN_MAX  64
+static const char RAINCS[] =
+    "01<>+-/ABCDEFGHKLMNPRSTUVWXYZ23456789abcdefghkmnoprstuvwxyz";
+static int head_y[RAIN_MAX];
+static int spd[RAIN_MAX];
+static char cells[RAIN_MAX][TRAIL];
+static uint32_t rain_trail[TRAIL];
+static int rain_ready;
+static long long end_frame = -1;
+
+static int rain_speed(void) {
+  return CELL * (2 + rand() % 3) - CELL / 4;   /* 42/66/90 px, uniform step */
+}
+
+static void rain_init(int seed) {
+  if (rain_ready) return;
+  rain_ready = 1;
+  if (seed) srand((unsigned)(time(NULL) ^ getpid()));
+  /* film fade: bright head, linear falloff to bg (the reference rain:
+   * RGB(0, 255-13j, 0) per glyph down the trail) */
+  for (int k = 0; k < TRAIL; k++) {
+    int t = 255 * (TRAIL - 1 - k) / TRAIL;   /* head k=0: full green */
+    rain_trail[k] = (uint32_t)(
+        ((0x02 * (255 - t) + 0x00 * t) / 255) << 16 |
+        ((0x05 * (255 - t) + 0xFF * t) / 255) << 8 |
+        ((0x03 * (255 - t) + 0x30 * t) / 255));
   }
+  int n = (int)(fb_w / CELL);
+  if (n > RAIN_MAX) n = RAIN_MAX;
+  for (int i = 0; i < n; i++) {
+    /* heads already spread across (and just above) the panel: the very
+     * first frame reads as ongoing rain, not an empty screen filling up */
+    head_y[i] =
+        (int)((unsigned)rand() % (fb_h + TRAIL * GLYPH_H)) - TRAIL * GLYPH_H;
+    /* reference rain moves 5-9 px per 20 ms tick (crosses in 1.4-2.6 s);
+     * scaled to this panel (3.7x taller) at our ~60 ms frame: 1.5-3.2
+     * cells per frame, constant step = uniform motion */
+    spd[i] = rain_speed();
+    for (int k = 0; k < TRAIL; k++)
+      cells[i][k] = RAINCS[rand() % (sizeof RAINCS - 1)];
+  }
+}
+
+static void render_rain(long tsec) {
+  int n = (int)(fb_w / CELL);
+  if (n > RAIN_MAX) n = RAIN_MAX;
+  for (int i = 0; i < n; i++) {
+    head_y[i] += spd[i];
+    if (head_y[i] - TRAIL * GLYPH_H > (int)fb_h) {
+      head_y[i] = -(int)((unsigned)rand() % (fb_h / 2)) - GLYPH_H;
+      spd[i] = rain_speed();
+    }
+    if (rand() % 5 == 0)
+      cells[i][rand() % TRAIL] = RAINCS[rand() % (sizeof RAINCS - 1)];
+    for (int k = 0; k < TRAIL; k++) {
+      int y = head_y[i] - k * GLYPH_H;
+      if (y + GLYPH_H < 0 || y > (int)fb_h) continue;
+      draw_glyph(i * CELL, y, cells[i][k], 4,
+                 k == 0 ? C_RAINHEAD : rain_trail[k]);
+    }
+  }
+  /* footer: wall clock + latest boot event (key val only — no detail,
+   * detail is free text and must never put anything secret on the panel) */
+  char ft[16];
+  snprintf(ft, sizeof ft, "T+%02ld:%02ld", tsec / 60, tsec % 60);
+  draw_text(40, fb_h - 64, ft, 2, C_RAINDIM);
+  if (latest_ev[0])
+    draw_text(fb_w - 40 - text_w(latest_ev, 2), fb_h - 64, latest_ev, 2,
+              C_RAINDIM);
+}
+
+static int boot_success(void) {
+  if (!done_ok || !done_seen) return 0;
+  for (int i = 0; i < NKEYS; i++)
+    if (st_status[i] != ST_OK) return 0;
+  return 1;
+}
+
+/* chars revealed by tick: 1 per ~90 ms tick */
+static int typed(uint64_t ticks, uint64_t start, int total) {
+  if (ticks <= start) return 0;
+  uint64_t n = ticks - start;
+  return n >= (uint64_t)total ? total : (int)n;
+}
+
+static void draw_text_n(int x, int y, const char *s, int n, int scale,
+                        uint32_t col) {
+  for (int i = 0; i < n && s[i]; i++, x += 6 * scale)
+    draw_glyph(x, y, s[i], scale, col);
+}
+
+static void render_end(uint64_t ticks) {
+  static const char L1[] = "Wake up...";
+  static const char L2[] = "The Matrix has you...";
+  static const char WM[] = "AginxOS";
+  int cs = 7;
+  int y1 = fb_h * 36 / 100;
+  int y2 = y1 + 8 * cs + 44;
+  int l1n = (int)sizeof L1 - 1, l2n = (int)sizeof L2 - 1;
+
+  uint64_t t2 = l1n + 3;                              /* line 1 pause end */
+  uint64_t t3 = t2 + l2n + 3;                         /* line 2 pause end */
+
+  int n1 = typed(ticks, 0, l1n);
+  int x1 = (fb_w - text_w(L1, cs)) / 2;
+  draw_text_n(x1, y1, L1, n1, cs, C_GREEN);
+  if (n1 > 0 && ticks < t2) {
+    int cx = x1 + (n1 < l1n ? n1 * 6 * cs : text_w(L1, cs));
+    fill_rect(cx, y1, 5 * cs, 8 * cs, C_GREEN);
+  }
+
+  int n2 = typed(ticks, t2, l2n);
+  int x2 = (fb_w - text_w(L2, cs)) / 2;
+  draw_text_n(x2, y2, L2, n2, cs, C_GREEN);
+  if (n2 > 0 && ticks >= t2 && ticks < t3) {
+    int cx = x2 + (n2 < l2n ? n2 * 6 * cs : text_w(L2, cs));
+    fill_rect(cx, y2, 5 * cs, 8 * cs, C_GREEN);
+  }
+
+  int n3 = typed(ticks, t3, (int)sizeof WM - 1);
+  if (n3 > 0) {
+    int ws = 13;
+    int ww = text_w("Aginx", ws) + 6 * ws + text_w("OS", ws);
+    int wx = (fb_w - ww) / 2;
+    int wy = fb_h * 56 / 100;
+    int wmn = (int)sizeof WM - 1;
+    for (int i = 0; i < n3; i++)
+      draw_glyph(wx + i * 6 * ws, wy, WM[i], ws, i < 5 ? C_WHITE : C_ACCENT);
+    if (ticks >= t3) {
+      int cx = wx + (n3 < wmn ? n3 * 6 * ws : text_w(WM, ws));
+      /* solid while typing, breathing after the wordmark lands */
+      if (n3 < wmn || (ticks / 5) % 2 == 0)
+        fill_rect(cx, wy, 5 * ws, 8 * ws, C_GREEN);
+    }
+  }
+}
+
+static void render_stopped(void) {
+  const char *l1 = "BOOT STOPPED";
+  int s1 = 6;
+  draw_text((fb_w - text_w(l1, s1)) / 2, fb_h * 42 / 100, l1, s1, C_FAIL);
+  char l2[96] = "INCOMPLETE";
+  for (int i = 0; i < NKEYS; i++)
+    if (st_status[i] == ST_FAIL) {
+      snprintf(l2, sizeof l2, "%s FAILED%s%s", LABELS[i],
+               st_detail[i][0] ? " - " : "", st_detail[i]);
+      break;
+    }
+  int s2 = 3, maxw = fb_w - 160;
+  while (text_w(l2, s2) > maxw && strlen(l2) > 1) l2[strlen(l2) - 1] = 0;
+  draw_text((fb_w - text_w(l2, s2)) / 2, fb_h * 42 / 100 + 8 * s1 + 40, l2,
+            s2, C_FAIL);
 }
 
 static void render(uint64_t frame, long tsec) {
   fill_rect(0, 0, fb_w, fb_h, C_BG);
-  int M = 90;                       /* side margin */
-  int w = fb_w;
-
-  /* power emblem */
-  int ecx = w / 2, ecy = 210, ER = 62;
-  arc(ecx, ecy, ER, 11, -M_PI * 55.0 / 180.0, M_PI * 235.0 / 180.0, C_ACCENT);
-  fill_rect(ecx - 5, ecy - ER + 8, 10, ER - 8, C_ACCENT);
-
-  /* wordmark: AginxOS — "Aginx" white, "OS" emerald */
-  int ws = 13;
-  int ww = text_w("Aginx", ws) + 6 * ws + text_w("OS", ws);
-  int wx = (w - ww) / 2, wy = 330;
-  wx = draw_text(wx, wy, "Aginx", ws, C_WHITE);
-  draw_text(wx + 6 * ws, wy, "OS", ws, C_ACCENT);
-
-  /* subtitle + rule */
-  const char *sub = "LINUX PHONE - BOOT CONSOLE";
-  draw_text((w - text_w(sub, 4)) / 2, wy + 8 * ws + 26, sub, 4, C_GRAY);
-  fill_rect(M, 560, w - 2 * M, 3, C_PANEL);
-
-  /* checklist */
-  int y0 = 620, rh = 120;
-  for (int i = 0; i < NKEYS; i++) {
-    int ry = y0 + i * rh;
-    status_glyph(M + 30, ry + rh / 2, st_status[i], frame);
-    int ls = 5;
-    draw_text(M + 92, ry + (rh - 8 * ls) / 2, LABELS[i], ls, C_WHITE);
-    if (st_detail[i][0]) {
-      int ds = 3;
-      int dw = text_w(st_detail[i], ds);
-      int maxw = w - M - 92 - text_w(LABELS[i], ls) - 40 - M;
-      char buf[80];
-      strncpy(buf, st_detail[i], sizeof buf - 1);
-      while (dw > maxw && strlen(buf) > 1) {
-        buf[strlen(buf) - 1] = 0;
-        dw = text_w(buf, ds);
-      }
-      draw_text(w - M - dw, ry + (rh - 8 * ds) / 2 + 4, buf, ds, C_GRAY);
-    }
-    if (i) fill_rect(M, ry, w - 2 * M, 2, C_PANEL);
+  if (end_frame >= 0) {
+    render_end((uint64_t)(frame - (uint64_t)end_frame));
+    return;
   }
-
-  /* completion banner */
-  int by = y0 + NKEYS * rh + 50;
-  if (done_seen) {
-    int anyfail = 0, anypend = 0;
-    for (int i = 0; i < NKEYS; i++) {
-      anyfail |= st_status[i] == ST_FAIL;
-      anypend |= st_status[i] != ST_OK;
-    }
-    if (done_ok && !anyfail && !anypend) {
-      fill_rrect(M, by, w - 2 * M, 150, 28, C_OK);
-      const char *l1 = "BOOT COMPLETE";
-      draw_text((w - text_w(l1, 6)) / 2, by + 22, l1, 6, 0x000A0E1A);
-      char l2[120];
-      snprintf(l2, sizeof l2, "IP %s - %s",
-               st_detail[7][0] ? st_detail[7] : "?",
-               st_detail[9][0] ? st_detail[9] : "net up");
-      draw_text((w - text_w(l2, 3)) / 2, by + 92, l2, 3, 0x000A0E1A);
-    } else {
-      fill_rrect(M, by, w - 2 * M, 150, 28, C_FAIL);
-      const char *l1 = "BOOT STOPPED";
-      draw_text((w - text_w(l1, 6)) / 2, by + 22, l1, 6, C_WHITE);
-      char l2[120] = "";
-      for (int i = 0; i < NKEYS; i++)
-        if (st_status[i] == ST_FAIL) {
-          snprintf(l2, sizeof l2, "%s FAILED%s%s", LABELS[i],
-                   st_detail[i][0] ? " - " : "", st_detail[i]);
-          break;
-        }
-      draw_text((w - text_w(l2, 3)) / 2, by + 92, l2, 3, C_WHITE);
-    }
-  }
-
-  /* footer */
-  char ft[32];
-  snprintf(ft, sizeof ft, "T+%02d:%02d", (int)(tsec / 60), (int)(tsec % 60));
-  draw_text(M, fb_h - 100, ft, 3, C_GRAY);
-  const char *fr = "AGINXOS / PIXEL 5";
-  draw_text(w - M - text_w(fr, 3), fb_h - 100, fr, 3, C_GRAY);
+  render_rain(tsec);
+  if (done_seen) render_stopped();
 }
 
 /* ---------------- device DRM setup (splash2 skeleton) ---------------- */
@@ -637,31 +657,69 @@ static void self_state(void) {
   snprintf(st_detail[1], sizeof st_detail[1], "ext4 / userdata");
 }
 
+/* boot.state for the host preview modes; the demo lines mirror a mid-boot
+ * device (wifi still running), which is when the rain is on screen. */
+static void load_state_or_demo(const char *statepath) {
+  if (statepath && access(statepath, R_OK) == 0) {
+    read_state(statepath);
+    return;
+  }
+  const char *demo[] = { "kernel ok 5.4.61-android13", "rootfs ok ext4",
+    "display ok 1080x2340", "touch ok", "battery ok 87%",
+    "modem ok", "wlan ok wlan0", "wifi run" };
+  unlink("/tmp/bootcard.demo.state");
+  for (unsigned i = 0; i < sizeof demo / sizeof demo[0]; i++) {
+    FILE *f = fopen("/tmp/bootcard.demo.state", "a");
+    fprintf(f, "%s\n", demo[i]);
+    fclose(f);
+  }
+  read_state("/tmp/bootcard.demo.state");
+}
+
 int main(int argc, char **argv) {
   font_init();
 
   if (argc > 1 && !strcmp(argv[1], "--ppm")) {
     const char *out = argc > 2 ? argv[2] : "/tmp/bootcard.ppm";
-    const char *statepath = argc > 3 ? argv[3] : NULL;
-    if (statepath && access(statepath, R_OK) == 0)
-      read_state(statepath);
-    else {  /* demo: mid-boot */
-      const char *demo[] = { "kernel ok 5.4.61-android13", "rootfs ok ext4",
-        "display ok 1080x2340", "touch ok", "battery ok 87%",
-        "modem ok", "wlan ok wlan0", "wifi run" };
-      unlink("/tmp/bootcard.demo.state");
-      for (unsigned i = 0; i < sizeof demo / sizeof demo[0]; i++) {
-        FILE *f = fopen("/tmp/bootcard.demo.state", "a");
-        fprintf(f, "%s\n", demo[i]);
-        fclose(f);
-      }
-      read_state("/tmp/bootcard.demo.state");
-    }
+    load_state_or_demo(argc > 3 ? argv[3] : NULL);
     self_state();
     fb_w = 1080; fb_h = 2340; pitch_px = fb_w;
     pix = malloc((size_t)fb_w * fb_h * 4);
-    render(3, 84);
+    rain_init(0);                       /* unseeded: deterministic host frame */
+    if (boot_success()) end_frame = 0;
+    uint64_t fr = argc > 4 ? (uint64_t)strtoul(argv[4], NULL, 0)
+                           : (end_frame >= 0 ? 50 : 3);
+    /* advance the rain to tick fr so host previews match the device loop
+     * (render() itself performs the fr-th advance) */
+    if (end_frame < 0)
+      for (uint64_t k = 1; k < fr; k++) render_rain(84);
+    render(fr, 84);
     return ppm_write(out) ? 1 : 0;
+  }
+
+  if (argc > 1 && !strcmp(argv[1], "--ppm-seq")) {
+    /* host-only: dump the exact frame run the device loop displays — one
+     * PPM per tick at the panel pace (~16 fps) — for screen-faithful
+     * recordings. args: <dir> <nframes> [end_at] [statefile]; frames past
+     * end_at play the END chain (0 = rain only). */
+    const char *dir = argc > 2 ? argv[2] : "/tmp/bcseq";
+    uint64_t n = argc > 3 ? (uint64_t)strtoul(argv[3], NULL, 0) : 64;
+    uint64_t end_at = argc > 4 ? (uint64_t)strtoul(argv[4], NULL, 0) : 0;
+    load_state_or_demo(argc > 5 ? argv[5] : NULL);
+    self_state();
+    fb_w = 1080; fb_h = 2340; pitch_px = fb_w;
+    pix = malloc((size_t)fb_w * fb_h * 4);
+    rain_init(0);
+    for (uint64_t k = 0; k < n; k++) {
+      if (end_at && end_frame < 0 && k >= end_at)
+        end_frame = (long long)k;   /* done just landed */
+      char path[256];
+      snprintf(path, sizeof path, "%s/f%04llu.ppm", dir,
+               (unsigned long long)k);
+      render(k, (long)(k / 16));    /* 16 fps wall clock for the footer */
+      if (ppm_write(path)) return 1;
+    }
+    return 0;
   }
 
   const char *statepath = argc > 1 ? argv[1] : "/run/boot.state";
@@ -703,14 +761,20 @@ int main(int argc, char **argv) {
     }
   }
   kmsgf("bootcard: panel up %ux%u conn=%u\n", fb_w, fb_h, g_conn_id);
+  rain_init(1);                 /* seeded: rain differs boot to boot */
   g_cur = 0;
 
-  /* Flip path: PAGE_FLIP per frame (vblank-synced). Fallback if the driver
-   * refuses flips: re-SETCRTC every ~2 s re-latches the back buffer. */
+  /* Present path: try PAGE_FLIP once; this msm_drm 4.19 refuses it
+   * (atomic-only driver, errno 2 — same as aginx-term's drm.rs), so the
+   * working path is drm.rs's: re-SETCRTC relatch on EVERY frame. */
   int flip_ok = 1;
   uint64_t frame = 0;
   for (;;) {
     int changed = read_state(statepath);
+    if (end_frame < 0 && boot_success()) {
+      end_frame = (long long)frame;
+      kmsg("bootcard: end sequence\n");
+    }
     if (changed)
       for (int i = 0; i < NKEYS; i++)
         if (st_status[i] != ST_PEND || st_detail[i][0])
@@ -721,28 +785,40 @@ int main(int argc, char **argv) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     long tsec = now.tv_sec - t0.tv_sec;
-    if (changed || frame % 3 == 0) {
-      int next = 1 - g_cur;
-      pix = g_map[next];
-      render(frame, tsec);
-      if (flip_ok) {
-        struct drm_mode_crtc_page_flip pf;
-        memset(&pf, 0, sizeof pf);
-        pf.fb_id = g_fb[next];
-        pf.crtc_id = g_crtc_id;
-        if (ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &pf) == 0) {
-          g_cur = next;
-        } else {
-          flip_ok = 0;
-          kmsgf("bootcard: PAGE_FLIP refused (%d) — falling back to relatch\n", errno);
+    int next = 1 - g_cur;
+    pix = g_map[next];
+    render(frame, tsec);
+    if (flip_ok) {
+      struct drm_mode_crtc_page_flip pf;
+      memset(&pf, 0, sizeof pf);
+      pf.fb_id = g_fb[next];
+      pf.crtc_id = g_crtc_id;
+      pf.flags = 1;   /* DRM_MODE_PAGE_FLIP_EVENT */
+      if (ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &pf) == 0) {
+        g_cur = next;
+        /* consume the flip-complete event (latch confirmed at vblank);
+         * bounded wait — a driver that never delivers events must not
+         * hang the bootcard */
+        struct pollfd p = { fd, POLLIN, 0 };
+        if (poll(&p, 1, 200) > 0) {
+          char evbuf[64];
+          ssize_t r;
+          do { r = read(fd, evbuf, sizeof evbuf); } while (r > 0);
         }
-      }
-      if (!flip_ok && frame % 13 == 12) {     /* ~2 s re-latch */
-        drm_modeset(fd, g_fb[1 - g_cur]);
-        g_cur = 1 - g_cur;
+      } else {
+        flip_ok = 0;
+        kmsgf("bootcard: PAGE_FLIP refused (%d) — relatch per frame\n", errno);
       }
     }
+    if (!flip_ok) {
+      /* msm_drm 4.19 is atomic-only and refuses legacy flips (errno 2,
+       * 2026-09-07); drm.rs's proven path is re-SETCRTC relatch on EVERY
+       * present (aginx-term runs 14 fps that way). Relatching every Nth
+       * frame is the stutter the boot rain showed. */
+      drm_modeset(fd, g_fb[next]);
+      g_cur = next;
+    }
     frame++;
-    usleep(150000);
+    usleep(40000);
   }
 }
