@@ -1,31 +1,24 @@
-/* bootcard.c — AginxOS boot screen, Matrix edition (M5 card → 开机体验④).
+/* bootcard.c — AginxOS boot console (开机剧情 v4⑤ #246).
  *
- * While the bring-up chain reports into /run/boot.state:
+ * 开机剧情 v4⑤ (09-08): bootcard draws ONLY the AginxOS wordmark where
+ * the Google splash sat — the live boot.state checklist retired (user
+ * verdict: 检测行全部不要). It still watches /run/boot.state and leaves
+ * on the same truth ladder as before; the SET_MASTER drop blanks the
+ * panel for one beat, then aginx-term takes over (breathing cursor at
+ * the bottom, transcript typing at the top). The story after the exit
+ * belongs to term/voice, not here.
  *
- *     <key> <ok|fail|run> [detail ...]
- *
- * the panel plays Matrix code-rain (green glyph trails falling in
- * columns), with the latest event echoed in a dim footer line. When
- * "done ok" lands and every stage is OK, the rain cuts to black and a
- * green terminal typewrites: "Wake up..." → "The Matrix has you..." →
- * the AginxOS wordmark — complete ~4 s in, because aginx-term-handoff
- * kills this process ~5-7 s after the done line (2 s poll + sleep 5) and
- * hands the panel to aginx-term (voice face). A failed boot keeps
- * raining under a red "BOOT STOPPED" verdict.
- *
- * It is the ONLY thing that ever holds DRM master once it starts; exiting
- * would drop master and dsi_backlight's dpms hooks would blank the panel,
- * so on device it never exits on its own.
+ * Exit ladder: internet ok|fail / wifi fail / dhcp fail → hold 3 s, exit;
+ * `done fail` (net phase-1 gave up) → 8 s grace so the offline floor still
+ * boots to the prompt; 150 s hard deadline from panel-light.
  *
  * DRM path is the splash2 skeleton (probe connector -> mode[0] -> encoder ->
  * possible_crtcs -> dumb fb -> SETCRTC) with its msm_drm 4.19 quirks intact:
  * zero count_fbs/encoders on the second GETRESOURCES, skip connectors
  * without a bound encoder or modes, prefer DSI (type 16).
  *
- * Host verification: `bootcard --ppm out.ppm [statefile] [frame]` renders
- * one frame into a P6 PPM instead of touching DRM — rain at frame 3 by
- * default, or the END sequence (frame 30 = fully typed) when the state
- * file shows done ok. Unseeded rand() keeps host frames deterministic.
+ * Host verification: `bootcard --ppm out.ppm` renders the wordmark frame
+ * into a P6 PPM instead of touching DRM.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -128,13 +121,8 @@ static uint32_t *pix;      /* XRGB8888 */
 static uint32_t pitch_px;  /* pixels per line */
 static uint32_t fb_w, fb_h;
 
-#define C_BG      0x00020503u   /* near-black, faint green cast (Matrix) */
-#define C_WHITE   0x00F5F7FAu
-#define C_ACCENT  0x0034D399u   /* emerald — "OS" in the wordmark */
-#define C_GREEN   0x0000FF41u   /* Matrix green — typewriter lines */
-#define C_FAIL    0x00EF4444u
-#define C_RAINHEAD 0x00C8FFC8u  /* rain head: near-white green */
-#define C_RAINDIM  0x00005A20u  /* footer status line */
+#define C_BG      0x00020503u   /* near-black, faint green cast */
+#define C_GREEN   0x0000FF41u   /* wordmark (term MGREEN) */
 
 /* ---------------- 5x8 string-art font ----------------
  * Each glyph is 8 rows of 5 chars ('#'=on, anything else=off), parsed once
@@ -262,29 +250,24 @@ static int draw_text(int x, int y, const char *s, int scale, uint32_t c) {
   return x;
 }
 
-static void draw_glyph(int x, int y, char c, int scale, uint32_t col) {
-  unsigned char *g = fontbits[(unsigned char)c & 127];
-  for (int r = 0; r < 8; r++)
-    for (int k = 0; k < 5; k++)
-      if (g[r] & (0x10 >> k))
-        fill_rect(x + k * scale, y + r * scale, scale, scale, col);
-}
-
-/* ---------------- boot state ---------------- */
-#define NKEYS 10
+/* ---------------- boot state ----------------
+ * The real boot.state key set (what the bring-up scripts append). v4⑤:
+ * the checklist render is retired — the table now feeds only the exit
+ * ladder (K_WIFI/K_DHCP/K_INTERNET + done) and the stderr diagnostics. */
+#define NKEYS 16
 static const char *KEYS[NKEYS] = {
   "kernel", "rootfs", "display", "touch", "battery",
   "modem", "wlan", "wifi", "dhcp", "internet",
+  "cell", "audio", "camera", "time", "pkg", "py",
 };
-static const char *LABELS[NKEYS] = {
-  "KERNEL", "ROOTFS", "DISPLAY", "TOUCH", "BATTERY",
-  "MODEM", "WLAN", "WIFI", "DHCP", "INTERNET",
-};
+/* exit-ladder keys (indexes into KEYS; keep in sync) */
+#define K_WIFI 7
+#define K_DHCP 8
+#define K_INTERNET 9
 enum { ST_PEND = 0, ST_RUN, ST_OK, ST_FAIL };
 static int st_status[NKEYS];
 static char st_detail[NKEYS][80];
 static int done_ok, done_seen;
-static char latest_ev[48];   /* rain footer: "key val" of the newest event */
 
 struct snapshot { int status[NKEYS]; char detail[NKEYS][80]; int d[2]; };
 static int read_state(const char *path) {
@@ -310,7 +293,6 @@ static int read_state(const char *path) {
       }
       for (int i = 0; i < NKEYS; i++)
         if (!strcmp(key, KEYS[i])) {
-          snprintf(latest_ev, sizeof latest_ev, "%s %s", key, val);
           st_status[i] = !strcmp(val, "ok") ? ST_OK
                        : !strcmp(val, "fail") ? ST_FAIL
                        : !strcmp(val, "run") ? ST_RUN : ST_PEND;
@@ -329,177 +311,22 @@ static int read_state(const char *path) {
   return memcmp(&before, &after, sizeof before) != 0;
 }
 
-/* ---------------- Matrix rain + typewriter END ----------------
- * 开机体验④. END budget: aginx-term-handoff kills us ~5-7 s after
- * "done ok" lands (2 s poll + fixed sleep 5); the sequence below
- * completes at ~4 s so the wordmark holds before the voice face
- * takes the panel. Ticks are the main loop's ~90 ms frames.
- */
-#define CELL      24   /* rain glyph advance: 6 px * scale 4 */
-#define GLYPH_H   32   /* rain glyph height: 8 px * scale 4 */
-#define TRAIL     28   /* cells per column trail (~40% of panel, film streak) */
-#define RAIN_MAX  64
-static const char RAINCS[] =
-    "01<>+-/ABCDEFGHKLMNPRSTUVWXYZ23456789abcdefghkmnoprstuvwxyz";
-static int head_y[RAIN_MAX];
-static int spd[RAIN_MAX];
-static char cells[RAIN_MAX][TRAIL];
-static uint32_t rain_trail[TRAIL];
-static int rain_ready;
-static long long end_frame = -1;
+/* ---------------- v4⑤ boot console: wordmark only ----------------
+ * 开机剧情 v4⑤ (09-08): 检测行全部不要 — the boot.state checklist
+ * (render_progress / marks / latest-event footer) retired with its
+ * palette. The console is one centered wordmark in term's MGREEN; the
+ * state table keeps feeding the exit ladder and stderr only. */
+#define WM_SCALE  13
 
-static int rain_speed(void) {
-  return CELL * (2 + rand() % 3) - CELL / 4;   /* 42/66/90 px, uniform step */
+static void render_wordmark(void) {
+  const char *wm = "AginxOS";
+  int ww = text_w(wm, WM_SCALE);
+  draw_text((fb_w - ww) / 2, fb_h * 45 / 100, wm, WM_SCALE, C_GREEN);
 }
 
-static void rain_init(int seed) {
-  if (rain_ready) return;
-  rain_ready = 1;
-  if (seed) srand((unsigned)(time(NULL) ^ getpid()));
-  /* film fade: bright head, linear falloff to bg (the reference rain:
-   * RGB(0, 255-13j, 0) per glyph down the trail) */
-  for (int k = 0; k < TRAIL; k++) {
-    int t = 255 * (TRAIL - 1 - k) / TRAIL;   /* head k=0: full green */
-    rain_trail[k] = (uint32_t)(
-        ((0x02 * (255 - t) + 0x00 * t) / 255) << 16 |
-        ((0x05 * (255 - t) + 0xFF * t) / 255) << 8 |
-        ((0x03 * (255 - t) + 0x30 * t) / 255));
-  }
-  int n = (int)(fb_w / CELL);
-  if (n > RAIN_MAX) n = RAIN_MAX;
-  for (int i = 0; i < n; i++) {
-    /* heads already spread across (and just above) the panel: the very
-     * first frame reads as ongoing rain, not an empty screen filling up */
-    head_y[i] =
-        (int)((unsigned)rand() % (fb_h + TRAIL * GLYPH_H)) - TRAIL * GLYPH_H;
-    /* reference rain moves 5-9 px per 20 ms tick (crosses in 1.4-2.6 s);
-     * scaled to this panel (3.7x taller) at our ~60 ms frame: 1.5-3.2
-     * cells per frame, constant step = uniform motion */
-    spd[i] = rain_speed();
-    for (int k = 0; k < TRAIL; k++)
-      cells[i][k] = RAINCS[rand() % (sizeof RAINCS - 1)];
-  }
-}
-
-static void render_rain(long tsec) {
-  int n = (int)(fb_w / CELL);
-  if (n > RAIN_MAX) n = RAIN_MAX;
-  for (int i = 0; i < n; i++) {
-    head_y[i] += spd[i];
-    if (head_y[i] - TRAIL * GLYPH_H > (int)fb_h) {
-      head_y[i] = -(int)((unsigned)rand() % (fb_h / 2)) - GLYPH_H;
-      spd[i] = rain_speed();
-    }
-    if (rand() % 5 == 0)
-      cells[i][rand() % TRAIL] = RAINCS[rand() % (sizeof RAINCS - 1)];
-    for (int k = 0; k < TRAIL; k++) {
-      int y = head_y[i] - k * GLYPH_H;
-      if (y + GLYPH_H < 0 || y > (int)fb_h) continue;
-      draw_glyph(i * CELL, y, cells[i][k], 4,
-                 k == 0 ? C_RAINHEAD : rain_trail[k]);
-    }
-  }
-  /* footer: wall clock + latest boot event (key val only — no detail,
-   * detail is free text and must never put anything secret on the panel) */
-  char ft[16];
-  snprintf(ft, sizeof ft, "T+%02ld:%02ld", tsec / 60, tsec % 60);
-  draw_text(40, fb_h - 64, ft, 2, C_RAINDIM);
-  if (latest_ev[0])
-    draw_text(fb_w - 40 - text_w(latest_ev, 2), fb_h - 64, latest_ev, 2,
-              C_RAINDIM);
-}
-
-static int boot_success(void) {
-  if (!done_ok || !done_seen) return 0;
-  for (int i = 0; i < NKEYS; i++)
-    if (st_status[i] != ST_OK) return 0;
-  return 1;
-}
-
-/* chars revealed by tick: 1 per ~90 ms tick */
-static int typed(uint64_t ticks, uint64_t start, int total) {
-  if (ticks <= start) return 0;
-  uint64_t n = ticks - start;
-  return n >= (uint64_t)total ? total : (int)n;
-}
-
-static void draw_text_n(int x, int y, const char *s, int n, int scale,
-                        uint32_t col) {
-  for (int i = 0; i < n && s[i]; i++, x += 6 * scale)
-    draw_glyph(x, y, s[i], scale, col);
-}
-
-static void render_end(uint64_t ticks) {
-  static const char L1[] = "Wake up...";
-  static const char L2[] = "The Matrix has you...";
-  static const char WM[] = "AginxOS";
-  int cs = 7;
-  int y1 = fb_h * 36 / 100;
-  int y2 = y1 + 8 * cs + 44;
-  int l1n = (int)sizeof L1 - 1, l2n = (int)sizeof L2 - 1;
-
-  uint64_t t2 = l1n + 3;                              /* line 1 pause end */
-  uint64_t t3 = t2 + l2n + 3;                         /* line 2 pause end */
-
-  int n1 = typed(ticks, 0, l1n);
-  int x1 = (fb_w - text_w(L1, cs)) / 2;
-  draw_text_n(x1, y1, L1, n1, cs, C_GREEN);
-  if (n1 > 0 && ticks < t2) {
-    int cx = x1 + (n1 < l1n ? n1 * 6 * cs : text_w(L1, cs));
-    fill_rect(cx, y1, 5 * cs, 8 * cs, C_GREEN);
-  }
-
-  int n2 = typed(ticks, t2, l2n);
-  int x2 = (fb_w - text_w(L2, cs)) / 2;
-  draw_text_n(x2, y2, L2, n2, cs, C_GREEN);
-  if (n2 > 0 && ticks >= t2 && ticks < t3) {
-    int cx = x2 + (n2 < l2n ? n2 * 6 * cs : text_w(L2, cs));
-    fill_rect(cx, y2, 5 * cs, 8 * cs, C_GREEN);
-  }
-
-  int n3 = typed(ticks, t3, (int)sizeof WM - 1);
-  if (n3 > 0) {
-    int ws = 13;
-    int ww = text_w("Aginx", ws) + 6 * ws + text_w("OS", ws);
-    int wx = (fb_w - ww) / 2;
-    int wy = fb_h * 56 / 100;
-    int wmn = (int)sizeof WM - 1;
-    for (int i = 0; i < n3; i++)
-      draw_glyph(wx + i * 6 * ws, wy, WM[i], ws, i < 5 ? C_WHITE : C_ACCENT);
-    if (ticks >= t3) {
-      int cx = wx + (n3 < wmn ? n3 * 6 * ws : text_w(WM, ws));
-      /* solid while typing, breathing after the wordmark lands */
-      if (n3 < wmn || (ticks / 5) % 2 == 0)
-        fill_rect(cx, wy, 5 * ws, 8 * ws, C_GREEN);
-    }
-  }
-}
-
-static void render_stopped(void) {
-  const char *l1 = "BOOT STOPPED";
-  int s1 = 6;
-  draw_text((fb_w - text_w(l1, s1)) / 2, fb_h * 42 / 100, l1, s1, C_FAIL);
-  char l2[96] = "INCOMPLETE";
-  for (int i = 0; i < NKEYS; i++)
-    if (st_status[i] == ST_FAIL) {
-      snprintf(l2, sizeof l2, "%s FAILED%s%s", LABELS[i],
-               st_detail[i][0] ? " - " : "", st_detail[i]);
-      break;
-    }
-  int s2 = 3, maxw = fb_w - 160;
-  while (text_w(l2, s2) > maxw && strlen(l2) > 1) l2[strlen(l2) - 1] = 0;
-  draw_text((fb_w - text_w(l2, s2)) / 2, fb_h * 42 / 100 + 8 * s1 + 40, l2,
-            s2, C_FAIL);
-}
-
-static void render(uint64_t frame, long tsec) {
+static void render(void) {
   fill_rect(0, 0, fb_w, fb_h, C_BG);
-  if (end_frame >= 0) {
-    render_end((uint64_t)(frame - (uint64_t)end_frame));
-    return;
-  }
-  render_rain(tsec);
-  if (done_seen) render_stopped();
+  render_wordmark();
 }
 
 /* ---------------- device DRM setup (splash2 skeleton) ---------------- */
@@ -657,74 +484,19 @@ static void self_state(void) {
   snprintf(st_detail[1], sizeof st_detail[1], "ext4 / userdata");
 }
 
-/* boot.state for the host preview modes; the demo lines mirror a mid-boot
- * device (wifi still running), which is when the rain is on screen. */
-static void load_state_or_demo(const char *statepath) {
-  if (statepath && access(statepath, R_OK) == 0) {
-    read_state(statepath);
-    return;
-  }
-  const char *demo[] = { "kernel ok 5.4.61-android13", "rootfs ok ext4",
-    "display ok 1080x2340", "touch ok", "battery ok 87%",
-    "modem ok", "wlan ok wlan0", "wifi run" };
-  unlink("/tmp/bootcard.demo.state");
-  for (unsigned i = 0; i < sizeof demo / sizeof demo[0]; i++) {
-    FILE *f = fopen("/tmp/bootcard.demo.state", "a");
-    fprintf(f, "%s\n", demo[i]);
-    fclose(f);
-  }
-  read_state("/tmp/bootcard.demo.state");
-}
-
 int main(int argc, char **argv) {
   font_init();
 
   if (argc > 1 && !strcmp(argv[1], "--ppm")) {
+    /* host-only: the wordmark frame, exactly what the panel shows. */
     const char *out = argc > 2 ? argv[2] : "/tmp/bootcard.ppm";
-    load_state_or_demo(argc > 3 ? argv[3] : NULL);
-    self_state();
     fb_w = 1080; fb_h = 2340; pitch_px = fb_w;
     pix = malloc((size_t)fb_w * fb_h * 4);
-    rain_init(0);                       /* unseeded: deterministic host frame */
-    if (boot_success()) end_frame = 0;
-    uint64_t fr = argc > 4 ? (uint64_t)strtoul(argv[4], NULL, 0)
-                           : (end_frame >= 0 ? 50 : 3);
-    /* advance the rain to tick fr so host previews match the device loop
-     * (render() itself performs the fr-th advance) */
-    if (end_frame < 0)
-      for (uint64_t k = 1; k < fr; k++) render_rain(84);
-    render(fr, 84);
+    render();
     return ppm_write(out) ? 1 : 0;
   }
 
-  if (argc > 1 && !strcmp(argv[1], "--ppm-seq")) {
-    /* host-only: dump the exact frame run the device loop displays — one
-     * PPM per tick at the panel pace (~16 fps) — for screen-faithful
-     * recordings. args: <dir> <nframes> [end_at] [statefile]; frames past
-     * end_at play the END chain (0 = rain only). */
-    const char *dir = argc > 2 ? argv[2] : "/tmp/bcseq";
-    uint64_t n = argc > 3 ? (uint64_t)strtoul(argv[3], NULL, 0) : 64;
-    uint64_t end_at = argc > 4 ? (uint64_t)strtoul(argv[4], NULL, 0) : 0;
-    load_state_or_demo(argc > 5 ? argv[5] : NULL);
-    self_state();
-    fb_w = 1080; fb_h = 2340; pitch_px = fb_w;
-    pix = malloc((size_t)fb_w * fb_h * 4);
-    rain_init(0);
-    for (uint64_t k = 0; k < n; k++) {
-      if (end_at && end_frame < 0 && k >= end_at)
-        end_frame = (long long)k;   /* done just landed */
-      char path[256];
-      snprintf(path, sizeof path, "%s/f%04llu.ppm", dir,
-               (unsigned long long)k);
-      render(k, (long)(k / 16));    /* 16 fps wall clock for the footer */
-      if (ppm_write(path)) return 1;
-    }
-    return 0;
-  }
-
   const char *statepath = argc > 1 ? argv[1] : "/run/boot.state";
-  struct timespec t0;
-  clock_gettime(CLOCK_MONOTONIC, &t0);
   self_state();
 
   int fd = -1;
@@ -751,7 +523,7 @@ int main(int argc, char **argv) {
   /* FIRST frame before the mode set — see the drm_prepare comment: the
    * scanout snapshot happens at SETCRTC. */
   pix = g_map[0];
-  render(0, 0);
+  render();
   if (drm_modeset(fd, g_fb[0])) {
     kmsg("bootcard: modeset failed; logging state only\n");
     for (;;) {
@@ -761,20 +533,50 @@ int main(int argc, char **argv) {
     }
   }
   kmsgf("bootcard: panel up %ux%u conn=%u\n", fb_w, fb_h, g_conn_id);
-  rain_init(1);                 /* seeded: rain differs boot to boot */
+  /* 开机剧情 v4: exit ladder — the screen only tells the truth, so the
+   * console leaves when the net chain actually resolves, not on a timer.
+   * internet ok|fail, wifi fail or dhcp fail => net verdict is in: hold
+   * 3 s so the last state is readable, then hand the panel to term.
+   * done fail (net phase-1 gave up) => 8 s grace so the offline floor
+   * still boots to the prompt. 150 s hard deadline from panel-light
+   * covers bringups that never write a verdict. Dropping master blanks
+   * the panel via the dsi_backlight dpms hooks — that beat of black is
+   * the handoff (term fast-polls on any SET_MASTER failure at 250 ms —
+   * msm_drm 4.19 answers EINVAL, not EBUSY, when a master exists). */
+  struct timespec t_panel;
+  clock_gettime(CLOCK_MONOTONIC, &t_panel);
   g_cur = 0;
+  long resolve_at = -1;         /* CLOCK_MONOTONIC sec when verdict landed */
+  int hold = 3;
 
   /* Present path: try PAGE_FLIP once; this msm_drm 4.19 refuses it
    * (atomic-only driver, errno 2 — same as aginx-term's drm.rs), so the
    * working path is drm.rs's: re-SETCRTC relatch on EVERY frame. */
   int flip_ok = 1;
-  uint64_t frame = 0;
   for (;;) {
-    int changed = read_state(statepath);
-    if (end_frame < 0 && boot_success()) {
-      end_frame = (long long)frame;
-      kmsg("bootcard: end sequence\n");
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long t = now.tv_sec - t_panel.tv_sec;
+    if (t >= 150) {
+      kmsg("bootcard: 150s deadline — exiting (term takes the panel)\n");
+      exit(0);
     }
+    if (resolve_at < 0) {
+      int resolved = st_status[K_INTERNET] == ST_OK ||
+                     st_status[K_INTERNET] == ST_FAIL ||
+                     st_status[K_WIFI] == ST_FAIL ||
+                     st_status[K_DHCP] == ST_FAIL;
+      int failed = done_seen && !done_ok;
+      if (resolved || failed) {
+        hold = (failed && !resolved) ? 8 : 3;
+        resolve_at = t;
+        kmsgf("bootcard: net verdict seen — holding %ds\n", hold);
+      }
+    } else if (t - resolve_at >= hold) {
+      kmsg("bootcard: boot console done — exiting (term takes the panel)\n");
+      exit(0);
+    }
+    int changed = read_state(statepath);
     if (changed)
       for (int i = 0; i < NKEYS; i++)
         if (st_status[i] != ST_PEND || st_detail[i][0])
@@ -782,12 +584,9 @@ int main(int argc, char **argv) {
                   st_status[i] == ST_OK ? "ok" : st_status[i] == ST_FAIL ? "fail"
                   : st_status[i] == ST_RUN ? "run" : "-",
                   st_detail[i]);
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    long tsec = now.tv_sec - t0.tv_sec;
     int next = 1 - g_cur;
     pix = g_map[next];
-    render(frame, tsec);
+    render();
     if (flip_ok) {
       struct drm_mode_crtc_page_flip pf;
       memset(&pf, 0, sizeof pf);
@@ -818,7 +617,6 @@ int main(int argc, char **argv) {
       drm_modeset(fd, g_fb[next]);
       g_cur = next;
     }
-    frame++;
     usleep(40000);
   }
 }
